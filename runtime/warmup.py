@@ -186,7 +186,7 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
                         doc_ids_train = None
 
                     with ctx:
-                        warm_loss, _, _ = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+                        logits, warm_loss, _, _ = gpt_model(x_train, y_train, document_ids=doc_ids_train)
 
                     (warm_loss / grad_accum_mini_steps).backward()
 

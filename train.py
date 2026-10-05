@@ -362,7 +362,7 @@ try:
                     doc_ids_train = doc_ids_train[:current_batch_size].pin_memory().to(device, non_blocking=True)
                 gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
                 with ctx:
-                    step_train_loss, step_token_loss, step_balance_term = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+                    logits, step_train_loss, step_token_loss, step_balance_term = gpt_model(x_train, y_train, document_ids=doc_ids_train)
                 check_finite_tensors(
                     run,
                     (("train loss", step_train_loss), ("train token loss", step_token_loss), ("train balance term", step_balance_term)),
