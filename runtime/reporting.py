@@ -6,6 +6,31 @@ import torch
 import torch.distributed as dist
 
 
+def flush_log(run) -> None:
+    if run.master_process and run.log_buffer:
+        with open(run.training_config.log_filename, "a") as file:
+            for line in run.log_buffer:
+                file.write(line + "\n")
+        run.log_buffer.clear()
+
+
+def check_finite_tensors(run, named_tensors, stage: str) -> None:
+    if not run.debug_nonfinite:
+        return
+    for name, tensor in named_tensors:
+        if not torch.isfinite(tensor).all().item():
+            message = (
+                f"non-finite value at {stage}: {name} | "
+                f"shape: {tuple(tensor.shape)} | dtype: {tensor.dtype} | "
+                f"nan count: {torch.isnan(tensor).sum().item()} | "
+                f"inf count: {torch.isinf(tensor).sum().item()}"
+            )
+            print(message, flush=True)
+            run.log_buffer.append(message)
+            flush_log(run)
+            raise FloatingPointError(message)
+
+
 def save_config_info(run, training_config, gpt_config) -> None:
     with open(training_config.config_filename, "w") as f:
         f.write(f"timestamp: {training_config.timestamp}\n")

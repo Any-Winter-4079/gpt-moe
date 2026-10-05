@@ -44,7 +44,7 @@ class TrainingConfig:
     batch_size_keys_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [0, 78_643_200], # in train_tokens_processed
+            "values": [0], # in train_tokens_processed
             # "start": 2_457_600,
             # "factor": 2, # in train_tokens_processed
             # "count": 4,
@@ -56,7 +56,7 @@ class TrainingConfig:
     batch_size_values_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [4, 8], # in batch size
+            "values": [8], # in batch size
         },
     })
 
@@ -135,6 +135,7 @@ class TrainingConfig:
     hub_repo_id: str = f"{hf_user}/nanogpt_{timestamp}"
 
     # logging
+    debug_nonfinite: bool = True # single-GPU DDP; adds synchronization overhead
     config_and_log_dir: str = f"./configs_and_logs/{timestamp}"
     log_filename: str = os.path.join(config_and_log_dir, "log.txt")
     config_filename: str = os.path.join(config_and_log_dir, "config.txt")

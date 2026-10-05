@@ -27,7 +27,7 @@ from checkpointing.checkpoint import (
     load_checkpoint, save_checkpoint, save_stage_weights_for_export,
 )
 from runtime.precision import convert_to_bf16, precision_context
-from runtime.reporting import save_config_info, log_parameter_counts
+from runtime.reporting import check_finite_tensors, flush_log, save_config_info, log_parameter_counts
 from runtime.warmup import kernel_warmup
 from runtime.pipeline import PipelineRuntime
 
@@ -243,6 +243,7 @@ def forward_for_evaluation(model, indices, targets=None, attn_mask=None, ignore_
 
 run = SimpleNamespace(
     parallel_mode=parallel_mode,
+    debug_nonfinite=training_config.debug_nonfinite and parallel_mode == "ddp" and world_size == 1,
     rank=rank,
     world_size=world_size,
     master_process=master_process,
@@ -263,7 +264,19 @@ load_hellaswag_data(run)
 if master_process:
     save_config_info(run, training_config, gpt_config)
 log_parameter_counts(run, gpt_config)
+if run.debug_nonfinite:
+    message = (
+        f"non-finite diagnostics enabled for single-GPU DDP | seed: {seed} | "
+        f"batch sizes: {batch_size_schedule_values} | "
+        f"bf16 autocast: {training_config.use_bf16_autocast} | "
+        f"compile mode: {training_config.torch_compile_mode} | timings include diagnostic checks"
+    )
+    print(message)
+    log_buffer.append(message)
+    flush_log(run)
+check_finite_tensors(run, raw_gpt_model.named_parameters(), "parameters before warmup")
 kernel_warmup(run, num_train_steps=training_config.kernel_warmup_train_steps)
+check_finite_tensors(run, raw_gpt_model.named_parameters(), "parameters after warmup restoration")
 if training_config.resume_from_checkpoint:
     torch.set_rng_state(torch_rng_state_cpu)
     torch.cuda.set_rng_state(torch_rng_state_cuda)
@@ -338,6 +351,8 @@ try:
             # reduced so we sum stage 0's 0 loss with stage 1's actual loss
             dist.all_reduce(train_losses, op=dist.ReduceOp.SUM)
         else:
+            diagnostic_context = f"step {step}, batch size {current_batch_size}"
+            check_finite_tensors(run, raw_gpt_model.named_parameters(), f"{diagnostic_context}, before forward")
             train_losses = torch.zeros(3, device=device)
             for mini_step in range(grad_accum_mini_steps):
                 x_train, y_train, doc_ids_train = train_data_loader.next_batch()
@@ -348,8 +363,18 @@ try:
                 gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
                 with ctx:
                     step_train_loss, step_token_loss, step_balance_term = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+                check_finite_tensors(
+                    run,
+                    (("train loss", step_train_loss), ("train token loss", step_token_loss), ("train balance term", step_balance_term)),
+                    f"{diagnostic_context}, microbatch {mini_step + 1}/{grad_accum_mini_steps}, after forward",
+                )
                 train_losses += torch.stack((step_train_loss.detach().float(), step_token_loss.detach().float(), step_balance_term.detach().float())) / grad_accum_mini_steps
                 (step_train_loss / grad_accum_mini_steps).backward()
+                check_finite_tensors(
+                    run,
+                    ((name, parameter.grad) for name, parameter in raw_gpt_model.named_parameters() if parameter.grad is not None),
+                    f"{diagnostic_context}, microbatch {mini_step + 1}/{grad_accum_mini_steps}, after backward",
+                )
             dist.all_reduce(train_losses, op=dist.ReduceOp.AVG)
         train_loss, token_loss, balance_term = train_losses.unbind()
         
@@ -418,8 +443,12 @@ try:
             for param_group in optimizers["muon"].param_groups:
                 param_group['lr'] = adamw_lr * raw_gpt_model.muon_lr_scale
         # step present optimizers
-        for optimizer in optimizers.values():
+        for optimizer_name, optimizer in optimizers.items():
             optimizer.step()
+            check_finite_tensors(
+                run, raw_gpt_model.named_parameters(),
+                f"step {step}, batch size {current_batch_size}, after {optimizer_name} update",
+            )
 
         # the logits can vary across ranks
         # <-- Uncomment for logit soft-capping -->
@@ -669,5 +698,6 @@ except Exception as e:
     dist.barrier()
     raise
 finally:
+    flush_log(run)
     dist.barrier()
     destroy_process_group()
