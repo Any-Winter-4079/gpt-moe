@@ -94,7 +94,8 @@ class MoE(nn.Module):
         if self.experts[0].c_fc.bias is not None:
             up_bias = torch.stack([expert.c_fc.bias for expert in self.experts]).to(dtype)
             packed = packed + up_bias[expert_indices]
-        packed = self.experts[0].activate(packed)
+        # CUDA autocast promotes pow to fp32; match nn.Linear's input cast before the down projection
+        packed = self.experts[0].activate(packed).to(dtype)
         down_weight = torch.stack([expert.c_proj.weight for expert in self.experts]).to(dtype)
         packed = grouped_linear(packed, down_weight, offsets)
         if self.experts[0].c_proj.bias is not None:
