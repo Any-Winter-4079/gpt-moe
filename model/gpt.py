@@ -59,6 +59,14 @@ class GPT(nn.Module):
         self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
         self.data_uses_padding = training_config.data_uses_padding
         self.keep_fp32_loss = training_config.keep_fp32_loss
+        self.use_liger_loss = training_config.use_liger_loss
+        if self.use_liger_loss and stage_index != 0:
+            from .loss import FusedLinearCrossEntropyLoss
+
+            self.liger_loss = FusedLinearCrossEntropyLoss(
+                ignore_index=self.pad_token_id if self.data_uses_padding else -100,
+                accum_dtype=torch.float32,
+            )
         self.moe_load_balance_weight = training_config.moe_load_balance_weight
         self.num_moe_layers = gpt_config.n_layers if gpt_config.use_moe else 0
 
@@ -674,20 +682,22 @@ class GPT(nn.Module):
         # cast if no autocast and cast is requested (x can be fp32, lm_head weights can be bf16)
         if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.lm_head.weight.dtype:
             x = x.to(dtype=self.lm_head.weight.dtype)
-        logits = self.lm_head(x)
-
-        if targets is not None:
-            logits_for_loss = logits.float() if self.keep_fp32_loss and logits.dtype != torch.float32 else logits
-            if self.data_uses_padding:
-                loss_mask = (targets != self.pad_token_id)
-                loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
-                n_non_masked_tokens = loss_mask.sum()
-                sum_non_masked_loss_tokens = (loss * loss_mask.view(-1)).sum()
-                loss = sum_non_masked_loss_tokens / n_non_masked_tokens
-            else:
-                loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
+        if self.training and targets is not None and self.use_liger_loss:
+            loss = self.liger_loss(self.lm_head.weight, x.reshape(-1, x.size(-1)), targets.reshape(-1))
         else:
-            loss = None
+            logits = self.lm_head(x)
+            if targets is not None:
+                logits_for_loss = logits.float() if self.keep_fp32_loss and logits.dtype != torch.float32 else logits
+                if self.data_uses_padding:
+                    loss_mask = (targets != self.pad_token_id)
+                    loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
+                    n_non_masked_tokens = loss_mask.sum()
+                    sum_non_masked_loss_tokens = (loss * loss_mask.view(-1)).sum()
+                    loss = sum_non_masked_loss_tokens / n_non_masked_tokens
+                else:
+                    loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
+            else:
+                loss = None
 
         if previous_stage_balance_loss is not None:
             balance_loss = previous_stage_balance_loss if balance_loss is None else balance_loss + previous_stage_balance_loss

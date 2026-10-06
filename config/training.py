@@ -18,6 +18,9 @@ class TrainingConfig:
     # parallelism
     parallel_mode: str = "ddp" # "ddp" or "pp"
 
+    # training loss
+    use_liger_loss: bool = True
+
     # MoE training objective
     moe_load_balance_weight: float = 0.01
 
@@ -226,6 +229,10 @@ class TrainingConfig:
         if self.use_all_bf16_and_null_ctx:
             self.use_bf16_autocast = False
             self.bf16_weights_params_and_scales = {"all": object}
+
+        # Liger's loss runs outside the compiled transformer because it reads a scalar with .item()
+        if self.use_liger_loss:
+            self.torch_compile_fullgraph = False
 
         # Muon Polar Express
         if self.optimizer_type == "muon" and self.muon_backend == "polarexpress":

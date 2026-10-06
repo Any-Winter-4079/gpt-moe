@@ -141,7 +141,7 @@ resume_config = {
             "moe_load_balance_weight", "use_bf16_autocast", "use_all_bf16_and_null_ctx",
             "use_bf16_weights_params_or_scales",
             "keep_1d_weights_params_and_scales_in_fp32", "keep_fp32_loss",
-            "cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast",
+            "cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast", "use_liger_loss",
         )
     },
     "bf16_weights_params_and_scales": {
