@@ -138,7 +138,7 @@ class TrainingConfig:
     hub_repo_id: str = f"{hf_user}/nanogpt_{timestamp}"
 
     # logging
-    debug_nonfinite: bool = True # single-GPU DDP; adds synchronization overhead
+    debug_nonfinite: bool = False # single-GPU DDP; adds synchronization overhead
     config_and_log_dir: str = f"./configs_and_logs/{timestamp}"
     log_filename: str = os.path.join(config_and_log_dir, "log.txt")
     config_filename: str = os.path.join(config_and_log_dir, "config.txt")
