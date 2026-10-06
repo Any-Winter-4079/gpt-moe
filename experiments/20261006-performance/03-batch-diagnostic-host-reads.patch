@@ -1,0 +1,45 @@
+diff --git a/model/attention.py b/model/attention.py
+--- a/model/attention.py
++++ b/model/attention.py
+@@ -129,6 +129,7 @@
+     max_k_raw = 0.0
+     max_q_eff = 0.0
+     max_k_eff = 0.0
++    scale_stats = []
+ 
+     for blk in model.transformer.h:
+         attn = blk.attn
+@@ -144,10 +145,15 @@
+         q_eff = torch.clamp(attn.q_scale, max=attn.qk_scale_max).max()
+         k_eff = torch.clamp(attn.k_scale, max=attn.qk_scale_max).max()
+ 
+-        max_q_raw = max(max_q_raw, float(q_raw))
+-        max_k_raw = max(max_k_raw, float(k_raw))
+-        max_q_eff = max(max_q_eff, float(q_eff))
+-        max_k_eff = max(max_k_eff, float(k_eff))
++        scale_stats.extend((q_raw, k_raw, q_eff, k_eff))
++
++    if scale_stats:
++        # read all diagnostic scalars in one device-to-host transfer
++        for q_raw, k_raw, q_eff, k_eff in torch.stack(scale_stats).view(-1, 4).tolist():
++            max_q_raw = max(max_q_raw, q_raw)
++            max_k_raw = max(max_k_raw, k_raw)
++            max_q_eff = max(max_q_eff, q_eff)
++            max_k_eff = max(max_k_eff, k_eff)
+ 
+     return (
+         f"max q_scale raw/eff: {max_q_raw:.4f}/{max_q_eff:.4f} | "
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -433,9 +433,7 @@
+         # dist.all_reduce(logits_absmax_post_capping, op=dist.ReduceOp.MAX)
+         # <-- Uncomment for logit soft-capping -->
+ 
+-        tl = float(train_loss)
+-        token_tl = float(token_loss)
+-        balance_tl = float(balance_term)
++        tl, token_tl, balance_tl = train_losses.tolist()
+ 
+         torch.cuda.synchronize()
+         end_train_t = time.time()

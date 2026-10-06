@@ -1,0 +1,188 @@
+diff --git a/model/grouped_routing.py b/model/grouped_routing.py
+new file mode 100644
+--- /dev/null
++++ b/model/grouped_routing.py
+@@ -0,0 +1,154 @@
++from __future__ import annotations
++
++from typing import Any, Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import triton_op, wrap_triton
++
++
++@triton.jit
++def _dispatch_kernel(
++    X, Order, Packed, Inverse,
++    D: tl.constexpr, TOP_K: tl.constexpr,
++    x_stride_m: tl.constexpr, x_stride_d: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    row = tl.program_id(0)
++    route = tl.load(Order + row)
++    col = tl.arange(0, BLOCK_D)
++    x = tl.load(X + (route // TOP_K) * x_stride_m + col * x_stride_d, col < D, 0.0)
++    tl.store(Packed + row * D + col, x, col < D)
++    tl.store(Inverse + route, row)
++
++
++@triton.jit
++def _dispatch_backward_kernel(
++    Grad, Inverse, GradX,
++    D: tl.constexpr, TOP_K: tl.constexpr,
++    grad_stride_m: tl.constexpr, grad_stride_d: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    token = tl.program_id(0)
++    col = tl.arange(0, BLOCK_D)
++    acc = tl.zeros((BLOCK_D,), tl.float32)
++    for slot in tl.static_range(TOP_K):
++        row = tl.load(Inverse + token * TOP_K + slot)
++        grad = tl.load(Grad + row * grad_stride_m + col * grad_stride_d, col < D, 0.0)
++        acc += grad.to(GradX.dtype.element_ty).to(tl.float32)
++    tl.store(GradX + token * D + col, acc, col < D)
++
++
++@triton.jit
++def _combine_kernel(
++    Packed, Inverse, Weights, Out,
++    D: tl.constexpr, TOP_K: tl.constexpr,
++    packed_stride_m: tl.constexpr, packed_stride_d: tl.constexpr,
++    weights_stride_m: tl.constexpr, weights_stride_k: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    token = tl.program_id(0)
++    col = tl.arange(0, BLOCK_D)
++    acc = tl.zeros((BLOCK_D,), tl.float32)
++    for slot in tl.static_range(TOP_K):
++        row = tl.load(Inverse + token * TOP_K + slot)
++        value = tl.load(Packed + row * packed_stride_m + col * packed_stride_d, col < D, 0.0)
++        weight = tl.load(Weights + token * weights_stride_m + slot * weights_stride_k)
++        value = value.to(Out.dtype.element_ty).to(tl.float32)
++        weight = weight.to(Out.dtype.element_ty).to(tl.float32)
++        # preserve the multiply's output dtype before the top-k reduction
++        acc += (value * weight).to(Out.dtype.element_ty).to(tl.float32)
++    tl.store(Out + token * D + col, acc, col < D)
++
++
++@triton.jit
++def _combine_backward_kernel(
++    Grad, Packed, Inverse, Weights, GradPacked, GradWeights,
++    D: tl.constexpr, TOP_K: tl.constexpr,
++    grad_stride_m: tl.constexpr, grad_stride_d: tl.constexpr,
++    packed_stride_m: tl.constexpr, packed_stride_d: tl.constexpr,
++    weights_stride_m: tl.constexpr, weights_stride_k: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    token = tl.program_id(0)
++    col = tl.arange(0, BLOCK_D)
++    grad = tl.load(Grad + token * grad_stride_m + col * grad_stride_d, col < D, 0.0).to(tl.float32)
++    for slot in tl.static_range(TOP_K):
++        row = tl.load(Inverse + token * TOP_K + slot)
++        value = tl.load(Packed + row * packed_stride_m + col * packed_stride_d, col < D, 0.0)
++        weight = tl.load(Weights + token * weights_stride_m + slot * weights_stride_k)
++        value = value.to(Grad.dtype.element_ty).to(tl.float32)
++        weight = weight.to(Grad.dtype.element_ty).to(tl.float32)
++        grad_value = (grad * weight).to(Grad.dtype.element_ty)
++        tl.store(GradPacked + row * D + col, grad_value, col < D)
++        grad_weight = (grad * value).to(Grad.dtype.element_ty).to(tl.float32)
++        grad_weight = tl.sum(tl.where(col < D, grad_weight, 0.0), 0).to(Grad.dtype.element_ty)
++        tl.store(GradWeights + token * TOP_K + slot, grad_weight)
++
++
++@triton_op("gpt_moe::grouped_dispatch", mutates_args=())
++def grouped_dispatch(x: Tensor, order: Tensor, top_k: int, dtype: torch.dtype) -> Tuple[Tensor, Tensor]:
++    packed = x.new_empty((order.numel(), x.shape[1]), dtype=dtype)
++    inverse = torch.empty_like(order)
++    wrap_triton(_dispatch_kernel)[(order.numel(),)](
++        x, order, packed, inverse, x.shape[1], top_k, x.stride(0), x.stride(1),
++        triton.next_power_of_2(x.shape[1]),
++    )
++    return packed, inverse
++
++
++@triton_op("gpt_moe::grouped_dispatch_backward", mutates_args=())
++def _grouped_dispatch_backward(grad: Tensor, inverse: Tensor, top_k: int, dtype: torch.dtype) -> Tensor:
++    grad_x = grad.new_empty((inverse.numel() // top_k, grad.shape[1]), dtype=dtype)
++    wrap_triton(_dispatch_backward_kernel)[(grad_x.shape[0],)](
++        grad, inverse, grad_x, grad.shape[1], top_k, grad.stride(0), grad.stride(1),
++        triton.next_power_of_2(grad.shape[1]),
++    )
++    return grad_x
++
++
++@triton_op("gpt_moe::grouped_combine", mutates_args=())
++def grouped_combine(packed: Tensor, inverse: Tensor, weights: Tensor, dtype: torch.dtype) -> Tensor:
++    output = packed.new_empty((weights.shape[0], packed.shape[1]), dtype=dtype)
++    wrap_triton(_combine_kernel)[(output.shape[0],)](
++        packed, inverse, weights, output, packed.shape[1], weights.shape[1],
++        packed.stride(0), packed.stride(1), weights.stride(0), weights.stride(1),
++        triton.next_power_of_2(packed.shape[1]), enable_fp_fusion=False,
++    )
++    return output
++
++
++@triton_op("gpt_moe::grouped_combine_backward", mutates_args=())
++def _grouped_combine_backward(grad: Tensor, packed: Tensor, inverse: Tensor, weights: Tensor) -> Tuple[Tensor, Tensor]:
++    grad_packed = torch.empty_like(packed, memory_format=torch.contiguous_format)
++    grad_weights = torch.empty_like(weights, memory_format=torch.contiguous_format)
++    wrap_triton(_combine_backward_kernel)[(weights.shape[0],)](
++        grad, packed, inverse, weights, grad_packed, grad_weights, packed.shape[1], weights.shape[1],
++        grad.stride(0), grad.stride(1), packed.stride(0), packed.stride(1),
++        weights.stride(0), weights.stride(1), triton.next_power_of_2(packed.shape[1]),
++    )
++    return grad_packed, grad_weights
++
++
++def _dispatch_setup_context(ctx: Any, inputs: Tuple, output: Tuple[Tensor, Tensor]) -> None:
++    x, order, top_k, dtype = inputs
++    ctx.save_for_backward(output[1])
++    ctx.top_k = top_k
++    ctx.dtype = x.dtype
++    ctx.mark_non_differentiable(output[1])
++
++
++def _dispatch_backward(ctx: Any, grad: Tensor, grad_inverse: Tensor) -> Tuple:
++    inverse, = ctx.saved_tensors
++    return _grouped_dispatch_backward(grad, inverse, ctx.top_k, ctx.dtype), None, None, None
++
++
++def _combine_setup_context(ctx: Any, inputs: Tuple, output: Tensor) -> None:
++    ctx.save_for_backward(*inputs[:3])
++
++
++def _combine_backward(ctx: Any, grad: Tensor) -> Tuple:
++    grad_packed, grad_weights = _grouped_combine_backward(grad, *ctx.saved_tensors)
++    return grad_packed, None, grad_weights, None
++
++
++grouped_dispatch.register_autograd(_dispatch_backward, setup_context=_dispatch_setup_context)
++grouped_combine.register_autograd(_combine_backward, setup_context=_combine_setup_context)
+diff --git a/model/moe.py b/model/moe.py
+--- a/model/moe.py
++++ b/model/moe.py
+@@ -8,6 +8,7 @@
+ from torch.nn import functional as F
+ 
+ from .grouped_linear import grouped_linear
++from .grouped_routing import grouped_combine, grouped_dispatch
+ from .mlp import MLP
+ 
+ if TYPE_CHECKING:
+@@ -86,7 +87,7 @@
+         )
+         offsets = counts.cumsum(0, dtype=torch.int32)
+         dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else self.experts[0].c_fc.weight.dtype
+-        packed = hidden_states[order // self.top_k].to(dtype)
++        packed, inverse_order = grouped_dispatch(hidden_states, order, self.top_k, dtype)
+ 
+         # stack for computation while keeping each 2d parameter and its Muon update
+         up_weight = torch.stack([expert.c_fc.weight for expert in self.experts]).to(dtype)
+@@ -102,7 +103,4 @@
+             down_bias = torch.stack([expert.c_proj.bias for expert in self.experts]).to(dtype)
+             packed = packed + down_bias[expert_indices]
+ 
+-        # restore token/top-k order before summing, avoiding atomic output accumulation
+-        inverse_order = torch.empty_like(order).scatter_(0, order, torch.arange(order.numel(), device=order.device))
+-        expert_output = packed[inverse_order].view(hidden_states.shape[0], self.top_k, -1).to(hidden_states.dtype)
+-        return (expert_output * top_k_weights[:, :, None].to(hidden_states.dtype)).sum(dim=1)
++        return grouped_combine(packed, inverse_order, top_k_weights, hidden_states.dtype)

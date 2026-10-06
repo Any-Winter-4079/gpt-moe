@@ -1,0 +1,20 @@
+diff --git a/model/attention.py b/model/attention.py
+--- a/model/attention.py
++++ b/model/attention.py
+@@ -247,9 +247,13 @@
+         if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.q_proj.weight.dtype:
+             x = x.to(dtype=self.q_proj.weight.dtype)
+ 
+-        q = self.q_proj(x).view(x.size(0), seq_len, self.n_heads, self.head_size).transpose(1, 2)
+-        k = self.k_proj(x).view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
+-        v = self.v_proj(x).view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
++        # keep separate parameters for Muon, but project Q/K/V in one matrix multiplication
++        qkv_weight = torch.cat((self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0)
++        qkv_bias = torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias), dim=0) if self.q_proj.bias is not None else None
++        q, k, v = F.linear(x, qkv_weight, qkv_bias).split((self.attn_dim, self.n_kv_heads * self.head_size, self.n_kv_heads * self.head_size), dim=-1)
++        q = q.view(x.size(0), seq_len, self.n_heads, self.head_size).transpose(1, 2)
++        k = k.view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
++        v = v.view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
+ 
+         if self.rotary is not None:
+             # apply RoPE

@@ -1,0 +1,42 @@
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -151,6 +151,7 @@
+             lr = group['lr']
+             momentum = group['momentum']
+             zeropower_backend = zeropower_backends[group['backend']]
++            buckets = {}
+             for p in group['params']:
+                 g = p.grad
+                 if g is None:
+@@ -163,10 +164,25 @@
+                 if group['nesterov']:
+                     g.add_(buf, alpha=momentum)
+                 if g.size(0) == 3 * g.size(1):  # split grouped QKV parameters
+-                    g = torch.cat([zeropower_backend(g1, steps=group['backend_steps']) for g1 in g.split(g.size(1))])
+-                    scale = g.size(1) ** 0.5
++                    updates = zip(p.data.split(g.size(1)), g.split(g.size(1)))
+                 else:
+-                    g = zeropower_backend(g, steps=group['backend_steps'])
+-                    scale = max(g.size(0), g.size(1)) ** 0.5  # scale so the update has ≈ unit mean-squared magnitude
+-                p.data.add_(g, alpha=-lr * scale)
++                    updates = [(p.data, g)]
++                for weight, update in updates:
++                    if group['backend'] == 'polarexpress':
++                        key = (update.shape, update.device, update.dtype)
++                        buckets.setdefault(key, []).append((weight, update))
++                    else:
++                        update = zeropower_backend(update, steps=group['backend_steps'])
++                        scale = max(update.shape) ** 0.5
++                        weight.add_(update, alpha=-lr * scale)
++
++            for bucket in buckets.values():
++                # bound temporary memory while batching independent matrix updates
++                for start in range(0, len(bucket), 8):
++                    batch = bucket[start:start + 8]
++                    updates = torch.stack([g for _, g in batch])
++                    updates = zeropower_backend(updates, steps=group['backend_steps'])
++                    scale = max(updates.shape[-2:]) ** 0.5
++                    for (weight, _), update in zip(batch, updates):
++                        weight.add_(update, alpha=-lr * scale)
+ # -- End of (modified) source: https://github.com/tyler-romero/nanogpt-speedrun/blob/main/src/train_gpt2.py --

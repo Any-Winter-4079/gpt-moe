@@ -1,0 +1,38 @@
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -563,7 +563,33 @@
+             )
+         # -- End of (modified) source: https://github.com/KellerJordan/modded-nanogpt/blob/master/records/071225_BosAlign/c1fd8a38-bb9f-45c4-8af0-d37f70c993f3.txt --
+ 
+-        # old path (for is_causal=False, validation, sampling, and hellaswag)
++        # eval masks without padding or documents can be classified exactly at block granularity
++        if not self.training and attn_mask is None and (not self.use_doc_masking or ignore_doc_mask or document_ids is None):
++            block_indices = torch.arange(seq_len // block_size, dtype=torch.int32, device=device)
++            block_distance = (block_indices[:, None] - block_indices) * block_size
++            if self.is_causal:
++                blockmask_any = block_distance >= 0
++                blockmask_all = block_distance >= block_size - 1
++            else:
++                blockmask_any = torch.ones_like(block_distance, dtype=torch.bool)
++                blockmask_all = blockmask_any
++            if apply_swa:
++                # the nearest and farthest token distances determine partial and full SWA tiles
++                block_distance = block_distance.abs()
++                blockmask_any = blockmask_any & ((block_distance - block_size + 1).clamp_min(0) <= window_size)
++                blockmask_all = blockmask_all & (block_distance + block_size - 1 <= window_size)
++            partial_blocks = (blockmask_any & ~blockmask_all)[None, None].expand(gpu_batch_size, 1, -1, -1).to(torch.int32)
++            full_blocks = blockmask_all[None, None].expand(gpu_batch_size, 1, -1, -1).to(torch.int32)
++            return BlockMask.from_kv_blocks(
++                partial_blocks.sum(dim=-1, dtype=torch.int32).contiguous(),
++                partial_blocks.argsort(dim=-1, descending=True, stable=True).to(torch.int32),
++                full_blocks.sum(dim=-1, dtype=torch.int32).contiguous(),
++                full_blocks.argsort(dim=-1, descending=True, stable=True).to(torch.int32),
++                BLOCK_SIZE=block_size,
++                mask_mod=mask_mod,
++            )
++
++        # general path for masks that depend on token values and noncausal training
+         return create_block_mask(
+             mask_mod,
+             B=gpu_batch_size,

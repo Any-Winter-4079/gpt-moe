@@ -1,0 +1,45 @@
+diff --git a/data/loader.py b/data/loader.py
+--- a/data/loader.py
++++ b/data/loader.py
+@@ -57,7 +57,7 @@
+         self.sorted_shards = sorted_shards
+         self.current_shard_idx = current_shard_idx
+ 
+-        # load shard tokens (CPU long tensor; materialize now to avoid memmap stalls)
++        # load shard tokens (CPU int32 tensor; materialize now to avoid memmap stalls)
+         self.tokens = self.load_shard_tokens(sorted_shards[self.current_shard_idx])
+ 
+         # there are world_size (e.g., 2) gpus,
+@@ -133,17 +133,14 @@
+         next_idx = (self.current_shard_idx + 1) % len(self.sorted_shards)
+ 
+         def _worker():
+-            # load + convert once on CPU (int32 -> long), avoids memmap stalls
+-            np_arr = np.load(self.sorted_shards[next_idx])
+-            tokens = torch.tensor(np_arr.astype(np.int32), dtype=torch.long)
+-            self._next_tokens = tokens
++            self._next_tokens = self.load_shard_tokens(self.sorted_shards[next_idx])
+ 
+         self._prefetch_thread = threading.Thread(target=_worker, daemon=True)
+         self._prefetch_thread.start()
+ 
+     def load_shard_tokens(self, shard_path: str) -> Tensor:
+-        # materialize to CPU long tensor (stable, no memmap)
+-        return torch.tensor(np.load(shard_path).astype(np.int32), dtype=torch.long)
++        # materialize to CPU int32; convert only selected batches to long
++        return torch.from_numpy(np.load(shard_path).astype(np.int32, copy=False))
+     
+     def reset(self) -> None:
+         self.current_shard_idx = 0
+@@ -200,8 +197,9 @@
+             # e.g., for gpu 0: [0-1023, 2048-3071] for the 1st grad accum mini-step
+             #       for gpu 1: [1024-2047, 5120-6143] for the 1st grad accum mini-step
+ 
+-        x = torch.stack([self.tokens[start:start + self.seq_len] for start in batch_starts])
+-        y = torch.stack([self.tokens[start + 1:start + self.seq_len + 1] for start in batch_starts])
++        batch = torch.stack([self.tokens[start:start + self.seq_len + 1] for start in batch_starts])
++        x = batch[:, :-1].to(dtype=torch.long, memory_format=torch.contiguous_format)
++        y = batch[:, 1:].to(dtype=torch.long, memory_format=torch.contiguous_format)
+ 
+         # optional doc ids (per-token doc index within the window)
+         doc_ids = None
