@@ -22,7 +22,7 @@ class PipelineStageModel(nn.Module):
             previous_stage_balance_loss: Optional[Tensor] = None,
             targets: Optional[Tensor] = None,
             document_ids: Optional[Tensor] = None,
-            ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]], Tuple[Tensor, Tensor, Tensor, Tensor]]:
+            ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]], Tuple[Tensor, Tensor, Tensor]]:
         output = self.model(indices, targets, document_ids=document_ids, previous_stage_balance_loss=previous_stage_balance_loss)
         # the scheduler transports activations from the first stage and backpropagates the final stage's loss
         return output
@@ -71,8 +71,8 @@ class PipelineRuntime:
             dist.broadcast(doc_ids, src=0)
         return x, y, doc_ids
 
-    def loss_fn(self, output: Tuple[Tensor, Tensor, Tensor, Tensor], target: Tensor) -> Tensor:
-        logits, total_loss, token_loss, balance_term = output
+    def loss_fn(self, output: Tuple[Tensor, Tensor, Tensor], target: Tensor) -> Tensor:
+        total_loss, token_loss, balance_term = output
         self.loss_components.append((token_loss.detach().float(), balance_term.detach().float()))
         return total_loss
 

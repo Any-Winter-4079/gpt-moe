@@ -606,7 +606,7 @@ class GPT(nn.Module):
             ignore_doc_mask: bool = False,
             document_ids: Optional[Tensor] = None,
             previous_stage_balance_loss: Optional[Tensor] = None,
-            ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]], Tuple[Tensor, Tensor, Tensor, Tensor]]:
+            ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]], Tuple[Tensor, Tensor, Tensor]]:
         # ignore_doc_mask to avoid using it in:
         # val, sampling, hellaswag
         # even if used in train
@@ -697,5 +697,5 @@ class GPT(nn.Module):
             if self.training and balance_loss is not None:
                 balance_term = self.moe_load_balance_weight * balance_loss / self.num_moe_layers
                 loss = loss + balance_term
-            return (logits, loss, token_loss, balance_term) if self.training else loss
+            return (loss, token_loss, balance_term) if self.training else loss
         return logits
