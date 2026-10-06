@@ -11,7 +11,7 @@ class GPTConfig:
     d_model: int = 1024
     use_bias: bool = False
     mlp_hidden_dim: int = 2048
-    use_tied_embeddings: bool = False
+    use_tied_embeddings: bool = True
     norm_type: str = "rms" # "rms" or any other name for "layer"
     is_causal: bool = True # True for decoders or False for encoders
 
@@ -74,7 +74,7 @@ class GPTConfig:
     use_fair_swiglu: bool = True # only if swiglu
 
     # mixture of experts
-    use_moe: bool = False
+    use_moe: bool = True
     num_experts: int = 8
     moe_top_k: int = 2
     # for top-k > 1, use full-softmax gates instead of renormalizing the selected experts; top-1 always uses full softmax
