@@ -60,6 +60,7 @@ class GPT(nn.Module):
         self.data_uses_padding = training_config.data_uses_padding
         self.keep_fp32_loss = training_config.keep_fp32_loss
         self.use_liger_loss = training_config.use_liger_loss
+        self.dense_loss_max_elements = training_config.dense_loss_max_elements
         if self.use_liger_loss and stage_index != 0:
             from .loss import FusedLinearCrossEntropyLoss
 
@@ -682,7 +683,10 @@ class GPT(nn.Module):
         # cast if no autocast and cast is requested (x can be fp32, lm_head weights can be bf16)
         if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.lm_head.weight.dtype:
             x = x.to(dtype=self.lm_head.weight.dtype)
-        if self.training and targets is not None and self.use_liger_loss:
+        if (
+            self.training and targets is not None and self.use_liger_loss
+            and x.size(0) * x.size(1) * self.lm_head.weight.size(0) > self.dense_loss_max_elements
+        ):
             loss = self.liger_loss(self.lm_head.weight, x.reshape(-1, x.size(-1)), targets.reshape(-1))
         else:
             logits = self.lm_head(x)

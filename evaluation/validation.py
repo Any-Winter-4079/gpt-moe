@@ -3,8 +3,6 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from runtime.reporting import check_finite_tensors
-
 
 def evaluate_validation(run, val_data_loader, val_steps: int, gpu_batch_size_val: int, seq_len_val: int) -> torch.Tensor:
     run.gpt_model.eval()
@@ -27,10 +25,6 @@ def evaluate_validation(run, val_data_loader, val_steps: int, gpu_batch_size_val
                 if doc_ids_val is not None:
                     doc_ids_val = doc_ids_val.pin_memory().to(run.device, non_blocking=True)
                 step_val_loss = run.gpt_model(x_val, y_val, document_ids=doc_ids_val)
-            check_finite_tensors(
-                run, (("validation loss", step_val_loss),),
-                f"validation batch {val_step + 1}/{val_steps}, batch size {gpu_batch_size_val}",
-            )
             val_loss += step_val_loss.float() / val_steps
         reduction = dist.ReduceOp.SUM if run.parallel_mode == "pp" else dist.ReduceOp.AVG
         dist.all_reduce(val_loss, op=reduction)

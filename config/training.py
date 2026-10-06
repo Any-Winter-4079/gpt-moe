@@ -20,6 +20,8 @@ class TrainingConfig:
 
     # training loss
     use_liger_loss: bool = True
+    # maximum logit elements for the original loss (batch * sequence length * vocabulary)
+    dense_loss_max_elements: int = 4 * 8192 * 50304
 
     # MoE training objective
     moe_load_balance_weight: float = 0.01
@@ -138,7 +140,6 @@ class TrainingConfig:
     hub_repo_id: str = f"{hf_user}/nanogpt_{timestamp}"
 
     # logging
-    debug_nonfinite: bool = False # single-GPU DDP; adds synchronization overhead
     config_and_log_dir: str = f"./configs_and_logs/{timestamp}"
     log_filename: str = os.path.join(config_and_log_dir, "log.txt")
     config_filename: str = os.path.join(config_and_log_dir, "config.txt")

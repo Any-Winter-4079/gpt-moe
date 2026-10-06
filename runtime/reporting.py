@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import subprocess
 from dataclasses import fields
+from pathlib import Path
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -14,21 +17,29 @@ def flush_log(run) -> None:
         run.log_buffer.clear()
 
 
-def check_finite_tensors(run, named_tensors, stage: str) -> None:
-    if not run.debug_nonfinite:
-        return
-    for name, tensor in named_tensors:
-        if not torch.isfinite(tensor).all().item():
-            message = (
-                f"non-finite value at {stage}: {name} | "
-                f"shape: {tuple(tensor.shape)} | dtype: {tensor.dtype} | "
-                f"nan count: {torch.isnan(tensor).sum().item()} | "
-                f"inf count: {torch.isinf(tensor).sum().item()}"
-            )
-            print(message, flush=True)
-            run.log_buffer.append(message)
-            flush_log(run)
-            raise FloatingPointError(message)
+def log_source_code(log_buffer: List[str]) -> None:
+    source_root = Path(__file__).resolve().parents[1]
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=source_root, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        changes = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=source_root, text=True, stderr=subprocess.DEVNULL,
+        )
+        log_buffer.extend([f"git commit: {commit}", f"git working tree modified: {bool(changes.strip())}"])
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        log_buffer.append("git commit: unavailable")
+
+    # read only Python files in the source directories, without traversing datasets or environments
+    source_dirs = ("", "checkpointing", "config", "data", "evaluation", "model", "optimizers", "runtime", "sampling", "schedules")
+    for directory in source_dirs:
+        for path in sorted((source_root / directory).glob("*.py")):
+            log_buffer.extend([
+                "=" * 100,
+                f"source: {path.relative_to(source_root).as_posix()}",
+                "=" * 100,
+                path.read_text(encoding="utf-8"),
+            ])
 
 
 def save_config_info(run, training_config, gpt_config) -> None:
