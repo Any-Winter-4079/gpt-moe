@@ -22,6 +22,7 @@ from data.loader import DataLoader
 from schedules.token import get_next_update_tokens
 from sampling.sample import get_sample_token_count, sample
 from evaluation.hellaswag import load_hellaswag_data, evaluate_hellaswag_standard
+from evaluation.gsm8k import load_gsm8k_data, evaluate_gsm8k
 from evaluation.validation import evaluate_validation
 from checkpointing.checkpoint import (
     export_full_model_ddp, export_full_model_pp, keep_latest_checkpoints,
@@ -262,6 +263,8 @@ run = SimpleNamespace(
     pipeline_non_training_forward=pipeline_non_training_forward,
 )
 load_hellaswag_data(run)
+if training_config.run_gsm8k:
+    load_gsm8k_data(run)
 if master_process:
     save_config_info(run, training_config, gpt_config)
 log_parameter_counts(run, gpt_config)
@@ -658,6 +661,21 @@ try:
                 )
             if master_process:
                 message = f"exported full model to: {export_path}"
+                print(message)
+                log_buffer.append(message)
+
+        if training_config.run_gsm8k and (
+            stop_training or step == max_train_steps - 1
+            or (training_config.gsm8k_interval > 0 and step > 0 and step % training_config.gsm8k_interval == 0)
+        ):
+            torch.cuda.synchronize()
+            start_gsm8k_t = time.time()
+            accuracy = evaluate_gsm8k(run)
+            torch.cuda.synchronize()
+            gsm8k_step_t = time.time() - start_gsm8k_t
+            total_t += gsm8k_step_t
+            if master_process:
+                message = f"step: {step:,} | GSM8K acc: {accuracy:.4f} | GSM8K time: {gsm8k_step_t:,.2f} s"
                 print(message)
                 log_buffer.append(message)
 

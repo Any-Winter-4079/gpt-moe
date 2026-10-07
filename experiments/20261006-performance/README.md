@@ -1,6 +1,6 @@
 # Performance experiments — 2026-10-06
 
-The original patches were prepared against source commit `7704a680a84be3000e407887e149914215c655c5`, which includes the grouped MoE implementation and its ReLU²/autocast correction. Batched Muon (formerly patch 05) is now incorporated into the working training code, and its experiment files have been removed. The remaining patches are stored here for testing on top of batched Muon.
+The original patches were prepared against source commit `7704a680a84be3000e407887e149914215c655c5`, which includes the grouped MoE implementation and its ReLU²/autocast correction. Batched Muon (formerly patch 05) and validation autocast (formerly patch 07) are now incorporated into the working code, and their experiment files have been removed. The remaining patches are stored here for testing on top of those changes.
 
 The objective is to reach the same validation loss sooner by implementing the existing computation more efficiently. Layer counts, expert selection, parameter identities, learning-rate and batch schedules, data order, tokenizer, and loss objective are retained. Floating-point reduction order can change in the numerical kernels; the reports identify those cases. Existing DDP and two-stage PP interfaces are retained, but actual distributed GPU execution remains unverified.
 
@@ -9,7 +9,6 @@ The objective is to reach the same validation loss sooner by implementing the ex
 | Patch | Mechanism | Main measurement | Assessment |
 | --- | --- | --- | --- |
 | [06 — static validation masks](06-static-validation-mask.patch) | Classify exact attention tiles from their token-distance bounds during evaluation without dynamic masks | Validation time and identical validation loss | First validation-speed candidate; avoids constructing a token-pair mask for this case |
-| [07 — validation autocast](07-validation-autocast.patch) | Reuse the configured BF16 autocast context during validation | Validation time and loss on the same checkpoint | One-line precision experiment; evaluation values can change |
 | [01 — fused MoE routing](01-fused-moe-routing.patch) | Fuse dispatch/combine and their backwards; gather input gradients by token instead of atomic scatter | Training-step time, routing time and peak GPU memory | Promising memory-traffic hypothesis; new Triton kernels need GPU compilation and numerical checks |
 | [04 — packed QKV](04-packed-qkv.patch) | Concatenate projection weights for one Q/K/V multiplication while retaining the three registered parameters | Training-step time and loss trajectory | Small implementation change; packing overhead and changed gradient summation can offset the benefit |
 | [03 — diagnostic host reads](03-batch-diagnostic-host-reads.patch) | Read Q/K diagnostic scalars together, and read the three training losses together | Actual wall time; smaller possible effect on logged step time | Modest overhead reduction; Q/K reporting is outside the training timer |
@@ -39,7 +38,7 @@ Use the corresponding filename for another experiment. The check commands catch 
 
 Use the same GPU environment, seed, dataset, configuration, and starting weights for the baseline and each candidate. Keep the existing 4→8 batch schedule and 8192 sequence length. Check both batch-size phases; an early improvement at four sequences does not establish the result at eight. Compare a range of steady-state steps with the same batch/window size, then the elapsed time to the same validation target, `3.28`. The normal training run is the deciding experiment; the detailed component checks in the individual reports are optional ways to investigate a failure or unexpected result.
 
-The [uploaded earlier MoE run](https://huggingface.co/Edue3r4t5y6/nanogpt_20261006_153319_RTX-PRO-6000-95GB_BS8_SEQ8192_GA4/raw/main/log.txt) reached `3.27687502` at step **1,825**, after **400,031,744 training tokens**. Its source commit was `a8fd074eb70ef50db0f4361150e2a475a3b07259`, predating the grouped implementation used as this patch baseline. Treat that result as historical context; compare the remaining patches against the current code with batched Muon on the same machine.
+The [uploaded earlier MoE run](https://huggingface.co/Edue3r4t5y6/nanogpt_20261006_153319_RTX-PRO-6000-95GB_BS8_SEQ8192_GA4/raw/main/log.txt) reached `3.27687502` at step **1,825**, after **400,031,744 training tokens**. Its source commit was `a8fd074eb70ef50db0f4361150e2a475a3b07259`, predating the grouped implementation used as this patch baseline. Treat that result as historical context; compare the remaining patches against the current code with batched Muon and validation autocast on the same machine.
 
 The historical log reports separate costs:
 
@@ -55,7 +54,7 @@ Their sum is about 131.12 minutes, before other untracked overhead. The displaye
 
 The reports document CPU algebra, loader, mask, state, syntax, and graph-capture checks. Triton arithmetic was inspected or exercised through CPU stand-ins where possible; those checks do not establish CUDA lowering, kernel performance, or distributed correctness. This machine cannot run the target CUDA kernels. GPU compilation, numerical behavior, peak memory, and time to the validation target still need your tests.
 
-The remaining patches can be applied independently on top of batched Muon. The integration check verifies that their source edits can coexist and parse together. That establishes source compatibility, not measured performance of the combined version.
+The remaining patches can be applied independently on top of batched Muon and validation autocast. The integration check verifies that their source edits can coexist and parse together. That establishes source compatibility, not measured performance of the combined version.
 
 ## Larger research directions
 

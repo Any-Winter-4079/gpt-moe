@@ -175,6 +175,14 @@ class TrainingConfig:
     hellaswag_interval: int = 50
     run_benchmarks: bool = False
 
+    # gsm8k
+    run_gsm8k: bool = False
+    gsm8k_interval: int = -1 # -1 runs only at the end; positive values also run every N steps
+    gsm8k_max_examples: int = -1 # -1 uses the full test split
+    gsm8k_num_shots: int = 8 # first N train examples as worked solutions
+    gsm8k_examples_per_batch: int = 4
+    gsm8k_max_new_tokens: int = 512
+
     # seeding
     base_seed: int = 1337
 

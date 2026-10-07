@@ -12,7 +12,7 @@ def evaluate_validation(run, val_data_loader, val_steps: int, gpu_batch_size_val
     else:
         val_data_loader.reset()
 
-    with torch.inference_mode():
+    with torch.inference_mode(), run.ctx:
         val_loss = torch.zeros((), device=run.device)
         for val_step in range(val_steps):
             if run.parallel_mode == "pp":
