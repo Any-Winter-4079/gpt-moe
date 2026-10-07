@@ -85,7 +85,7 @@ def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
 
     # val-shape warmup (compile eval forward)
     gpt_model.eval()
-    with torch.inference_mode():
+    with torch.inference_mode(), ctx:
         x_val = torch.randint(
             0, raw_gpt_model.pad_token_id,
             (gpu_batch_size_val, seq_len_val), device=device
@@ -200,7 +200,7 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
 
     # val-shape warmup (compile eval forward)
     gpt_model.eval()
-    with torch.inference_mode():
+    with torch.inference_mode(), ctx:
         x_val = torch.randint(
             0, raw_gpt_model.pad_token_id,
             (gpu_batch_size_val, seq_len_val), device=device
