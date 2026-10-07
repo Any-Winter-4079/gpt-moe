@@ -16,7 +16,7 @@ from schedules.token import add_schedule, custom_schedule, enforce_flex_block_co
 @dataclass
 class TrainingConfig:
     # parallelism
-    parallel_mode: str = "ddp" # "ddp" or "pp"
+    parallel_mode: str = "pp" # "ddp" or "pp"
 
     # training loss
     use_liger_loss: bool = True
@@ -122,8 +122,8 @@ class TrainingConfig:
     lr_schedule: List[Dict[str, Any]] = field(default_factory=list)
 
     # loading/checkpointing
-    enable_checkpointing: bool = False
-    checkpoint_interval: int = -1 # completed training steps; -1 disables periodic checkpoints
+    enable_checkpointing: bool = True
+    checkpoint_interval: int = 100 # completed training steps; -1 disables periodic checkpoints
     checkpoint_best_improvement_interval: int = -1 # -1 disables; 1 saves every new validation best
     max_checkpoints_to_keep: int = 3
     export_full_model_at_end: bool = True
