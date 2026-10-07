@@ -7,11 +7,11 @@ from typing import List
 @dataclass
 class GPTConfig:
     # miscellaneous
-    n_layers: int = 24
+    n_layers: int = 8
     d_model: int = 1024
     use_bias: bool = False
     mlp_hidden_dim: int = 2048
-    use_tied_embeddings: bool = False
+    use_tied_embeddings: bool = True
     norm_type: str = "rms" # "rms" or any other name for "layer"
     is_causal: bool = True # True for decoders or False for encoders
 
