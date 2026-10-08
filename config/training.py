@@ -185,6 +185,9 @@ class TrainingConfig:
     # kernel warmup
     kernel_warmup_train_steps: int = 2
 
+    # activation memory
+    offload_activations: bool = True
+
     # torch compile
     # NOTE: workaround for RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run is 
     # to disable cudagraphs in max-autotune when grad_accum_mini_steps > 1

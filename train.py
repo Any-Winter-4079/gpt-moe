@@ -3,6 +3,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from importlib.metadata import version
 from types import SimpleNamespace
@@ -217,6 +218,7 @@ pipeline_train_step = pipeline_runtime.train_step if pipeline_runtime is not Non
 pipeline_non_training_forward = pipeline_runtime.non_training_forward if pipeline_runtime is not None else None
 
 ctx = precision_context(training_config, device_type)
+activation_ctx = torch.autograd.graph.save_on_cpu(pin_memory=True) if training_config.offload_activations else nullcontext()
 loader_world_size = world_size if parallel_mode == "ddp" else 1
 loader_rank = rank if parallel_mode == "ddp" else 0
 use_loader = parallel_mode == "ddp" or master_process
@@ -256,6 +258,7 @@ run = SimpleNamespace(
     optimizers=optimizers,
     tokenizer=tokenizer,
     ctx=ctx,
+    activation_ctx=activation_ctx,
     log_buffer=log_buffer,
     forward=forward_for_evaluation,
     pipeline_next_batch=pipeline_next_batch,
@@ -338,7 +341,7 @@ try:
             for mini_step in range(grad_accum_mini_steps):
                 x_train, y_train, doc_ids_train = pipeline_next_batch(train_data_loader, current_batch_size, seq_len_train)
                 pipeline_batches.append((x_train, y_train, doc_ids_train))
-            with ctx:
+            with ctx, activation_ctx:
                 train_losses = pipeline_train_step(pipeline_batches)
             # with 2 GPUs, stage 0 produces loss = 0 (because it's a partial run) but is still
             # reduced so we sum stage 0's 0 loss with stage 1's actual loss
@@ -352,7 +355,7 @@ try:
                 if doc_ids_train is not None:
                     doc_ids_train = doc_ids_train[:current_batch_size].pin_memory().to(device, non_blocking=True)
                 gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
-                with ctx:
+                with ctx, activation_ctx:
                     step_train_loss, step_token_loss, step_balance_term = gpt_model(x_train, y_train, document_ids=doc_ids_train)
                 train_losses += torch.stack((step_train_loss.detach().float(), step_token_loss.detach().float(), step_balance_term.detach().float())) / grad_accum_mini_steps
                 (step_train_loss / grad_accum_mini_steps).backward()
