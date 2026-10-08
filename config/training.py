@@ -81,7 +81,7 @@ class TrainingConfig:
     swa_values_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [32768], # in window tokens
+            "values": [1024], # in window tokens
         },
     })
     # filled by resolve(world_size)
