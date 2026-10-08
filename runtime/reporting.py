@@ -79,32 +79,36 @@ def save_config_info(run, training_config, gpt_config) -> None:
 
 def log_parameter_counts(run, gpt_config) -> None:
     raw_gpt_model = run.raw_gpt_model
+    inactive_expert_params = 0
+    if gpt_config.use_moe:
+        inactive_expert_params = sum(
+            p.numel()
+            for block in raw_gpt_model.transformer.h
+            for expert in block.mlp.experts[block.mlp.top_k:]
+            for p in expert.parameters() if p.requires_grad
+        )
     if run.parallel_mode == "pp":
         parameter_counts = torch.tensor([
             sum(p.numel() for p in run.gpt_model.parameters() if p.requires_grad),
-            raw_gpt_model.lm_head.weight.numel() if hasattr(raw_gpt_model, "lm_head") else 0,
+            inactive_expert_params,
         ], dtype=torch.long, device=run.device)
         dist.all_reduce(parameter_counts, op=dist.ReduceOp.SUM)
         total_params = parameter_counts[0].item()
-        lm_head_params = parameter_counts[1].item()
+        inactive_expert_params = parameter_counts[1].item()
     else:
         total_params = sum(p.numel() for p in run.gpt_model.parameters() if p.requires_grad)
-        lm_head_params = raw_gpt_model.lm_head.weight.numel()
 
     if run.master_process:
         message = f"{total_params:,} parameters"
         print(message)
         run.log_buffer.append(message)
 
-        emb_params = raw_gpt_model.transformer.wte.weight.numel()
-        emb_tables = 1
-        if hasattr(raw_gpt_model.transformer, "wpe"):
-            emb_params += raw_gpt_model.transformer.wpe.weight.numel()
-            emb_tables += 1
+        # the full output projection stays active, including when tied to the input embedding
+        active_params = total_params - inactive_expert_params
         if not gpt_config.use_tied_embeddings:
-            emb_params += lm_head_params
-            emb_tables += 1
-        active_params = total_params - emb_params + emb_tables * gpt_config.d_model
+            active_params -= raw_gpt_model.transformer.wte.weight.numel() - gpt_config.d_model
+        if hasattr(raw_gpt_model.transformer, "wpe"):
+            active_params -= raw_gpt_model.transformer.wpe.weight.numel() - gpt_config.d_model
         message = f"active parameters per token: {active_params:,}"
         print(message)
         run.log_buffer.append(message)
