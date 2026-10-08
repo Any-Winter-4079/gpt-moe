@@ -61,7 +61,7 @@ class TrainingConfig:
     batch_size_values_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [1], # in batch size
+            "values": [4], # in batch size
         },
     })
 
