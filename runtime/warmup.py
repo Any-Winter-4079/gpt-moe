@@ -19,7 +19,6 @@ def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
     grad_accum_mini_steps = run.training_config.grad_accum_mini_steps
     device = run.device
     ctx = run.ctx
-    activation_ctx = run.activation_ctx
     pipeline_train_step = run.pipeline_train_step
     pipeline_non_training_forward = run.pipeline_non_training_forward
     # snapshot everything so we don't "cheat"
@@ -73,7 +72,7 @@ def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
                         dist.broadcast(doc_ids_train, src=0)
                     pipeline_batches.append((x_train, y_train, doc_ids_train))
 
-                with ctx, activation_ctx:
+                with ctx:
                     pipeline_train_step(pipeline_batches)
 
                 for optimizer in optimizers.values():
@@ -138,7 +137,6 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
     grad_accum_mini_steps = run.training_config.grad_accum_mini_steps
     device = run.device
     ctx = run.ctx
-    activation_ctx = run.activation_ctx
     # snapshot everything so we don't "cheat"
     model_state = copy.deepcopy(raw_gpt_model.state_dict())
     optimizer_states = {k: copy.deepcopy(opt.state_dict()) for k, opt in optimizers.items()}
@@ -187,7 +185,7 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
                     else:
                         doc_ids_train = None
 
-                    with ctx, activation_ctx:
+                    with ctx:
                         warm_loss, _, _ = gpt_model(x_train, y_train, document_ids=doc_ids_train)
 
                     (warm_loss / grad_accum_mini_steps).backward()
