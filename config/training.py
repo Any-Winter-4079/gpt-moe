@@ -35,10 +35,10 @@ class TrainingConfig:
     #   65_536 * 4 → 262_144 tokens → grad_accum_mini_steps = 1 (for 2**18 == 262_144 step tokens)
     # for 8 gpus →
     #   total_tokens_per_step needs to increase, or we need to reduce gpu batch size or seq len
-    gpu_batch_size_train: int = 4
-    gpu_batch_size_val: int = 4
-    seq_len_train: int = 4096
-    seq_len_val: int = 4096
+    gpu_batch_size_train: int = 1
+    gpu_batch_size_val: int = 1
+    seq_len_train: int = 16384
+    seq_len_val: int = 16384
     max_tokens: int = 5 * 10**9
 
     flex_block_size: int = 128
@@ -61,7 +61,7 @@ class TrainingConfig:
     batch_size_values_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [4], # in batch size
+            "values": [1], # in batch size
         },
     })
 
