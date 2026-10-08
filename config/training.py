@@ -37,8 +37,8 @@ class TrainingConfig:
     #   total_tokens_per_step needs to increase, or we need to reduce gpu batch size or seq len
     gpu_batch_size_train: int = 1
     gpu_batch_size_val: int = 1
-    seq_len_train: int = 32768
-    seq_len_val: int = 32768
+    seq_len_train: int = 16384
+    seq_len_val: int = 16384
     max_tokens: int = 5 * 10**9
 
     flex_block_size: int = 128
