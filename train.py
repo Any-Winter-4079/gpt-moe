@@ -218,7 +218,7 @@ pipeline_train_step = pipeline_runtime.train_step if pipeline_runtime is not Non
 pipeline_non_training_forward = pipeline_runtime.non_training_forward if pipeline_runtime is not None else None
 
 ctx = precision_context(training_config, device_type)
-activation_ctx = torch.autograd.graph.save_on_cpu(pin_memory=True) if training_config.offload_activations else nullcontext()
+activation_ctx = torch.autograd.graph.save_on_cpu(pin_memory=False) if training_config.offload_activations else nullcontext()
 loader_world_size = world_size if parallel_mode == "ddp" else 1
 loader_rank = rank if parallel_mode == "ddp" else 0
 use_loader = parallel_mode == "ddp" or master_process
