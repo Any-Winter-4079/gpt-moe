@@ -64,7 +64,7 @@ class GPTConfig:
 
     # full (global) attention overrides
     # layers not in full_attention_layers use local (SWA) attention with the params above
-    full_attention_layers: List[int] = field(default_factory=lambda: [5, 11, 17])
+    full_attention_layers: List[int] = field(default_factory=lambda: list(range(18)))
     global_attn_dim: int = 2048 # attn dim for full attn layers, head_size = global_attn_dim // n_heads
     global_n_kv_heads: int = 16 # KV heads for full attn layers
     global_rope_theta: int = 500_000 # RoPE theta for full attn layers (local: 500_000)
