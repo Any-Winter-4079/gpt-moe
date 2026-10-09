@@ -30,6 +30,27 @@ def log_source_code(log_buffer: List[str]) -> None:
     except (FileNotFoundError, subprocess.CalledProcessError):
         log_buffer.append("git commit: unavailable")
 
+    log_buffer.append("hardware information: startup snapshot")
+    for command in (["nvidia-smi"], ["lscpu"], ["free", "-b"]):
+        log_buffer.append(f"$ {' '.join(command)}")
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            log_buffer.append(result.stdout.rstrip("\n"))
+            if result.stderr:
+                log_buffer.append(result.stderr.rstrip("\n"))
+            if result.returncode:
+                log_buffer.append(f"exit code: {result.returncode}")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            log_buffer.append(f"unavailable: {error}")
+
+    # free can report host RAM, so also record the exposed cgroup membership and limits
+    for filename in ("/proc/self/cgroup", "/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/memory.max"):
+        log_buffer.append(f"{filename}:")
+        try:
+            log_buffer.append(Path(filename).read_text(encoding="utf-8").rstrip("\n"))
+        except OSError as error:
+            log_buffer.append(f"unavailable: {error}")
+
     # read only Python files in the source directories, without traversing datasets or environments
     source_dirs = ("", "checkpointing", "config", "data", "evaluation", "model", "optimizers", "runtime", "sampling", "schedules")
     for directory in source_dirs:
