@@ -20,8 +20,6 @@ class TrainingConfig:
 
     # training loss
     use_liger_loss: bool = True
-    # maximum logit elements for the original loss (batch * sequence length * vocabulary)
-    dense_loss_max_elements: int = 4 * 8192 * 50304
 
     # MoE training objective
     moe_load_balance_weight: float = 0.01

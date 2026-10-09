@@ -144,7 +144,6 @@ resume_config = {
             "use_bf16_weights_params_or_scales", "use_bf16_adamw_moments",
             "keep_1d_weights_params_and_scales_in_fp32", "keep_fp32_loss",
             "cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast", "use_liger_loss",
-            "dense_loss_max_elements",
         )
     },
     "bf16_weights_params_and_scales": {
