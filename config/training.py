@@ -216,7 +216,7 @@ class TrainingConfig:
     # - medium -> perform matmul in bf16 (8 mantissa bits with 7 bits explicitly stored)
     # Source: https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
     keep_fp32_loss: bool = True
-    use_bf16_adamw_moments: bool = True # False stores AdamW moments in fp32
+    use_bf16_adamw_moments: bool = False # False stores AdamW moments in fp32
     use_all_bf16_and_null_ctx: bool = False # all (1d/2d) weights, nn.Parameter, scales to bf16, and no autocast (nullcontext)
     use_bf16_weights_params_or_scales: bool = False # some (1d/2d) weights, nn.Parameter, or scales to bf16 (can be overwritten/ignored if use_all_bf16_and_null_ctx=True -which casts all-)
     bf16_weights_params_and_scales: Dict[str, Any] = field(default_factory=lambda: {
