@@ -85,7 +85,7 @@ if master_process:
         f"torch.cuda: {torch.version.cuda}",
         f"triton: {triton.__version__}",
     ])
-    if training_config.use_liger_loss:
+    if training_config.use_liger_loss or training_config.use_fp8_lm_head:
         log_buffer.append(f"liger-kernel: {version('liger-kernel')}")
     log_source_code(log_buffer)
     log_buffer.append("=" * 100)
@@ -143,7 +143,7 @@ resume_config = {
             "moe_load_balance_weight", "use_bf16_autocast", "use_all_bf16_and_null_ctx",
             "use_bf16_weights_params_or_scales", "use_bf16_adamw_moments",
             "keep_1d_weights_params_and_scales_in_fp32", "keep_fp32_loss",
-            "cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast", "use_liger_loss",
+            "cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast", "use_liger_loss", "use_fp8_lm_head",
         )
     },
     "bf16_weights_params_and_scales": {

@@ -19,7 +19,10 @@ class TrainingConfig:
     parallel_mode: str = "ddp" # "ddp" or "pp"
 
     # training loss
-    use_liger_loss: bool = True
+    # retained as a workaround for NaNs previously observed with large dense logits
+    # re-enable if instability returns; the suspected indexing issue was not confirmed
+    use_liger_loss: bool = False
+    use_fp8_lm_head: bool = False # training-only FP8 head with chunked Liger cross-entropy
 
     # MoE training objective
     moe_load_balance_weight: float = 0.01
@@ -47,7 +50,7 @@ class TrainingConfig:
     batch_size_keys_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [0, 78_643_200], # in train_tokens_processed
+            "values": [0], # in train_tokens_processed
             # "start": 2_457_600,
             # "factor": 2, # in train_tokens_processed
             # "count": 4,
@@ -59,7 +62,7 @@ class TrainingConfig:
     batch_size_values_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [4, 8], # in batch size
+            "values": [8], # in batch size
         },
     })
 

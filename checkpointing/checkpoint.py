@@ -164,6 +164,7 @@ def load_checkpoint(training_config, gpt_config, rank: int, world_size: int, res
         'training': {
             **training_state['resume_config']['training'],
             'use_bf16_adamw_moments': training_config.use_bf16_adamw_moments,
+            'use_fp8_lm_head': training_state['resume_config']['training'].get('use_fp8_lm_head', False),
         },
     }
     if checkpoint_resume_config != resume_config:
