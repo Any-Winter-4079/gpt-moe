@@ -35,10 +35,10 @@ class TrainingConfig:
     #   65_536 * 4 → 262_144 tokens → grad_accum_mini_steps = 1 (for 2**18 == 262_144 step tokens)
     # for 8 gpus →
     #   total_tokens_per_step needs to increase, or we need to reduce gpu batch size or seq len
-    gpu_batch_size_train: int = 1
-    gpu_batch_size_val: int = 1
-    seq_len_train: int = 16384
-    seq_len_val: int = 16384
+    gpu_batch_size_train: int = 8
+    gpu_batch_size_val: int = 8
+    seq_len_train: int = 8192
+    seq_len_val: int = 8192
     max_tokens: int = 5 * 10**9
 
     flex_block_size: int = 128
@@ -49,7 +49,7 @@ class TrainingConfig:
     batch_size_keys_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [0], # in train_tokens_processed
+            "values": [0, 78_643_200], # in train_tokens_processed
             # "start": 2_457_600,
             # "factor": 2, # in train_tokens_processed
             # "count": 4,
@@ -61,7 +61,7 @@ class TrainingConfig:
     batch_size_values_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [1], # in batch size
+            "values": [4, 8], # in batch size
         },
     })
 
@@ -70,18 +70,22 @@ class TrainingConfig:
     # add_schedule expects:    "start", "increment", "end"|"count" to set the train_tokens_processed to increase the window size at
     # factor_schedule expects: "start", "factor", "end"|"count", to set the train_tokens_processed to increase the window size at
     swa_keys_schedule: Dict[str, Any] = field(default_factory=lambda: {
-        "fn": custom_schedule,
+        "fn": add_schedule,
         "kwargs": {
-            "values": [0], # in train_tokens_processed
+            "start": 32_768_000, # in train_tokens_processed
+            "increment": 200 * 262_144, # in train_tokens_processed
+            "count": 11,
         },
     })
     # custom_schedule expects: "values", with a list of window sizes to increase to (e.g., 128, 256, etc. window tokens)
     # add_schedule expects:    "start", "increment", "end"|"count" to set the schedule of window sizes to change to
     # factor_schedule expects: "start", "factor", "end"|"count", to set the schedule of window sizes to change to
     swa_values_schedule: Dict[str, Any] = field(default_factory=lambda: {
-        "fn": custom_schedule,
+        "fn": add_schedule,
         "kwargs": {
-            "values": [1024], # in window tokens
+            "start": 128, # in window tokens
+            "increment": 128, # in window tokens
+            "count": 11,
         },
     })
     # filled by resolve(world_size)
@@ -186,7 +190,7 @@ class TrainingConfig:
     kernel_warmup_train_steps: int = 2
 
     # activation checkpointing
-    use_activation_checkpointing: bool = True
+    use_activation_checkpointing: bool = False
 
     # torch compile
     # NOTE: workaround for RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run is 

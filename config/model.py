@@ -7,10 +7,10 @@ from typing import List
 @dataclass
 class GPTConfig:
     # miscellaneous
-    n_layers: int = 18
-    d_model: int = 2048
+    n_layers: int = 8
+    d_model: int = 1024
     use_bias: bool = False
-    mlp_hidden_dim: int = 4096
+    mlp_hidden_dim: int = 2048
     use_tied_embeddings: bool = True
     norm_type: str = "rms" # "rms" or any other name for "layer"
     is_causal: bool = True # True for decoders or False for encoders
@@ -43,7 +43,7 @@ class GPTConfig:
     # head_size ~128 looks good
     n_heads: int = 16
     n_kv_heads: int = 16
-    attn_dim: int = 2048
+    attn_dim: int = 1024
     use_flex_attention: bool = True # True for FlexAttention or False for SDPA
     # NOTE: for performance reasons, SWA, attention logit soft capping and doc masking require FlexAttention
     use_doc_masking: bool = False
@@ -64,9 +64,9 @@ class GPTConfig:
 
     # full (global) attention overrides
     # layers not in full_attention_layers use local (SWA) attention with the params above
-    full_attention_layers: List[int] = field(default_factory=lambda: list(range(18)))
+    full_attention_layers: List[int] = field(default_factory=lambda: [])
     global_attn_dim: int = 2048 # attn dim for full attn layers, head_size = global_attn_dim // n_heads
-    global_n_kv_heads: int = 16 # KV heads for full attn layers
+    global_n_kv_heads: int = 4 # KV heads for full attn layers
     global_rope_theta: int = 500_000 # RoPE theta for full attn layers (local: 500_000)
 
     # MLP activations
