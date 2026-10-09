@@ -158,7 +158,15 @@ def load_checkpoint(training_config, gpt_config, rank: int, world_size: int, res
         raise ValueError("checkpoint GPU count differs from the current run")
     if training_config.parallel_mode.lower() == "pp" and training_state['rank'] != rank:
         raise ValueError("checkpoint stage number differs from this rank")
-    if training_state['resume_config'] != resume_config:
+    # allow the requested AdamW moment precision to override the checkpoint setting
+    checkpoint_resume_config = {
+        **training_state['resume_config'],
+        'training': {
+            **training_state['resume_config']['training'],
+            'use_bf16_adamw_moments': training_config.use_bf16_adamw_moments,
+        },
+    }
+    if checkpoint_resume_config != resume_config:
         raise ValueError("checkpoint model or training configuration differs from the current run")
 
     # load weights

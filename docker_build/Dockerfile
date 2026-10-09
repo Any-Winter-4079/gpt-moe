@@ -1,12 +1,3 @@
-# gpt-moe
-
-## Build and push the CUDA 13.2 image
-
-Run locally with Docker Desktop running. This extends `anywinter4079/pytorch:2.10.0-cu128`, keeps its Python 3.11 and data packages, and installs the full CUDA Toolkit 13.2.2, PyTorch 2.13.0+cu132, and Liger 0.8.4. The default working directory is `/root`.
-
-```bash
-mkdir -p docker_build && \
-cat > docker_build/Dockerfile <<'EOF'
 FROM anywinter4079/pytorch:2.10.0-cu128
 
 WORKDIR /root
@@ -30,32 +21,3 @@ RUN python -m pip install --no-cache-dir --upgrade torch==2.13.0+cu132 \
 
 RUN nvcc --version \
  && python -c "import torch, triton; from importlib.metadata import version; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'triton:', triton.__version__, 'liger-kernel:', version('liger-kernel')); assert torch.version.cuda == '13.2'"
-EOF
-```
-
-Log in and select the existing builder:
-
-```bash
-docker login
-docker buildx use amd64-builder
-```
-
-If the builder does not exist, create it instead:
-
-```bash
-docker buildx create --name amd64-builder --driver docker-container --use
-```
-
-Build and push under a new tag:
-
-```bash
-docker buildx build --platform linux/amd64 \
-  -t anywinter4079/pytorch:2.13.0-cu132-devel \
-  ./docker_build --push
-```
-
-## Run
-
-```
-git clone https://github.com/Any-Winter-4079/gpt-moe.git && cd gpt-moe/ && python data/fineweb-npy.py
-```

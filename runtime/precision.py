@@ -45,6 +45,32 @@ def convert_to_bf16(
                 p.data = p.data.float()
 
 
+def configure_adamw_moments(optimizer: torch.optim.AdamW, use_bf16_adamw_moments: bool) -> None:
+    dtype = torch.bfloat16 if use_bf16_adamw_moments else torch.float32
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if p.dtype != dtype:
+                if not (p.dtype == torch.float32 and dtype == torch.bfloat16
+                        and p.device.type == "cuda" and group["fused"]):
+                    raise ValueError("mixed-dtype AdamW requires fused CUDA with fp32 parameters and bf16 moments")
+                if tuple(int(part) for part in torch.__version__.split(".")[:2]) < (2, 13):
+                    raise ValueError("bf16 AdamW moments with fp32 parameters require PyTorch 2.13 or newer")
+
+            state = optimizer.state[p]
+            if not state:
+                # initialize directly in the requested dtype, before the first optimizer step
+                state["step"] = torch.zeros(
+                    (), dtype=torch.float32,
+                    device=p.device if group["fused"] or group["capturable"] else "cpu",
+                )
+                state["exp_avg"] = torch.zeros_like(p, dtype=dtype)
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=dtype)
+            else:
+                # keep the current moment values and step counter when restoring state
+                state["exp_avg"] = state["exp_avg"].to(dtype=dtype)
+                state["exp_avg_sq"] = state["exp_avg_sq"].to(dtype=dtype)
+
+
 def precision_context(training_config, device_type: str):
     if training_config.use_all_bf16_and_null_ctx or not training_config.use_bf16_autocast:
         return contextlib.nullcontext()

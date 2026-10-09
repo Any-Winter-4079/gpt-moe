@@ -28,7 +28,7 @@ from checkpointing.checkpoint import (
     export_full_model_ddp, export_full_model_pp, keep_latest_checkpoints,
     load_checkpoint, save_checkpoint, save_stage_weights_for_export,
 )
-from runtime.precision import convert_to_bf16, precision_context
+from runtime.precision import configure_adamw_moments, convert_to_bf16, precision_context
 from runtime.reporting import flush_log, log_source_code, save_config_info, log_parameter_counts
 from runtime.warmup import kernel_warmup
 from runtime.pipeline import PipelineRuntime
@@ -141,7 +141,7 @@ resume_config = {
             "adamw_betas", "adamw_eps", "adamw_weight_decay", "muon_lr_scale",
             "muon_backend", "muon_backend_steps", "muon_momentum", "muon_use_nesterov",
             "moe_load_balance_weight", "use_bf16_autocast", "use_all_bf16_and_null_ctx",
-            "use_bf16_weights_params_or_scales",
+            "use_bf16_weights_params_or_scales", "use_bf16_adamw_moments",
             "keep_1d_weights_params_and_scales_in_fp32", "keep_fp32_loss",
             "cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast", "use_liger_loss",
             "dense_loss_max_elements",
@@ -208,6 +208,30 @@ if training_config.resume_from_checkpoint:
         optimizer.load_state_dict(optimizer_state_dicts[name])
     dist.barrier()
 
+configure_adamw_moments(optimizers["adamw"], training_config.use_bf16_adamw_moments)
+if master_process:
+    moment_dtype = torch.bfloat16 if training_config.use_bf16_adamw_moments else torch.float32
+    if training_config.resume_from_checkpoint:
+        saved_moment_dtypes = {
+            state[key].dtype
+            for state in optimizer_state_dicts["adamw"]["state"].values()
+            for key in ("exp_avg", "exp_avg_sq")
+        }
+        if saved_moment_dtypes and saved_moment_dtypes != {moment_dtype}:
+            message = (
+                "#" * 64 + "\n"
+                "WARNING: ADAMW MOMENT PRECISION CHANGED ON RESUME\n"
+                f"Checkpoint moments: {', '.join(sorted(str(dtype) for dtype in saved_moment_dtypes))}\n"
+                f"Requested moments:  {moment_dtype}\n"
+                "Existing moments are converted, not reset; step counters are retained.\n"
+                "#" * 64
+            )
+            print(message)
+            log_buffer.append(message)
+    message = f"AdamW moment dtype: {moment_dtype}"
+    print(message)
+    log_buffer.append(message)
+
 pipeline_runtime = PipelineRuntime(
     gpt_model, rank, world_size, device, grad_accum_mini_steps,
     batch_size_schedule_values, raw_gpt_model.use_doc_masking,
@@ -270,6 +294,8 @@ if master_process:
 log_parameter_counts(run, gpt_config)
 flush_log(run)
 kernel_warmup(run, num_train_steps=training_config.kernel_warmup_train_steps)
+# warmup restores optimizer state, which casts moments to the parameter dtype
+configure_adamw_moments(optimizers["adamw"], training_config.use_bf16_adamw_moments)
 if training_config.resume_from_checkpoint:
     torch.set_rng_state(torch_rng_state_cpu)
     torch.cuda.set_rng_state(torch_rng_state_cuda)
