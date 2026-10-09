@@ -130,8 +130,8 @@ new file mode 100644
 +    scales = (config.nvfp4_input_scale, config.nvfp4_weight_scale, config.nvfp4_grad_scale)
 +    if any(not math.isfinite(scale) or scale <= 0 for scale in scales):
 +        raise ValueError("nvfp4 scales must be finite and positive")
-+    if torch.__version__.split("+")[0] != "2.10.0" or triton.__version__ != "3.6.0":
-+        raise RuntimeError("nvfp4 projections require torch==2.10.0 and triton==3.6.0")
++    if (torch.__version__.split("+")[0], triton.__version__) not in (("2.10.0", "3.6.0"), ("2.13.0", "3.7.1")):
++        raise RuntimeError("nvfp4 projections require torch/triton 2.10.0/3.6.0 or 2.13.0/3.7.1")
 +    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((12, 0),):
 +        raise RuntimeError("nvfp4 projections require SM120 (RTX Blackwell)")
 +
