@@ -1,0 +1,189 @@
+diff --git a/config/training.py b/config/training.py
+--- a/config/training.py
++++ b/config/training.py
+@@ -112,6 +112,7 @@
+     muon_backend_steps: int = 5 # ~5-10; the higher, the slightly “tighter” orthogonalization (and slower)
+     muon_momentum: float = 0.95
+     muon_use_nesterov: bool = True
++    muon_fused_polar_update: bool = True
+     # derived from the above
+     total_decay_tokens: int = lr_warmup_and_cosine_tokens - lr_warmup_tokens
+     # filled by resolve
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -32,6 +32,7 @@
+         self.muon_backend_steps = training_config.muon_backend_steps
+         self.muon_momentum = training_config.muon_momentum
+         self.muon_use_nesterov = training_config.muon_use_nesterov
++        self.muon_fused_polar_update = training_config.muon_fused_polar_update
+ 
+         # <-- Uncomment for gradient norm clipping -->
+         # self.use_grad_norm_clipping = gpt_config.use_grad_norm_clipping
+@@ -222,6 +223,7 @@
+             nesterov=self.muon_use_nesterov,
+             backend=self.muon_backend,
+             backend_steps=self.muon_backend_steps,
++            fused_polar_update=self.muon_fused_polar_update,
+         )
+         return {"adamw": adamw, "muon": muon}
+ 
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -142,8 +142,9 @@
+             nesterov: bool = True,
+             backend: str = "newtonschulz5",
+             backend_steps: int = 5,
++            fused_polar_update: bool = False,
+             ) -> None:
+-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
++        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps, fused_polar_update=fused_polar_update)
+         super().__init__(params, defaults)
+ 
+     def step(self) -> None:
+@@ -181,7 +182,7 @@
+                 for start in range(0, len(bucket), 8):
+                     batch = bucket[start:start + 8]
+                     updates = torch.stack([g for _, g in batch])
+-                    updates = zeropower_backend(updates, steps=group['backend_steps'])
++                    updates = zeropower_backend(updates, steps=group['backend_steps'], fused_update=group['fused_polar_update'])
+                     scale = max(updates.shape[-2:]) ** 0.5
+                     for (weight, _), update in zip(batch, updates):
+                         weight.add_(update, alpha=-lr * scale)
+diff --git a/optimizers/polar_express.py b/optimizers/polar_express.py
+--- a/optimizers/polar_express.py
++++ b/optimizers/polar_express.py
+@@ -263,6 +263,101 @@
+     return out
+ 
+ 
++@triton.autotune(
++    configs=[
++        triton.Config(
++            {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": 32},
++            num_stages=3, num_warps=4,
++        )
++        for bm, bn in [(32, 64), (64, 64), (64, 128)]
++    ],
++    key=["M", "N", "b_stride_r", "b_stride_c", "x_stride_r", "x_stride_c", "c_stride_r", "c_stride_c"],
++)
++@triton.jit
++def aX_plus_BX_kernel(
++    B_ptr, X_ptr, C_ptr,
++    M, N,
++    b_stride_b, b_stride_r, b_stride_c,
++    x_stride_b, x_stride_r, x_stride_c,
++    c_stride_b, c_stride_r, c_stride_c,
++    alpha,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++):
++    pid = tl.program_id(axis=0)
++    batch_idx = tl.program_id(axis=1)
++    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
++    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
++    pid_m, pid_n = tl.swizzle2d(pid // num_pid_n, pid % num_pid_n, num_pid_m, num_pid_n, 8)
++    m_idx = pid_m * BLOCK_SIZE_M
++    n_idx = pid_n * BLOCK_SIZE_N
++
++    B_ptr += batch_idx * b_stride_b
++    X_ptr += batch_idx * x_stride_b
++    C_ptr += batch_idx * c_stride_b
++
++    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
++    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % N
++    offs_k = tl.arange(0, BLOCK_SIZE_K)
++    b_ptrs = B_ptr + offs_m[:, None] * b_stride_r + offs_k[None, :] * b_stride_c
++    x_ptrs = X_ptr + offs_k[:, None] * x_stride_r + offs_n[None, :] * x_stride_c
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++    for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
++        b = tl.load(b_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
++        x = tl.load(x_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
++        accumulator = tl.dot(b, x, accumulator)
++        b_ptrs += BLOCK_SIZE_K * b_stride_c
++        x_ptrs += BLOCK_SIZE_K * x_stride_r
++
++    # add a * X before the only BF16 rounding and output store
++    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
++    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
++    mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
++    x_add_ptrs = X_ptr + offs_cm[:, None] * x_stride_r + offs_cn[None, :] * x_stride_c
++    x_add = tl.load(x_add_ptrs, mask=mask, other=0.0).to(tl.float32)
++    output = tl.fma(x_add, alpha, accumulator).to(tl.bfloat16)
++    c_ptrs = C_ptr + offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c
++    tl.store(c_ptrs, output, mask=mask)
++
++
++def fused_aX_plus_BX(B: Tensor, X: Tensor, alpha: float, out: Tensor):
++    """
++    Compute C = alpha * X + B @ X for strided BF16 matrices or batches.
++    out must have independent storage from B and X, with no overlapping elements.
++    """
++    assert X.ndim == 2 or X.ndim == 3
++    M, N = X.shape[-2:]
++    assert B.shape == (*X.shape[:-1], M), "Input matrices have incompatible shapes"
++    assert out.shape == X.shape, "Output matrix has incorrect shape"
++    assert B.dtype == X.dtype == out.dtype == torch.bfloat16
++    assert B.device == X.device == out.device and X.is_cuda
++
++    batch_size = X.size(0) if X.ndim == 3 else 1
++    grid = lambda meta: (
++        triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),
++        batch_size,
++    )
++    aX_plus_BX_kernel[grid](
++        B_ptr=B,
++        X_ptr=X,
++        C_ptr=out,
++        M=M,
++        N=N,
++        b_stride_b=B.stride(0) if B.ndim == 3 else 0,
++        b_stride_r=B.stride(-2),
++        b_stride_c=B.stride(-1),
++        x_stride_b=X.stride(0) if X.ndim == 3 else 0,
++        x_stride_r=X.stride(-2),
++        x_stride_c=X.stride(-1),
++        c_stride_b=out.stride(0) if out.ndim == 3 else 0,
++        c_stride_r=out.stride(-2),
++        c_stride_c=out.stride(-1),
++        alpha=alpha,
++    )
++    return out
++
++
+ # Computed for num_iters=5, safety_factor=2e-2, cushion=2
+ polar_express_coeffs = [
+     (8.156554524902461, -22.48329292557795, 15.878769915207462),
+@@ -274,7 +369,7 @@
+ 
+ 
+ @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
+-def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool = False):
++def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool = False, fused_update: bool = False):
+     """
+     Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+@@ -310,7 +405,9 @@
+         # resulting in a cudaMemcpyAsync in baddbmm.
+         # For large matrices (i.e., the mlp weights), it's faster to split 
+         # the operation into two kernels to avoid this.
+-        if split_baddbmm:
++        if fused_update:
++            fused_aX_plus_BX(B, X, alpha=a, out=C)
++        elif split_baddbmm:
+             BX_matmul(B, X, out=C)  # C = B @ X  
+             C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+         else:
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -140,6 +140,7 @@
+             "data_path", "data_uses_padding", "base_seed", "optimizer_type",
+             "adamw_betas", "adamw_eps", "adamw_weight_decay", "muon_lr_scale",
+             "muon_backend", "muon_backend_steps", "muon_momentum", "muon_use_nesterov",
++            "muon_fused_polar_update",
+             "moe_load_balance_weight", "use_bf16_autocast", "use_all_bf16_and_null_ctx",
+             "use_bf16_weights_params_or_scales",
+             "keep_1d_weights_params_and_scales_in_fp32", "keep_fp32_loss",

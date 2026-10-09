@@ -1,0 +1,67 @@
+diff --git a/model/grouped_linear.py b/model/grouped_linear.py
+--- a/model/grouped_linear.py
++++ b/model/grouped_linear.py
+@@ -14,7 +14,7 @@
+         triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk}, num_stages=3, num_warps=4)
+         for bm, bn, bk in [(64, 64, 64), (64, 128, 32), (64, 128, 64), (128, 64, 32)]
+     ],
+-    key=["M", "N", "K", "NUM_EXPERTS", "GROUP_K", "a_stride_m", "a_stride_k", "b_stride_k", "b_stride_n"],
++    key=["M", "N", "K", "NUM_EXPERTS", "GROUP_K", "a_stride_m", "a_stride_k", "b_stride_k", "b_stride_n", "SPLIT_K"],
+ )
+ @triton.jit
+ def _grouped_mm_kernel(
+@@ -22,7 +22,7 @@
+     M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+     a_stride_m: tl.constexpr, a_stride_k: tl.constexpr,
+     b_stride_e: tl.constexpr, b_stride_k: tl.constexpr, b_stride_n: tl.constexpr,
+-    NUM_EXPERTS: tl.constexpr, NUM_PROGRAMS: tl.constexpr, GROUP_K: tl.constexpr,
++    NUM_EXPERTS: tl.constexpr, NUM_PROGRAMS: tl.constexpr, GROUP_K: tl.constexpr, SPLIT_K: tl.constexpr,
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+ ):
+     # persistent workers traverse the tiles of all experts
+@@ -35,7 +35,7 @@
+             rows, reduction = M, end - start
+             a_base = start * a_stride_k
+             b_base = start * b_stride_k
+-            c_base = expert * M * N
++            c_base = (tl.program_id(1) * NUM_EXPERTS + expert) * M * N
+         else:
+             rows, reduction = end - start, K
+             a_base = start * a_stride_m
+@@ -50,7 +50,14 @@
+             col = (local_tile % tiles_n) * BLOCK_N + tl.arange(0, BLOCK_N)
+             inner = tl.arange(0, BLOCK_K)
+             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-            for block in range(tl.cdiv(reduction, BLOCK_K)):
++            first_block = 0
++            last_block = tl.cdiv(reduction, BLOCK_K)
++            if GROUP_K:
++                # independent partial sums avoid atomics and shorten the serial reduction
++                blocks_per_split = tl.cdiv(last_block, SPLIT_K)
++                first_block = tl.program_id(1) * blocks_per_split
++                last_block = tl.minimum(first_block + blocks_per_split, last_block)
++            for block in range(first_block, last_block):
+                 k = block * BLOCK_K + inner
+                 a = tl.load(
+                     A + a_base + row[:, None] * a_stride_m + k[None, :] * a_stride_k,
+@@ -76,15 +83,16 @@
+     m, k = a.shape
+     n = b.shape[-1]
+     num_experts = offsets.numel()
+-    out = a.new_empty((num_experts, m, n) if group_k else (m, n))
++    split_k = 4 if group_k else 1
++    out = torch.empty((split_k, num_experts, m, n), device=a.device, dtype=torch.float32) if group_k else a.new_empty((m, n))
+     num_programs = torch.cuda.get_device_properties(a.device).multi_processor_count
+-    wrap_triton(_grouped_mm_kernel)[(num_programs,)](
++    wrap_triton(_grouped_mm_kernel)[(num_programs, split_k)](
+         a, b, out, offsets, m, n, k,
+         a.stride(0), a.stride(1),
+         0 if group_k else b.stride(0), b.stride(-2), b.stride(-1),
+-        num_experts, num_programs, group_k,
++        num_experts, num_programs, group_k, split_k,
+     )
+-    return out
++    return out.sum(dim=0).to(a.dtype) if group_k else out
+ 
+ 
+ @triton_op("gpt_moe::grouped_linear", mutates_args=())

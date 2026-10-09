@@ -1,0 +1,19 @@
+diff --git a/model/grouped_linear.py b/model/grouped_linear.py
+--- a/model/grouped_linear.py
++++ b/model/grouped_linear.py
+@@ -46,8 +46,13 @@
+         last_tile = first_tile + tl.cdiv(rows, BLOCK_M) * tiles_n
+         while tile < last_tile:
+             local_tile = tile - first_tile
+-            row = (local_tile // tiles_n) * BLOCK_M + tl.arange(0, BLOCK_M)
+-            col = (local_tile % tiles_n) * BLOCK_N + tl.arange(0, BLOCK_N)
++            # visit nearby row tiles together to reuse weight tiles in L2
++            group = local_tile // (8 * tiles_n)
++            first_row_tile = group * 8
++            group_rows = tl.minimum(tl.cdiv(rows, BLOCK_M) - first_row_tile, 8)
++            in_group = local_tile % (8 * tiles_n)
++            row = (first_row_tile + in_group % group_rows) * BLOCK_M + tl.arange(0, BLOCK_M)
++            col = (in_group // group_rows) * BLOCK_N + tl.arange(0, BLOCK_N)
+             inner = tl.arange(0, BLOCK_K)
+             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+             for block in range(tl.cdiv(reduction, BLOCK_K)):

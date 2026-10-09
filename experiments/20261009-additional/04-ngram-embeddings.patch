@@ -1,0 +1,147 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -32,6 +32,13 @@
+     pad_token_id: int = 50257
+     eos_token_id: int = 50256
+     
++    # hashed n-gram embeddings
++    use_ngram_embeddings: bool = True
++    ngram_orders: List[int] = field(default_factory=lambda: [2, 3])
++    ngram_dims: List[int] = field(default_factory=lambda: [128, 128])
++    ngram_table_sizes: List[int] = field(default_factory=lambda: [65521, 65521])
++    ngram_gate_init: float = 0.1
++
+     # local attention
+     # n_heads == n_kv_heads    for MHA (Multi-Head Attention)
+     # n_heads > n_kv_heads > 1 for GQA (Grouped-Query Attention) 
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -11,6 +11,7 @@
+ from torch.utils.checkpoint import checkpoint
+ 
+ from .block import Block
++from .ngram import NgramEmbedding
+ 
+ if TYPE_CHECKING:
+     from config.model import GPTConfig
+@@ -106,6 +107,8 @@
+             h = nn.ModuleList([Block(gpt_config, training_config, layer_idx=i) for i in range(gpt_config.n_layers)]),
+             ln_f = nn.RMSNorm(gpt_config.d_model) if gpt_config.norm_type.lower() == "rms" else nn.LayerNorm(gpt_config.d_model),
+         ))
++        if gpt_config.use_ngram_embeddings:
++            self.transformer.ngram = NgramEmbedding(gpt_config, training_config)
+         self.lm_head = nn.Linear(gpt_config.d_model, gpt_config.vocab_size, bias=False)
+         
+         self.use_tied_embeddings = gpt_config.use_tied_embeddings
+@@ -127,6 +130,8 @@
+                 self.transformer.h = self.transformer.h[split:]
+                 self.layer_is_full_attention = self.layer_is_full_attention[split:]
+                 del self.transformer.wte
++                if "ngram" in self.transformer:
++                    del self.transformer.ngram
+                 if "wpe" in self.transformer:
+                     del self.transformer.wpe
+             self.has_full_attention_layers = any(self.layer_is_full_attention)
+@@ -171,7 +176,7 @@
+         muon_param_names = set()
+         if self.optimizer_type == "muon":
+             for pn, p in param_dict.items():
+-                if p.dim() == 2 and ("wte" not in pn) and ("lm_head" not in pn):
++                if p.dim() == 2 and ("wte" not in pn) and ("lm_head" not in pn) and not pn.startswith("transformer.ngram.tables."):
+                     muon_param_names.add(pn)
+ 
+         # adamw gets everything else, split by decay rule
+@@ -650,6 +655,8 @@
+         gpu_batch_size, seq_len = indices.shape[:2]
+         if self.stage_index != 1:
+             te = self.transformer.wte(indices)
++            if "ngram" in self.transformer:
++                te = self.transformer.ngram(indices, te, document_ids)
+ 
+             # if RoPE or NoPE, rotate later in attention or do nothing, respectively
+             if self.pos_encoding_type == "rope" or self.pos_encoding_type == "nope":
+diff --git a/model/ngram.py b/model/ngram.py
+new file mode 100644
+--- /dev/null
++++ b/model/ngram.py
+@@ -0,0 +1,63 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Optional
++
++import torch
++import torch.nn as nn
++from torch import Tensor
++from torch.nn import functional as F
++
++if TYPE_CHECKING:
++    from config.model import GPTConfig
++    from config.training import TrainingConfig
++
++
++class NgramEmbedding(nn.Module):
++    def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig) -> None:
++        super().__init__()
++        self.orders = tuple(gpt_config.ngram_orders)
++        dims = gpt_config.ngram_dims
++        sizes = gpt_config.ngram_table_sizes
++        assert len(self.orders) == len(dims) == len(sizes) > 0, "N-gram orders, dimensions and table sizes must have matching nonempty lengths"
++        assert all(order >= 2 for order in self.orders), "N-gram orders must be at least two"
++        assert all(dim > 0 for dim in dims), "N-gram dimensions must be positive"
++        assert all(0 < size < 2**31 for size in sizes), "N-gram table sizes must be positive and smaller than 2**31"
++        assert 0 < gpt_config.vocab_size < 2**31, "N-gram vocabulary size must be positive and smaller than 2**31"
++        self.pad_token_id = gpt_config.pad_token_id
++        self.eos_token_id = gpt_config.eos_token_id
++        self.use_bf16_autocast = training_config.use_bf16_autocast
++        self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
++        self.tables = nn.ModuleList([nn.Embedding(size, dim) for size, dim in zip(sizes, dims)])
++        self.projections = nn.ModuleList([
++            nn.Linear(dim, gpt_config.d_model, bias=False) if dim != gpt_config.d_model else nn.Identity()
++            for dim in dims
++        ])
++        self.gates = nn.Parameter(torch.full((len(self.orders),), gpt_config.ngram_gate_init))
++
++    def forward(self, indices: Tensor, x: Tensor, document_ids: Optional[Tensor] = None) -> Tensor:
++        tokens = indices.to(dtype=torch.int64)
++        seq_len = tokens.size(1)
++        # EOS belongs to the ending document; history restarts on the following token
++        boundaries = torch.ones_like(tokens, dtype=torch.bool)
++        boundaries[:, 1:] = (tokens[:, :-1] == self.eos_token_id) | (tokens[:, :-1] == self.pad_token_id)
++        if document_ids is not None:
++            boundaries[:, 1:] |= document_ids[:, 1:] != document_ids[:, :-1]
++        segments = boundaries.to(dtype=torch.int64).cumsum(dim=1)
++        history_len = max(self.orders) - 1
++        token_history = F.pad(tokens, (history_len, 0))
++        segment_history = F.pad(segments, (history_len, 0), value=-1)
++
++        for i, (order, table, projection) in enumerate(zip(self.orders, self.tables, self.projections)):
++            hashes = torch.zeros_like(tokens)
++            # reduce each int64 step; products stay below 2**48 for the configured limits
++            for offset in range(order):
++                start = history_len - offset
++                hashes = (hashes * 65599 + token_history[:, start:start + seq_len] + 1) % table.num_embeddings
++            start = history_len - order + 1
++            valid = (tokens != self.pad_token_id) & (segments == segment_history[:, start:start + seq_len])
++            ngram = table(hashes)
++            if isinstance(projection, nn.Linear) and not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and ngram.dtype != projection.weight.dtype:
++                ngram = ngram.to(dtype=projection.weight.dtype)
++            ngram = projection(ngram)
++            x = x + (self.gates[i].to(dtype=ngram.dtype) * ngram * valid.unsqueeze(-1)).to(dtype=x.dtype)
++        return x
+diff --git a/runtime/reporting.py b/runtime/reporting.py
+--- a/runtime/reporting.py
++++ b/runtime/reporting.py
+@@ -109,6 +109,11 @@
+             active_params -= raw_gpt_model.transformer.wte.weight.numel() - gpt_config.d_model
+         if hasattr(raw_gpt_model.transformer, "wpe"):
+             active_params -= raw_gpt_model.transformer.wpe.weight.numel() - gpt_config.d_model
++        if hasattr(raw_gpt_model.transformer, "ngram"):
++            active_params -= sum(
++                table.weight.numel() - table.embedding_dim
++                for table in raw_gpt_model.transformer.ngram.tables
++            )
+         message = f"active parameters per token: {active_params:,}"
+         print(message)
+         run.log_buffer.append(message)

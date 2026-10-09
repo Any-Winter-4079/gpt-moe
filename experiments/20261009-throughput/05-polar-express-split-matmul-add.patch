@@ -1,0 +1,12 @@
+diff --git a/optimizers/polar_express.py b/optimizers/polar_express.py
+--- a/optimizers/polar_express.py
++++ b/optimizers/polar_express.py
+@@ -274,7 +274,7 @@
+ 
+ 
+ @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
+-def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool = False):
++def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool = True):
+     """
+     Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.

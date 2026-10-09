@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, and_masks
+from torch.utils.checkpoint import checkpoint
 
 from .block import Block
 
@@ -24,6 +25,7 @@ class GPT(nn.Module):
         self.pad_token_id = gpt_config.pad_token_id
         self.pos_encoding_type = gpt_config.pos_encoding_type.lower()
         self.optimizer_type = training_config.optimizer_type.lower()
+        self.use_activation_checkpointing = training_config.use_activation_checkpointing
 
         self.muon_lr_scale = training_config.muon_lr_scale
         self.muon_backend = training_config.muon_backend
@@ -694,7 +696,13 @@ class GPT(nn.Module):
         balance_loss = None
         for block, is_full in zip(self.transformer.h, self.layer_is_full_attention):
             flex_mask = full_flex_attn_block_mask if is_full else swa_flex_attn_block_mask
-            x, block_balance_loss = block(x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=sdpa_attn_mask)
+            if self.use_activation_checkpointing and self.training and torch.is_grad_enabled():
+                x, block_balance_loss = checkpoint(
+                    block, x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=sdpa_attn_mask,
+                    use_reentrant=False,
+                )
+            else:
+                x, block_balance_loss = block(x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=sdpa_attn_mask)
             if block_balance_loss is not None:
                 balance_loss = block_balance_loss if balance_loss is None else balance_loss + block_balance_loss
         if self.stage_index == 0:

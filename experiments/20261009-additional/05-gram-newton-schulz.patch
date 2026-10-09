@@ -1,0 +1,137 @@
+diff --git a/config/training.py b/config/training.py
+--- a/config/training.py
++++ b/config/training.py
+@@ -108,10 +108,12 @@
+     adamw_hard_min_lr: float = 7e-4
+     optimizer_type: str = "muon" # "muon" (and adamw) or any other name for "adamw"
+     muon_lr_scale: float = 0.15 # Muon usually likes a smaller LR than AdamW (e.g., 0.1x)
+-    muon_backend: str = "polarexpress" # "svd" | "newtonschulz5" | "polarexpress"
++    muon_backend: str = "gram_newton_schulz" # "svd" | "newtonschulz5" | "polarexpress" | "gram_newton_schulz"
+     muon_backend_steps: int = 5 # ~5-10; the higher, the slightly “tighter” orthogonalization (and slower)
+     muon_momentum: float = 0.95
+     muon_use_nesterov: bool = True
++    muon_gram_use_kernels: bool = False # enable CuTeDSL kernels on supported Hopper/Blackwell GPUs
++    muon_gram_reset_iterations: List[int] = field(default_factory=lambda: [2])
+     # derived from the above
+     total_decay_tokens: int = lr_warmup_and_cosine_tokens - lr_warmup_tokens
+     # filled by resolve
+@@ -239,9 +241,9 @@
+             self.bf16_weights_params_and_scales = {"all": object}
+ 
+         # Muon Polar Express
+-        if self.optimizer_type == "muon" and self.muon_backend == "polarexpress":
++        if self.optimizer_type == "muon" and self.muon_backend in ("polarexpress", "gram_newton_schulz"):
+             assert self.muon_backend_steps == 5, (
+-                "Using Polar Express currently requires muon_backend_steps=5 steps due to "
++                "These Polar Express coefficients require muon_backend_steps=5 steps due to "
+                 f"pre-computed coefficients (got {self.muon_backend_steps} steps)"
+             )
+ 
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -32,6 +32,8 @@
+         self.muon_backend_steps = training_config.muon_backend_steps
+         self.muon_momentum = training_config.muon_momentum
+         self.muon_use_nesterov = training_config.muon_use_nesterov
++        self.muon_gram_use_kernels = training_config.muon_gram_use_kernels
++        self.muon_gram_reset_iterations = training_config.muon_gram_reset_iterations
+ 
+         # <-- Uncomment for gradient norm clipping -->
+         # self.use_grad_norm_clipping = gpt_config.use_grad_norm_clipping
+@@ -222,6 +224,8 @@
+             nesterov=self.muon_use_nesterov,
+             backend=self.muon_backend,
+             backend_steps=self.muon_backend_steps,
++            gram_use_kernels=self.muon_gram_use_kernels,
++            gram_reset_iterations=self.muon_gram_reset_iterations,
+         )
+         return {"adamw": adamw, "muon": muon}
+ 
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -140,6 +140,7 @@
+             "data_path", "data_uses_padding", "base_seed", "optimizer_type",
+             "adamw_betas", "adamw_eps", "adamw_weight_decay", "muon_lr_scale",
+             "muon_backend", "muon_backend_steps", "muon_momentum", "muon_use_nesterov",
++            "muon_gram_use_kernels", "muon_gram_reset_iterations",
+             "moe_load_balance_weight", "use_bf16_autocast", "use_all_bf16_and_null_ctx",
+             "use_bf16_weights_params_or_scales",
+             "keep_1d_weights_params_and_scales_in_fp32", "keep_fp32_loss",
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -6,7 +6,7 @@
+ import torch.nn as nn
+ from torch import Tensor
+ 
+-from .polar_express import zeropower_via_polar_express
++from .polar_express import polar_express_coeffs, zeropower_via_polar_express
+ 
+ ################################################
+ #                     Muon                     #
+@@ -142,15 +142,32 @@
+             nesterov: bool = True,
+             backend: str = "newtonschulz5",
+             backend_steps: int = 5,
++            gram_use_kernels: bool = False,
++            gram_reset_iterations: Optional[list[int]] = None,
+             ) -> None:
+         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+         super().__init__(params, defaults)
++        if backend == "gram_newton_schulz":
++            from gram_newton_schulz import GramNewtonSchulz
++
++            assert backend_steps == 5, "Gram Newton-Schulz uses the five Polar Express coefficients"
++            coefficients = list(polar_express_coeffs)
++            # absorb the baseline 1.02 input scaling into the first polynomial
++            a, b, c = coefficients[0]
++            coefficients[0] = (a / 1.02, b / 1.02**3, c / 1.02**5)
++            self.gram_backend = GramNewtonSchulz(
++                ns_epsilon=1e-6 / 1.02,
++                ns_use_kernels=gram_use_kernels,
++                ns_coefficients=coefficients,
++                gram_newton_schulz_reset_iterations=gram_reset_iterations,
++                compile_kwargs={"fullgraph": True, "dynamic": False, "mode": "default"},
++            )
+ 
+     def step(self) -> None:
+         for group in self.param_groups:
+             lr = group['lr']
+             momentum = group['momentum']
+-            zeropower_backend = zeropower_backends[group['backend']]
++            zeropower_backend = self.gram_backend if group['backend'] == 'gram_newton_schulz' else zeropower_backends[group['backend']]
+             buckets = {}
+             for p in group['params']:
+                 g = p.grad
+@@ -168,7 +185,7 @@
+                 else:
+                     updates = [(p.data, g)]
+                 for weight, update in updates:
+-                    if group['backend'] == 'polarexpress':
++                    if group['backend'] in ('polarexpress', 'gram_newton_schulz'):
+                         key = (update.shape, update.device, update.dtype)
+                         buckets.setdefault(key, []).append((weight, update))
+                     else:
+@@ -181,7 +198,10 @@
+                 for start in range(0, len(bucket), 8):
+                     batch = bucket[start:start + 8]
+                     updates = torch.stack([g for _, g in batch])
+-                    updates = zeropower_backend(updates, steps=group['backend_steps'])
++                    if group['backend'] == 'gram_newton_schulz':
++                        updates = zeropower_backend(updates.bfloat16())
++                    else:
++                        updates = zeropower_backend(updates, steps=group['backend_steps'])
+                     scale = max(updates.shape[-2:]) ** 0.5
+                     for (weight, _), update in zip(batch, updates):
+                         weight.add_(update, alpha=-lr * scale)
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,2 +1,5 @@
+ # additional dependency for the fused training loss
+ liger-kernel==0.8.4
++
++# optional Muon Gram Newton-Schulz backend
++gram-newton-schulz @ git+https://github.com/Dao-AILab/gram-newton-schulz.git@e45d0aca7083cb275c9a303220c05c4abecd9187

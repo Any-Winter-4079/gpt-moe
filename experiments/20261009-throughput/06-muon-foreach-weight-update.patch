@@ -1,0 +1,12 @@
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -183,6 +183,6 @@
+                     updates = torch.stack([g for _, g in batch])
+                     updates = zeropower_backend(updates, steps=group['backend_steps'])
+                     scale = max(updates.shape[-2:]) ** 0.5
+-                    for (weight, _), update in zip(batch, updates):
+-                        weight.add_(update, alpha=-lr * scale)
++                    # apply the independent matrix updates in one multi-tensor operation
++                    torch._foreach_add_([weight for weight, _ in batch], list(updates.unbind()), alpha=-lr * scale)
+ # -- End of (modified) source: https://github.com/tyler-romero/nanogpt-speedrun/blob/main/src/train_gpt2.py --

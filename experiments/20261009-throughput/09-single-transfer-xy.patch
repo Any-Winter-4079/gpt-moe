@@ -1,0 +1,62 @@
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -346,11 +346,7 @@
+         else:
+             train_losses = torch.zeros(3, device=device)
+             for mini_step in range(grad_accum_mini_steps):
+-                x_train, y_train, doc_ids_train = train_data_loader.next_batch()
+-                x_train = x_train[:current_batch_size].pin_memory().to(device, non_blocking=True)
+-                y_train = y_train[:current_batch_size].pin_memory().to(device, non_blocking=True)
+-                if doc_ids_train is not None:
+-                    doc_ids_train = doc_ids_train[:current_batch_size].pin_memory().to(device, non_blocking=True)
++                x_train, y_train, doc_ids_train = train_data_loader.next_batch(device=device, batch_size=current_batch_size)
+                 gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
+                 with ctx:
+                     step_train_loss, step_token_loss, step_balance_term = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+diff --git a/data/loader.py b/data/loader.py
+--- a/data/loader.py
++++ b/data/loader.py
+@@ -158,7 +158,7 @@
+         self._next_tokens = None
+         self._start_shard_prefetch()
+     
+-    def next_batch(self) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
++    def next_batch(self, *, device: Optional[str] = None, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+         if self.grad_accum_mini_steps_per_shard_counter == self.grad_accum_mini_steps_per_shard:
+             self.current_shard_idx += 1
+             self.grad_accum_mini_steps_per_shard_counter = 0
+@@ -200,8 +200,15 @@
+             # e.g., for gpu 0: [0-1023, 2048-3071] for the 1st grad accum mini-step
+             #       for gpu 1: [1024-2047, 5120-6143] for the 1st grad accum mini-step
+ 
+-        x = torch.stack([self.tokens[start:start + self.seq_len] for start in batch_starts])
+-        y = torch.stack([self.tokens[start + 1:start + self.seq_len + 1] for start in batch_starts])
++        if device is not None:
++            # transfer each overlapping X/Y window once, then form contiguous batches on the GPU
++            windows = torch.stack([self.tokens[start:start + self.seq_len + 1] for start in batch_starts[:batch_size]])
++            windows = windows.pin_memory().to(device, non_blocking=True)
++            x = windows[:, :-1].contiguous()
++            y = windows[:, 1:].contiguous()
++        else:
++            x = torch.stack([self.tokens[start:start + self.seq_len] for start in batch_starts])
++            y = torch.stack([self.tokens[start + 1:start + self.seq_len + 1] for start in batch_starts])
+ 
+         # optional doc ids (per-token doc index within the window)
+         doc_ids = None
+diff --git a/runtime/pipeline.py b/runtime/pipeline.py
+--- a/runtime/pipeline.py
++++ b/runtime/pipeline.py
+@@ -55,11 +55,7 @@
+ 
+     def next_batch(self, data_loader: Optional[DataLoader], batch_size: int, seq_len: int) -> Tuple[Optional[Tensor], Tensor, Optional[Tensor]]:
+         if self.master_process:
+-            x, y, doc_ids = data_loader.next_batch()
+-            x = x[:batch_size].pin_memory().to(self.device, non_blocking=True)
+-            y = y[:batch_size].pin_memory().to(self.device, non_blocking=True)
+-            if doc_ids is not None:
+-                doc_ids = doc_ids[:batch_size].pin_memory().to(self.device, non_blocking=True)
++            x, y, doc_ids = data_loader.next_batch(device=self.device, batch_size=batch_size)
+         else:
+             x = None
+             y = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)

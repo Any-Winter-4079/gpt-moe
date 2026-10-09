@@ -1,0 +1,83 @@
+diff --git a/config/training.py b/config/training.py
+--- a/config/training.py
++++ b/config/training.py
+@@ -187,6 +187,7 @@
+ 
+     # activation checkpointing
+     use_activation_checkpointing: bool = True
++    activation_checkpointing_scope: str = "mlp" # "block" or "mlp"
+ 
+     # torch compile
+     # NOTE: workaround for RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run is 
+@@ -233,6 +234,8 @@
+     torch_compile_mode: str = field(init=False)
+ 
+     def resolve(self, world_size: int) -> None:
++        assert self.activation_checkpointing_scope in ("block", "mlp"), "activation_checkpointing_scope must be 'block' or 'mlp'"
++
+         # bf16
+         if self.use_all_bf16_and_null_ctx:
+             self.use_bf16_autocast = False
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -26,6 +26,7 @@
+         self.pos_encoding_type = gpt_config.pos_encoding_type.lower()
+         self.optimizer_type = training_config.optimizer_type.lower()
+         self.use_activation_checkpointing = training_config.use_activation_checkpointing
++        self.activation_checkpointing_scope = training_config.activation_checkpointing_scope
+ 
+         self.muon_lr_scale = training_config.muon_lr_scale
+         self.muon_backend = training_config.muon_backend
+@@ -696,7 +697,7 @@
+         balance_loss = None
+         for block, is_full in zip(self.transformer.h, self.layer_is_full_attention):
+             flex_mask = full_flex_attn_block_mask if is_full else swa_flex_attn_block_mask
+-            if self.use_activation_checkpointing and self.training and torch.is_grad_enabled():
++            if self.use_activation_checkpointing and self.activation_checkpointing_scope == "block" and self.training and torch.is_grad_enabled():
+                 x, block_balance_loss = checkpoint(
+                     block, x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=sdpa_attn_mask,
+                     use_reentrant=False,
+diff --git a/model/block.py b/model/block.py
+--- a/model/block.py
++++ b/model/block.py
+@@ -6,6 +6,7 @@
+ import torch.nn as nn
+ from torch import Tensor
+ from torch.nn.attention.flex_attention import BlockMask
++from torch.utils.checkpoint import checkpoint
+ 
+ from .attention import SelfAttention
+ from .mlp import MLP
+@@ -20,6 +21,7 @@
+     def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig, layer_idx: int = 0) -> None:
+         super().__init__()
+         self.use_moe = gpt_config.use_moe
++        self.checkpoint_mlp = training_config.use_activation_checkpointing and training_config.activation_checkpointing_scope == "mlp"
+         self.use_bf16_autocast = training_config.use_bf16_autocast
+         self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
+ 
+@@ -80,7 +82,10 @@
+             x_ln2 = x
+             if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+                 x_ln2 = x_ln2.to(dtype=self.ln_2.weight.dtype)
+-            mlp_output = self.mlp(self.ln_2(x_ln2))
++            if self.checkpoint_mlp and self.training and torch.is_grad_enabled():
++                mlp_output = checkpoint(self.mlp, self.ln_2(x_ln2), use_reentrant=False)
++            else:
++                mlp_output = self.mlp(self.ln_2(x_ln2))
+             if self.use_moe:
+                 mlp_output, balance_loss = mlp_output
+ 
+@@ -106,7 +111,10 @@
+             x_ln2 = x
+             if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+                 x_ln2 = x_ln2.to(dtype=self.ln_2.weight.dtype)
+-            mlp_output = self.mlp(self.ln_2(x_ln2))
++            if self.checkpoint_mlp and self.training and torch.is_grad_enabled():
++                mlp_output = checkpoint(self.mlp, self.ln_2(x_ln2), use_reentrant=False)
++            else:
++                mlp_output = self.mlp(self.ln_2(x_ln2))
+             if self.use_moe:
+                 mlp_output, balance_loss = mlp_output
+             x = x + self.residual_scale * mlp_output

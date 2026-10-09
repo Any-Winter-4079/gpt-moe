@@ -1,0 +1,277 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -73,6 +73,16 @@
+     activation: str = "relu2" # "gelu", "relu", "relu2" (relu^2), "silu" or "swiglu"
+     use_fair_swiglu: bool = True # only if swiglu
+ 
++    # selective fp8 MLP and expert projections
++    fp8_projections: str = "off" # "off", "up", "down" or "both"
++    fp8_min_features: int = 256
++    fp8_backward: bool = False
++    fp8_scaling: str = "dynamic" # "dynamic" or "fixed"
++    fp8_margin: int = 0 # dynamic scale headroom in powers of two
++    fp8_input_scale: float = 1.0 # fixed dequantization scales
++    fp8_weight_scale: float = 1.0
++    fp8_grad_scale: float = 1.0
++
+     # mixture of experts
+     use_moe: bool = True
+     num_experts: int = 8
+diff --git a/model/mlp.py b/model/mlp.py
+--- a/model/mlp.py
++++ b/model/mlp.py
+@@ -5,6 +5,8 @@
+ import torch.nn as nn
+ from torch import Tensor
+ from torch.nn import functional as F
++
++from .fp8_linear import fp8_linear, validate_fp8_config
+ 
+ if TYPE_CHECKING:
+     from config.model import GPTConfig
+@@ -41,14 +43,32 @@
+             self.c_fc = nn.Linear(gpt_config.d_model, self.hidden_dim, bias=gpt_config.use_bias)
+             self.c_proj = nn.Linear(self.hidden_dim, gpt_config.d_model, bias=gpt_config.use_bias)
+ 
++        self.fp8_up = False
++        self.fp8_down = False
++        if gpt_config.fp8_projections != "off":
++            validate_fp8_config(gpt_config)
++            self.fp8_up = gpt_config.fp8_projections in ("up", "both") and min(self.c_fc.weight.shape) >= gpt_config.fp8_min_features
++            self.fp8_down = gpt_config.fp8_projections in ("down", "both") and min(self.c_proj.weight.shape) >= gpt_config.fp8_min_features
++            self.fp8_options = (
++                gpt_config.fp8_backward, gpt_config.fp8_scaling == "dynamic",
++                float(2 ** gpt_config.fp8_margin), gpt_config.fp8_input_scale,
++                gpt_config.fp8_weight_scale, gpt_config.fp8_grad_scale,
++            )
++
+     def forward(self, x: Tensor) -> Tensor:
+         # cast if no autocast and cast is requested (x input can be f32, and c_fc weights can be bf16)
+         if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.c_fc.weight.dtype:
+             x = x.to(dtype=self.c_fc.weight.dtype)
+-        x = self.activate(self.c_fc(x))
++        if self.fp8_up:
++            x = fp8_linear(x, self.c_fc.weight, self.c_fc.bias, *self.fp8_options)
++        else:
++            x = self.c_fc(x)
++        x = self.activate(x)
+         # cast if no autocast and cast is requested (x coming from activation can be fp32, proj weights can be bf16)
+         if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.c_proj.weight.dtype:
+             x = x.to(dtype=self.c_proj.weight.dtype)
++        if self.fp8_down:
++            return fp8_linear(x, self.c_proj.weight, self.c_proj.bias, *self.fp8_options)
+         return self.c_proj(x)
+ 
+     def activate(self, x: Tensor) -> Tensor:
+diff --git a/model/moe.py b/model/moe.py
+--- a/model/moe.py
++++ b/model/moe.py
+@@ -9,6 +9,7 @@
+ 
+ from .grouped_linear import grouped_linear
+ from .mlp import MLP
++from .fp8_linear import grouped_fp8_linear
+ 
+ if TYPE_CHECKING:
+     from config.model import GPTConfig
+@@ -90,14 +91,20 @@
+ 
+         # stack for computation while keeping each 2d parameter and its Muon update
+         up_weight = torch.stack([expert.c_fc.weight for expert in self.experts]).to(dtype)
+-        packed = grouped_linear(packed, up_weight, offsets)
++        if self.experts[0].fp8_up:
++            packed = grouped_fp8_linear(packed, up_weight, offsets, *self.experts[0].fp8_options)
++        else:
++            packed = grouped_linear(packed, up_weight, offsets)
+         if self.experts[0].c_fc.bias is not None:
+             up_bias = torch.stack([expert.c_fc.bias for expert in self.experts]).to(dtype)
+             packed = packed + up_bias[expert_indices]
+         # CUDA autocast promotes pow to fp32; match nn.Linear's input cast before the down projection
+         packed = self.experts[0].activate(packed).to(dtype)
+         down_weight = torch.stack([expert.c_proj.weight for expert in self.experts]).to(dtype)
+-        packed = grouped_linear(packed, down_weight, offsets)
++        if self.experts[0].fp8_down:
++            packed = grouped_fp8_linear(packed, down_weight, offsets, *self.experts[0].fp8_options)
++        else:
++            packed = grouped_linear(packed, down_weight, offsets)
+         if self.experts[0].c_proj.bias is not None:
+             down_bias = torch.stack([expert.c_proj.bias for expert in self.experts]).to(dtype)
+             packed = packed + down_bias[expert_indices]
+diff --git a/model/fp8_linear.py b/model/fp8_linear.py
+new file mode 100644
+--- /dev/null
++++ b/model/fp8_linear.py
+@@ -0,0 +1,172 @@
++from __future__ import annotations
++
++import math
++from typing import Any, Optional, Tuple, TYPE_CHECKING
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import triton_op, wrap_triton
++
++from .grouped_linear import _grouped_linear_backward
++
++if TYPE_CHECKING:
++    from config.model import GPTConfig
++
++
++def validate_fp8_config(config: GPTConfig) -> None:
++    if config.fp8_projections not in ("up", "down", "both"):
++        raise ValueError("unsupported fp8_projections: use off, up, down or both")
++    if config.fp8_scaling not in ("dynamic", "fixed"):
++        raise ValueError("unsupported fp8_scaling: use dynamic or fixed")
++    if config.fp8_margin < 0 or config.fp8_margin > 16 or config.fp8_min_features < 1:
++        raise ValueError("fp8_margin must be in [0, 16] and fp8_min_features must be positive")
++    scales = (config.fp8_input_scale, config.fp8_weight_scale, config.fp8_grad_scale)
++    if any(not math.isfinite(scale) or scale <= 0 for scale in scales):
++        raise ValueError("fp8 scales must be finite and positive")
++    if torch.__version__.split("+")[0] != "2.10.0" or triton.__version__ != "3.6.0":
++        raise RuntimeError("fp8 projections require torch==2.10.0 and triton==3.6.0")
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((8, 9), (12, 0)):
++        raise RuntimeError("fp8 projections require SM89 (Ada) or SM120 (RTX Blackwell)")
++
++
++@triton.jit
++def _fp8_mm_kernel(
++    A, B, C, Offsets, AScale, BScale,
++    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
++    a_stride_m: tl.constexpr, a_stride_k: tl.constexpr,
++    b_stride_e: tl.constexpr, b_stride_k: tl.constexpr, b_stride_n: tl.constexpr,
++    NUM_EXPERTS: tl.constexpr, NUM_PROGRAMS: tl.constexpr, GROUP_K: tl.constexpr,
++    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
++):
++    # persistent workers traverse the tiles of all experts
++    tile = tl.program_id(0)
++    first_tile = 0
++    start = 0
++    a_scale = tl.load(AScale)
++    for expert in range(NUM_EXPERTS):
++        end = tl.load(Offsets + expert)
++        if GROUP_K:
++            rows, reduction = M, end - start
++            a_base = start * a_stride_k
++            b_base = start * b_stride_k
++            c_base = expert * M * N
++            b_scale = tl.load(BScale)
++        else:
++            rows, reduction = end - start, K
++            a_base = start * a_stride_m
++            b_base = expert * b_stride_e
++            c_base = start * N
++            b_scale = tl.load(BScale + expert)
++
++        tiles_n = tl.cdiv(N, BLOCK_N)
++        last_tile = first_tile + tl.cdiv(rows, BLOCK_M) * tiles_n
++        while tile < last_tile:
++            local_tile = tile - first_tile
++            row = (local_tile // tiles_n) * BLOCK_M + tl.arange(0, BLOCK_M)
++            col = (local_tile % tiles_n) * BLOCK_N + tl.arange(0, BLOCK_N)
++            inner = tl.arange(0, BLOCK_K)
++            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++            for block in range(tl.cdiv(reduction, BLOCK_K)):
++                k = block * BLOCK_K + inner
++                a = tl.load(
++                    A + a_base + row[:, None] * a_stride_m + k[None, :] * a_stride_k,
++                    mask=(row[:, None] < rows) & (k[None, :] < reduction), other=0.0,
++                ).to(tl.float32)
++                b = tl.load(
++                    B + b_base + k[:, None] * b_stride_k + col[None, :] * b_stride_n,
++                    mask=(k[:, None] < reduction) & (col[None, :] < N), other=0.0,
++                ).to(tl.float32)
++                a = tl.minimum(tl.maximum(a / a_scale, -448.0), 448.0).to(tl.float8e4nv)
++                b = tl.minimum(tl.maximum(b / b_scale, -448.0), 448.0).to(tl.float8e4nv)
++                acc = tl.dot(a, b, acc)
++            result = acc * a_scale * b_scale
++            tl.store(
++                C + c_base + row[:, None] * N + col[None, :], result.to(C.dtype.element_ty),
++                mask=(row[:, None] < rows) & (col[None, :] < N),
++            )
++            tile += NUM_PROGRAMS
++        first_tile = last_tile
++        start = end
++
++
++def _tensor_scale(x: Tensor, dynamic: bool, margin: float, fixed_scale: float) -> Tensor:
++    shape = (x.shape[0],) if x.ndim == 3 else ()
++    if not dynamic:
++        return torch.full(shape, fixed_scale, device=x.device, dtype=torch.float32)
++    if x.numel() == 0:
++        return torch.ones(shape, device=x.device, dtype=torch.float32)
++    amax = x.float().abs().amax(dim=(-2, -1))
++    return amax.clamp_min(1e-12) * (margin / 448.0)
++
++
++def _fp8_mm(a: Tensor, b: Tensor, offsets: Tensor, a_scale: Tensor, b_scale: Tensor) -> Tensor:
++    # partition output rows for forward/dgrad and the reduction for wgrad
++    group_k = b.ndim == 2
++    m, k = a.shape
++    n = b.shape[-1]
++    num_experts = offsets.numel()
++    out = a.new_empty((num_experts, m, n) if group_k else (m, n))
++    num_programs = torch.cuda.get_device_properties(a.device).multi_processor_count
++    wrap_triton(_fp8_mm_kernel)[(num_programs,)](
++        a, b, out, offsets, a_scale, b_scale, m, n, k,
++        a.stride(0), a.stride(1),
++        0 if group_k else b.stride(0), b.stride(-2), b.stride(-1),
++        num_experts, num_programs, group_k,
++        BLOCK_M=128, BLOCK_N=64, BLOCK_K=64, num_warps=4, num_stages=1,
++    )
++    return out
++
++
++@triton_op("gpt_moe::grouped_fp8_linear", mutates_args=())
++def grouped_fp8_linear(
++    x: Tensor, weight: Tensor, offsets: Tensor, low_precision_backward: bool,
++    dynamic: bool, margin: float, input_scale: float, weight_scale: float, grad_scale: float,
++) -> Tensor:
++    x_scale = _tensor_scale(x, dynamic, margin, input_scale)
++    w_scale = _tensor_scale(weight, dynamic, margin, weight_scale)
++    return _fp8_mm(x, weight.transpose(-2, -1), offsets, x_scale, w_scale)
++
++
++@triton_op("gpt_moe::grouped_fp8_backward", mutates_args=())
++def _grouped_fp8_backward(
++    grad: Tensor, x: Tensor, weight: Tensor, offsets: Tensor,
++    dynamic: bool, margin: float, input_scale: float, weight_scale: float, grad_scale: float,
++) -> Tuple[Tensor, Tensor]:
++    x_scale = _tensor_scale(x, dynamic, margin, input_scale)
++    w_scale = _tensor_scale(weight, dynamic, margin, weight_scale)
++    g_scale = _tensor_scale(grad, dynamic, margin, grad_scale)
++    grad_x = _fp8_mm(grad, weight, offsets, g_scale, w_scale)
++    grad_weight = _fp8_mm(grad.t(), x, offsets, g_scale, x_scale)
++    return grad_x, grad_weight
++
++
++def _setup_context(ctx: Any, inputs: Tuple, output: Tensor) -> None:
++    ctx.save_for_backward(*inputs[:3])
++    ctx.low_precision_backward = inputs[3]
++    ctx.scaling = inputs[4:]
++
++
++def _backward(ctx: Any, grad: Tensor) -> Tuple:
++    x, weight, offsets = ctx.saved_tensors
++    grad = grad.to(x.dtype)
++    # use an approximate linear backward; do not differentiate rounding or scales
++    if ctx.low_precision_backward:
++        grad_x, grad_weight = _grouped_fp8_backward(grad, x, weight, offsets, *ctx.scaling)
++    else:
++        grad_x, grad_weight = _grouped_linear_backward(grad, x, weight, offsets)
++    return (grad_x, grad_weight) + (None,) * 7
++
++
++grouped_fp8_linear.register_autograd(_backward, setup_context=_setup_context)
++
++
++def fp8_linear(x: Tensor, weight: Tensor, bias: Optional[Tensor], *options: Any) -> Tensor:
++    dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else weight.dtype
++    flat = x.reshape(-1, x.shape[-1]).to(dtype)
++    offsets = torch.full((1,), flat.shape[0], device=x.device, dtype=torch.int32)
++    result = grouped_fp8_linear(flat, weight.to(dtype).unsqueeze(0), offsets, *options)
++    if bias is not None:
++        result = result + bias.to(dtype)
++    return result.reshape(*x.shape[:-1], weight.shape[0])

@@ -1,0 +1,74 @@
+diff --git a/config/training.py b/config/training.py
+--- a/config/training.py
++++ b/config/training.py
+@@ -112,6 +112,7 @@
+     muon_backend_steps: int = 5 # ~5-10; the higher, the slightly “tighter” orthogonalization (and slower)
+     muon_momentum: float = 0.95
+     muon_use_nesterov: bool = True
++    muon_offload_momentum: bool = True
+     # derived from the above
+     total_decay_tokens: int = lr_warmup_and_cosine_tokens - lr_warmup_tokens
+     # filled by resolve
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -32,6 +32,7 @@
+         self.muon_backend_steps = training_config.muon_backend_steps
+         self.muon_momentum = training_config.muon_momentum
+         self.muon_use_nesterov = training_config.muon_use_nesterov
++        self.muon_offload_momentum = training_config.muon_offload_momentum
+ 
+         # <-- Uncomment for gradient norm clipping -->
+         # self.use_grad_norm_clipping = gpt_config.use_grad_norm_clipping
+@@ -220,6 +221,7 @@
+             lr=lr * self.muon_lr_scale,
+             momentum=self.muon_momentum,
+             nesterov=self.muon_use_nesterov,
++            offload_momentum=self.muon_offload_momentum,
+             backend=self.muon_backend,
+             backend_steps=self.muon_backend_steps,
+         )
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -142,9 +142,11 @@
+             nesterov: bool = True,
+             backend: str = "newtonschulz5",
+             backend_steps: int = 5,
++            offload_momentum: bool = False,
+             ) -> None:
+         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+         super().__init__(params, defaults)
++        self.offload_momentum = offload_momentum
+ 
+     def step(self) -> None:
+         for group in self.param_groups:
+@@ -157,12 +159,25 @@
+                 if g is None:
+                     continue
+                 state = self.state[p]
+-                if 'momentum_buffer' not in state:
+-                    state['momentum_buffer'] = torch.zeros_like(g)
+-                buf = state['momentum_buffer']
++                if self.offload_momentum:
++                    if 'momentum_buffer' not in state:
++                        state['momentum_buffer'] = torch.zeros_like(g, device='cpu', pin_memory=g.is_cuda)
++                    elif state['momentum_buffer'].device.type != 'cpu' or (g.is_cuda and not state['momentum_buffer'].is_pinned()):
++                        # optimizer loading can move saved momentum back to the parameter device
++                        host_buf = torch.empty_like(g, device='cpu', pin_memory=g.is_cuda)
++                        host_buf.copy_(state['momentum_buffer'])
++                        state['momentum_buffer'] = host_buf
++                    buf = state['momentum_buffer'].to(device=g.device, non_blocking=True)
++                else:
++                    if 'momentum_buffer' not in state:
++                        state['momentum_buffer'] = torch.zeros_like(g)
++                    buf = state['momentum_buffer']
+                 buf.mul_(momentum).add_(g)
+                 if group['nesterov']:
+                     g.add_(buf, alpha=momentum)
++                if self.offload_momentum:
++                    # finish the copy before this pinned buffer can be reused or checkpointed
++                    state['momentum_buffer'].copy_(buf)
+                 if g.size(0) == 3 * g.size(1):  # split grouped QKV parameters
+                     updates = zip(p.data.split(g.size(1)), g.split(g.size(1)))
+                 else:

@@ -1,0 +1,22 @@
+diff --git a/model/moe.py b/model/moe.py
+--- a/model/moe.py
++++ b/model/moe.py
+@@ -88,15 +88,15 @@
+         dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else self.experts[0].c_fc.weight.dtype
+         packed = hidden_states[order // self.top_k].to(dtype)
+ 
+-        # stack for computation while keeping each 2d parameter and its Muon update
+-        up_weight = torch.stack([expert.c_fc.weight for expert in self.experts]).to(dtype)
++        # pack input/output order contiguously, retaining each expert parameter and its Muon update
++        up_weight = torch.stack([expert.c_fc.weight.t() for expert in self.experts]).to(dtype).transpose(-2, -1)
+         packed = grouped_linear(packed, up_weight, offsets)
+         if self.experts[0].c_fc.bias is not None:
+             up_bias = torch.stack([expert.c_fc.bias for expert in self.experts]).to(dtype)
+             packed = packed + up_bias[expert_indices]
+         # CUDA autocast promotes pow to fp32; match nn.Linear's input cast before the down projection
+         packed = self.experts[0].activate(packed).to(dtype)
+-        down_weight = torch.stack([expert.c_proj.weight for expert in self.experts]).to(dtype)
++        down_weight = torch.stack([expert.c_proj.weight.t() for expert in self.experts]).to(dtype).transpose(-2, -1)
+         packed = grouped_linear(packed, down_weight, offsets)
+         if self.experts[0].c_proj.bias is not None:
+             down_bias = torch.stack([expert.c_proj.bias for expert in self.experts]).to(dtype)

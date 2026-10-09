@@ -1,0 +1,156 @@
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -139,6 +139,7 @@
+             "swa_initial_window_size",
+             "data_path", "data_uses_padding", "base_seed", "optimizer_type",
+             "adamw_betas", "adamw_eps", "adamw_weight_decay", "muon_lr_scale",
++            "lion_betas", "lion_lr_scale", "lion_weight_decay",
+             "muon_backend", "muon_backend_steps", "muon_momentum", "muon_use_nesterov",
+             "moe_load_balance_weight", "use_bf16_autocast", "use_all_bf16_and_null_ctx",
+             "use_bf16_weights_params_or_scales",
+@@ -417,8 +418,12 @@
+         raw_gpt_model.sliding_window_size.fill_(current_window_size)
+ 
+         # AdamW gets the base learning rate
+-        for param_group in optimizers["adamw"].param_groups:
+-            param_group['lr'] = adamw_lr
++        if "adamw" in optimizers:
++            for param_group in optimizers["adamw"].param_groups:
++                param_group['lr'] = adamw_lr
++        if "lion" in optimizers:
++            for param_group in optimizers["lion"].param_groups:
++                param_group['lr'] = adamw_lr * raw_gpt_model.lion_lr_scale
+         # Muon if present gets scaled learning rate
+         if "muon" in optimizers:
+             for param_group in optimizers["muon"].param_groups:
+diff --git a/config/training.py b/config/training.py
+--- a/config/training.py
++++ b/config/training.py
+@@ -106,7 +106,10 @@
+     lr_warmup_and_cosine_tokens: int = 600 * 10**6
+     adamw_weight_decay: float = 0.01
+     adamw_hard_min_lr: float = 7e-4
+-    optimizer_type: str = "muon" # "muon" (and adamw) or any other name for "adamw"
++    optimizer_type: str = "lion" # "lion", "muon" (and adamw), or "adamw"
++    lion_betas: Tuple[float, float] = (0.9, 0.99)
++    lion_lr_scale: float = 0.1 # multiplier on the token-based base LR schedule
++    lion_weight_decay: float = 0.1
+     muon_lr_scale: float = 0.15 # Muon usually likes a smaller LR than AdamW (e.g., 0.1x)
+     muon_backend: str = "polarexpress" # "svd" | "newtonschulz5" | "polarexpress"
+     muon_backend_steps: int = 5 # ~5-10; the higher, the slightly “tighter” orthogonalization (and slower)
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -26,6 +26,10 @@
+         self.pos_encoding_type = gpt_config.pos_encoding_type.lower()
+         self.optimizer_type = training_config.optimizer_type.lower()
+         self.use_activation_checkpointing = training_config.use_activation_checkpointing
++
++        self.lion_betas = training_config.lion_betas
++        self.lion_lr_scale = training_config.lion_lr_scale
++        self.lion_weight_decay = training_config.lion_weight_decay
+ 
+         self.muon_lr_scale = training_config.muon_lr_scale
+         self.muon_backend = training_config.muon_backend
+@@ -166,6 +170,25 @@
+             )
+             print(message)
+             log_buffer.append(message)
++
++        if self.optimizer_type == "lion":
++            from optimizers.lion import FusedLion
++
++            decay_params = [p for p in param_dict.values() if p.dim() >= 2]
++            nodecay_params = [p for p in param_dict.values() if p.dim() < 2]
++            lion = FusedLion(
++                [
++                    {'params': decay_params, 'weight_decay': self.lion_weight_decay},
++                    {'params': nodecay_params, 'weight_decay': 0.0},
++                ],
++                lr=lr * self.lion_lr_scale,
++                betas=self.lion_betas,
++            )
++            if master_process:
++                message = f"using fused Lion: {len(decay_params)} decayed and {len(nodecay_params)} non-decayed tensors"
++                print(message)
++                log_buffer.append(message)
++            return {"lion": lion}
+ 
+         # muon params: 2d weights, excluding embeddings and lm_head
+         muon_param_names = set()
+diff --git a/optimizers/lion.py b/optimizers/lion.py
+new file mode 100644
+--- /dev/null
++++ b/optimizers/lion.py
+@@ -0,0 +1,70 @@
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _lion_step_kernel(P, G, M, N: tl.constexpr, lr, beta1, beta2, one_minus_beta1, one_minus_beta2, decay, BLOCK: tl.constexpr):
++    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = offsets < N
++    p = tl.load(P + offsets, mask=mask, other=0.0).to(tl.float32)
++    g = tl.load(G + offsets, mask=mask, other=0.0).to(tl.float32)
++    m = tl.load(M + offsets, mask=mask, other=0.0)
++    update = beta1 * m + one_minus_beta1 * g
++    direction = tl.where(update > 0.0, 1.0, tl.where(update < 0.0, -1.0, 0.0))
++    p = p * decay - lr * direction
++    m = beta2 * m + one_minus_beta2 * g
++    tl.store(P + offsets, p, mask=mask)
++    tl.store(M + offsets, m, mask=mask)
++
++
++class FusedLion(torch.optim.Optimizer):
++    """Google Lion equations, fused per tensor with FP32 arithmetic and momentum."""
++
++    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
++        super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
++        for group in self.param_groups:
++            if not group['lr'] >= 0 or not group['weight_decay'] >= 0:
++                raise ValueError("Lion requires nonnegative learning rate and weight decay")
++            if len(group['betas']) != 2 or any(not 0 <= beta < 1 for beta in group['betas']):
++                raise ValueError("Lion requires two betas in [0, 1)")
++            for p in group['params']:
++                if not p.is_cuda or not p.is_contiguous():
++                    raise ValueError("fused Lion requires contiguous CUDA parameters")
++                if p.dtype not in (torch.float32, torch.bfloat16, torch.float16):
++                    raise ValueError("fused Lion requires float32, bfloat16 or float16 parameters")
++
++    def load_state_dict(self, state_dict):
++        super().load_state_dict(state_dict)
++        # restore saved FP32 values before parameter-dtype casting loses momentum precision
++        for group, saved_group in zip(self.param_groups, state_dict['param_groups']):
++            for p, index in zip(group['params'], saved_group['params']):
++                saved = state_dict['state'].get(index)
++                if saved is not None:
++                    self.state[p]['exp_avg'] = saved['exp_avg'].to(device=p.device, dtype=torch.float32).clone()
++
++    @torch.no_grad()
++    def step(self, closure=None):
++        loss = None
++        if closure is not None:
++            with torch.enable_grad():
++                loss = closure()
++        for group in self.param_groups:
++            beta1, beta2 = group['betas']
++            for p in group['params']:
++                if p.grad is None or p.numel() == 0:
++                    continue
++                if p.grad.is_sparse:
++                    raise ValueError("fused Lion does not support sparse gradients")
++                state = self.state[p]
++                if 'exp_avg' not in state:
++                    state['exp_avg'] = torch.zeros_like(p, dtype=torch.float32)
++                grad = p.grad.contiguous()
++                _lion_step_kernel[(triton.cdiv(p.numel(), 1024),)](
++                    p, grad, state['exp_avg'], p.numel(), group['lr'], beta1, beta2,
++                    1.0 - beta1, 1.0 - beta2, 1.0 - group['lr'] * group['weight_decay'],
++                    BLOCK=1024, enable_fp_fusion=False,
++                )
++        return loss

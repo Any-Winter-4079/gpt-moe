@@ -1,0 +1,49 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -26,6 +26,8 @@
+     weighted_residual_path_init: float = 1.0 # alpha_1, alpha_2 init
+     use_weighted_main_path: bool = True
+     weighted_main_path_init: float = 0.0 # beta_1, beta_2 init
++
++    use_parallel_attn_mlp: bool = True
+ 
+     # vocabulary and tokenizer
+     vocab_size: int = 50304
+diff --git a/model/block.py b/model/block.py
+--- a/model/block.py
++++ b/model/block.py
+@@ -20,6 +20,7 @@
+     def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig, layer_idx: int = 0) -> None:
+         super().__init__()
+         self.use_moe = gpt_config.use_moe
++        self.use_parallel_attn_mlp = gpt_config.use_parallel_attn_mlp
+         self.use_bf16_autocast = training_config.use_bf16_autocast
+         self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
+ 
+@@ -58,6 +59,7 @@
+             sdpa_attn_mask: Optional[Tensor] = None,
+             ) -> Tuple[Tensor, Optional[Tensor]]:
+         balance_loss = None
++        block_input = x
+         # weighted path
+         if self.use_weighted_residual_path or self.use_weighted_main_path:
+             # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+@@ -77,7 +79,7 @@
+                 x = self.attn_residual_scale * x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+ 
+             # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+-            x_ln2 = x
++            x_ln2 = block_input if self.use_parallel_attn_mlp else x
+             if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+                 x_ln2 = x_ln2.to(dtype=self.ln_2.weight.dtype)
+             mlp_output = self.mlp(self.ln_2(x_ln2))
+@@ -103,7 +105,7 @@
+                 x_ln1 = x_ln1.to(dtype=self.ln_1.weight.dtype)
+             x = x + self.residual_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+             # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+-            x_ln2 = x
++            x_ln2 = block_input if self.use_parallel_attn_mlp else x
+             if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+                 x_ln2 = x_ln2.to(dtype=self.ln_2.weight.dtype)
+             mlp_output = self.mlp(self.ln_2(x_ln2))

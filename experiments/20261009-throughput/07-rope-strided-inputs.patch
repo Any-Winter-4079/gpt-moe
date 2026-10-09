@@ -1,0 +1,20 @@
+diff --git a/model/position.py b/model/position.py
+--- a/model/position.py
++++ b/model/position.py
+@@ -50,13 +50,9 @@
+     gpu_batch_size, n_heads, seq_len, head_size = q.shape
+     _, n_kv_heads_k, _, _ = k.shape
+ 
+-    # gpu_batch_size, n_heads, seq_len, head_size // 2, 2
+-    q_pairs = q.contiguous().reshape(gpu_batch_size, n_heads, seq_len, head_size // 2, 2)
+-    k_pairs = k.contiguous().reshape(gpu_batch_size, n_kv_heads_k, seq_len, head_size // 2, 2)
+-
+-    # gpu_batch_size, n_heads, seq_len, head_size/2 each
+-    q_x1, q_x2 = q_pairs[..., 0], q_pairs[..., 1]
+-    k_x1, k_x2 = k_pairs[..., 0], k_pairs[..., 1]
++    # slice the pairs directly from strided Q/K without copying both tensors first
++    q_x1, q_x2 = q[..., 0::2], q[..., 1::2]
++    k_x1, k_x2 = k[..., 0::2], k[..., 1::2]
+ 
+     # gpu_batch_size, n_heads, seq_len, head_size
+     q_rot = torch.stack([q_x1 * cos - q_x2 * sin, q_x1 * sin + q_x2 * cos], dim=-1)

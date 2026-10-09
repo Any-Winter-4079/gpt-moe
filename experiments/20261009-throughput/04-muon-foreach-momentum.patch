@@ -1,0 +1,35 @@
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -152,6 +152,7 @@
+             momentum = group['momentum']
+             zeropower_backend = zeropower_backends[group['backend']]
+             buckets = {}
++            momentum_buckets = {}
+             for p in group['params']:
+                 g = p.grad
+                 if g is None:
+@@ -159,10 +160,20 @@
+                 state = self.state[p]
+                 if 'momentum_buffer' not in state:
+                     state['momentum_buffer'] = torch.zeros_like(g)
+-                buf = state['momentum_buffer']
+-                buf.mul_(momentum).add_(g)
++                key = (g.device, g.dtype)
++                momentum_buckets.setdefault(key, []).append((g, state['momentum_buffer']))
++            for bucket in momentum_buckets.values():
++                # update independent momentum buffers with multi-tensor kernels
++                grads = [g for g, _ in bucket]
++                buffers = [buf for _, buf in bucket]
++                torch._foreach_mul_(buffers, momentum)
++                torch._foreach_add_(buffers, grads)
+                 if group['nesterov']:
+-                    g.add_(buf, alpha=momentum)
++                    torch._foreach_add_(grads, buffers, alpha=momentum)
++            for p in group['params']:
++                g = p.grad
++                if g is None:
++                    continue
+                 if g.size(0) == 3 * g.size(1):  # split grouped QKV parameters
+                     updates = zip(p.data.split(g.size(1)), g.split(g.size(1)))
+                 else:

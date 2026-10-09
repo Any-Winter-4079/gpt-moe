@@ -1,0 +1,138 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -26,6 +26,10 @@
+     weighted_residual_path_init: float = 1.0 # alpha_1, alpha_2 init
+     use_weighted_main_path: bool = True
+     weighted_main_path_init: float = 0.0 # beta_1, beta_2 init
++
++    use_long_skips: bool = True
++    long_skip_span: int = 2 # number of blocks in each nonoverlapping skip
++    long_skip_init: float = 0.0
+ 
+     # vocabulary and tokenizer
+     vocab_size: int = 50304
+diff --git a/runtime/pipeline.py b/runtime/pipeline.py
+--- a/runtime/pipeline.py
++++ b/runtime/pipeline.py
+@@ -20,10 +20,12 @@
+             self,
+             indices: Tensor,
+             previous_stage_balance_loss: Optional[Tensor] = None,
++            previous_stage_skip: Optional[Tensor] = None,
+             targets: Optional[Tensor] = None,
+             document_ids: Optional[Tensor] = None,
+             ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]], Tuple[Tensor, Tensor, Tensor]]:
+-        output = self.model(indices, targets, document_ids=document_ids, previous_stage_balance_loss=previous_stage_balance_loss)
++        output = self.model(indices, targets, document_ids=document_ids,
++                            previous_stage_balance_loss=previous_stage_balance_loss, previous_stage_skip=previous_stage_skip)
+         # the scheduler transports activations from the first stage and backpropagates the final stage's loss
+         return output
+ 
+@@ -107,14 +109,24 @@
+         # forward-only passes retain the original batch shapes, including single prompts and variable-length HellaSwag batches
+         if self.master_process:
+             x = model(indices, attn_mask=attn_mask, ignore_doc_mask=ignore_doc_mask, document_ids=document_ids)
+-            metadata = [(x.shape, x.dtype)]
++            if model.pipeline_skip:
++                x, _, skip = x
++            metadata = [(x.shape, x.dtype, (skip.shape, skip.dtype) if model.pipeline_skip else None)]
+         else:
+             metadata = [None]
+         dist.broadcast_object_list(metadata, src=0, device=torch.device(self.device))
+         if self.master_process:
+             dist.send(x.contiguous(), dst=1)
++            if model.pipeline_skip:
++                dist.send(skip.contiguous(), dst=1)
+             return torch.zeros((), device=self.device) if targets is not None else None
+-        shape, dtype = metadata[0]
++        shape, dtype, skip_metadata = metadata[0]
+         x = torch.empty(shape, dtype=dtype, device=self.device)
+         dist.recv(x, src=0)
+-        return model(x, targets, attn_mask=attn_mask, ignore_doc_mask=ignore_doc_mask, document_ids=document_ids)
++        skip = None
++        if skip_metadata is not None:
++            skip_shape, skip_dtype = skip_metadata
++            skip = torch.empty(skip_shape, dtype=skip_dtype, device=self.device)
++            dist.recv(skip, src=0)
++        return model(x, targets, attn_mask=attn_mask, ignore_doc_mask=ignore_doc_mask,
++                     document_ids=document_ids, previous_stage_skip=skip)
+diff --git a/model/block.py b/model/block.py
+--- a/model/block.py
++++ b/model/block.py
+@@ -25,6 +25,9 @@
+ 
+         self.use_weighted_residual_path = gpt_config.use_weighted_residual_path
+         self.use_weighted_main_path = gpt_config.use_weighted_main_path
++
++        if gpt_config.use_long_skips and (layer_idx + 1) % gpt_config.long_skip_span == 0:
++            self.long_skip_scale = nn.Parameter(torch.full((1,), gpt_config.long_skip_init))
+ 
+         if self.use_weighted_residual_path:
+             self.attn_residual_scale = nn.Parameter(torch.full((1,), gpt_config.weighted_residual_path_init))
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -21,6 +21,17 @@
+     def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig, stage_index: Optional[int] = None) -> None:
+         super().__init__()
+         self.stage_index = stage_index
++        self.use_long_skips = gpt_config.use_long_skips
++        self.long_skip_span = gpt_config.long_skip_span
++        if self.use_long_skips:
++            assert 2 <= self.long_skip_span <= gpt_config.n_layers, "long_skip_span must be between 2 and n_layers"
++        self.layer_offset = gpt_config.n_layers // 2 if stage_index == 1 else 0
++        split = gpt_config.n_layers // 2
++        self.pipeline_skip = (
++            self.use_long_skips and stage_index is not None
++            and split % self.long_skip_span != 0
++            and (split // self.long_skip_span + 1) * self.long_skip_span <= gpt_config.n_layers
++        )
+         self.max_seq_len = training_config.max_seq_len
+         self.pad_token_id = gpt_config.pad_token_id
+         self.pos_encoding_type = gpt_config.pos_encoding_type.lower()
+@@ -643,6 +654,7 @@
+             ignore_doc_mask: bool = False,
+             document_ids: Optional[Tensor] = None,
+             previous_stage_balance_loss: Optional[Tensor] = None,
++            previous_stage_skip: Optional[Tensor] = None,
+             ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]], Tuple[Tensor, Tensor, Tensor]]:
+         # ignore_doc_mask to avoid using it in:
+         # val, sampling, hellaswag
+@@ -694,7 +706,10 @@
+             sdpa_attn_mask = attn_mask
+ 
+         balance_loss = None
+-        for block, is_full in zip(self.transformer.h, self.layer_is_full_attention):
++        skip = previous_stage_skip
++        for local_idx, (block, is_full) in enumerate(zip(self.transformer.h, self.layer_is_full_attention)):
++            if self.use_long_skips and (self.layer_offset + local_idx) % self.long_skip_span == 0:
++                skip = x
+             flex_mask = full_flex_attn_block_mask if is_full else swa_flex_attn_block_mask
+             if self.use_activation_checkpointing and self.training and torch.is_grad_enabled():
+                 x, block_balance_loss = checkpoint(
+@@ -703,9 +718,15 @@
+                 )
+             else:
+                 x, block_balance_loss = block(x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=sdpa_attn_mask)
++            if self.use_long_skips and (self.layer_offset + local_idx + 1) % self.long_skip_span == 0:
++                x = x + block.long_skip_scale * skip
++                skip = None
+             if block_balance_loss is not None:
+                 balance_loss = block_balance_loss if balance_loss is None else balance_loss + block_balance_loss
+         if self.stage_index == 0:
++            if self.pipeline_skip:
++                # carry the skip and its gradient across the stage boundary
++                return x, balance_loss if balance_loss is not None else x.new_zeros(()), skip
+             return (x, balance_loss) if balance_loss is not None else x
+         # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+         x_ln_f = x
+@@ -737,7 +758,7 @@
+             else:
+                 loss = None
+ 
+-        if previous_stage_balance_loss is not None:
++        if previous_stage_balance_loss is not None and self.num_moe_layers > 0:
+             balance_loss = previous_stage_balance_loss if balance_loss is None else balance_loss + previous_stage_balance_loss
+         if targets is not None:
+             token_loss = loss

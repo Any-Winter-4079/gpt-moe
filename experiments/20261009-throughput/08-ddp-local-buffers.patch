@@ -1,0 +1,13 @@
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -186,7 +186,8 @@
+     dynamic=training_config.torch_compile_dynamic,
+ )
+ if parallel_mode == "ddp":
+-    gpt_model = DDP(gpt_model, device_ids=[local_rank])
++    # RoPE buffers are fixed; every rank updates its own sliding-window buffer from the same schedule
++    gpt_model = DDP(gpt_model, device_ids=[local_rank], broadcast_buffers=False)
+     raw_gpt_model = gpt_model.module
+ else:
+     raw_gpt_model = gpt_model

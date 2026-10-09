@@ -1,0 +1,366 @@
+diff --git a/config/training.py b/config/training.py
+index e71af55..e37b5b0 100644
+--- a/config/training.py
++++ b/config/training.py
+@@ -6,10 +6,9 @@ from dataclasses import dataclass, field
+ from datetime import datetime
+ from typing import Any, Dict, List, Tuple
+ 
+-import tiktoken
+ import torch.nn as nn
+-from tiktoken.core import Encoding
+ 
++from tokenizer.loader import load_tokenizer, validate_dataset_tokenizer
+ from schedules.token import add_schedule, custom_schedule, enforce_flex_block_constraints, enforce_min_max_constraints, get_token_based_adamw_lr
+ 
+ 
+@@ -96,7 +95,11 @@ class TrainingConfig:
+     max_train_steps: int = max_tokens // total_tokens_per_step_train
+ 
+     # tokenizer
+-    tokenizer: Encoding = tiktoken.get_encoding("gpt2")
++    tokenizer_backend: str = "gpt2" # "gpt2" or "byte_bpe"
++    tokenizer_path: str = "" # saved tokenizer JSON for byte_bpe
++    tokenizer_vocab_multiple: int = 128
++    tokenizer: Any = field(init=False, repr=False)
++    tokenizer_identity: Dict[str, Any] = field(init=False)
+ 
+     # optimizers
+     adamw_betas: Tuple[float, float] = (0.9, 0.95)
+@@ -233,6 +236,11 @@ class TrainingConfig:
+     torch_compile_mode: str = field(init=False)
+ 
+     def resolve(self, world_size: int) -> None:
++        if self.tokenizer_vocab_multiple < 1:
++            raise ValueError("tokenizer_vocab_multiple must be positive")
++        self.tokenizer, self.tokenizer_identity = load_tokenizer(self.tokenizer_backend, self.tokenizer_path)
++        validate_dataset_tokenizer(self.data_path, self.tokenizer_identity)
++
+         # bf16
+         if self.use_all_bf16_and_null_ctx:
+             self.use_bf16_autocast = False
+diff --git a/model/gpt.py b/model/gpt.py
+index 4779414..e410472 100644
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -23,6 +23,7 @@ class GPT(nn.Module):
+         self.stage_index = stage_index
+         self.max_seq_len = training_config.max_seq_len
+         self.pad_token_id = gpt_config.pad_token_id
++        self.eos_token_id = gpt_config.eos_token_id
+         self.pos_encoding_type = gpt_config.pos_encoding_type.lower()
+         self.optimizer_type = training_config.optimizer_type.lower()
+         self.use_activation_checkpointing = training_config.use_activation_checkpointing
+diff --git a/requirements.txt b/requirements.txt
+index 0378811..6ce7d10 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,2 +1,5 @@
+ # additional dependency for the fused training loss
+ liger-kernel==0.8.4
++
++# optional backend for custom byte-BPE tokenizer experiments
++tokenizers==0.21.4
+diff --git a/runtime/reporting.py b/runtime/reporting.py
+index 575a0a9..bfec752 100644
+--- a/runtime/reporting.py
++++ b/runtime/reporting.py
+@@ -31,7 +31,7 @@ def log_source_code(log_buffer: List[str]) -> None:
+         log_buffer.append("git commit: unavailable")
+ 
+     # read only Python files in the source directories, without traversing datasets or environments
+-    source_dirs = ("", "checkpointing", "config", "data", "evaluation", "model", "optimizers", "runtime", "sampling", "schedules")
++    source_dirs = ("", "checkpointing", "config", "data", "evaluation", "model", "optimizers", "runtime", "sampling", "schedules", "tokenizer")
+     for directory in source_dirs:
+         for path in sorted((source_root / directory).glob("*.py")):
+             log_buffer.extend([
+@@ -43,6 +43,14 @@ def log_source_code(log_buffer: List[str]) -> None:
+ 
+ 
+ def save_config_info(run, training_config, gpt_config) -> None:
++    if training_config.tokenizer_backend == "byte_bpe":
++        folders = [training_config.config_and_log_dir]
++        if training_config.enable_checkpointing:
++            folders.append(training_config.checkpoint_dir)
++        if training_config.export_full_model_at_end or training_config.full_model_export_interval > 0:
++            folders.append(training_config.model_export_dir)
++        for folder in folders:
++            training_config.tokenizer.save(str(Path(folder) / "tokenizer.json"))
+     with open(training_config.config_filename, "w") as f:
+         f.write(f"timestamp: {training_config.timestamp}\n")
+         f.write(f"parallel mode: {training_config.parallel_mode}\n")
+@@ -55,7 +63,7 @@ def save_config_info(run, training_config, gpt_config) -> None:
+             if config_field.name in ["hf_user", "hf_token"]:
+                 continue
+             elif config_field.name == "tokenizer":
+-                f.write("tokenizer: gpt2 (tiktoken)\n")
++                f.write(f"tokenizer: {training_config.tokenizer_identity}\n")
+             elif config_field.name == "bf16_weights_params_and_scales":
+                 f.write(f"bf16_weights_params_and_scales: {list(training_config.bf16_weights_params_and_scales.keys())}\n")
+             elif config_field.init is False:
+diff --git a/sampling/sample.py b/sampling/sample.py
+index 1565878..15a6eb9 100644
+--- a/sampling/sample.py
++++ b/sampling/sample.py
+@@ -84,7 +84,7 @@ def sample(
+             if run.parallel_mode == "ddp" or rank == world_size - 1:
+                 # of which we take the vocab_size values for each sequence's continuation to the last non-pad token,
+                 # resulting in len(sample_sequences), vocab_size
+-                last_logits = logits[torch.arange(len(sample_sequences), device=device), actual_sequence_lengths - 1, :]
++                last_logits = logits[torch.arange(len(sample_sequences), device=device), actual_sequence_lengths - 1, :tokenizer.n_vocab]
+ 
+                 if temperature == 0.0:
+                     # then if temperature is 0, we cannot divide by 0, so take the max logit from vocab_size
+@@ -167,7 +167,7 @@ def sample(
+             # increase the actual, non-padded sequence endings
+             actual_sequence_lengths += 1
+ 
+-        # and decode, ignoring above 50256
++        # decode only IDs that belong to the tokenizer
+         local_messages = []
+         if run.parallel_mode == "ddp" or rank == world_size - 1:
+             if run.parallel_mode == "pp":
+@@ -176,7 +176,7 @@ def sample(
+             for i in range(len(sample_sequences)):
+                 decoded = tokenizer.decode([
+                     token for token in generated_sequences[i, :actual_sequence_lengths[i]].tolist()
+-                    if token < raw_gpt_model.pad_token_id])
++                    if token < tokenizer.n_vocab])
+                 message = f"[rank {rank}] seq {i} >>> {decoded}"
+                 print(message)
+                 local_messages.append(message)
+diff --git a/tokenizer/loader.py b/tokenizer/loader.py
+new file mode 100644
+index 0000000..a80ebb7
+--- /dev/null
++++ b/tokenizer/loader.py
+@@ -0,0 +1,80 @@
++from __future__ import annotations
++
++import hashlib
++import json
++from importlib.metadata import version
++from pathlib import Path
++
++
++class ByteBPETokenizer:
++    def __init__(self, path: str) -> None:
++        from tokenizers import Tokenizer
++
++        artifact = Path(path).read_bytes()
++        self.artifact = artifact
++        self.tokenizer = Tokenizer.from_buffer(artifact)
++        self.n_vocab = self.tokenizer.get_vocab_size()
++        self.eot_token = self.tokenizer.token_to_id("<|endoftext|>")
++        if self.eot_token != 0 or not 257 <= self.n_vocab <= 65535:
++            raise ValueError("use a byte-BPE artifact produced by tokenizer.prepare with vocab_size <= 65535")
++        # encode literal special-token text as ordinary bytes; only the shard writer inserts EOS
++        self.tokenizer.encode_special_tokens = True
++        self.identity = {
++            "backend": "byte_bpe",
++            "sha256": hashlib.sha256(artifact).hexdigest(),
++            "library_version": version("tokenizers"),
++            "n_vocab": self.n_vocab,
++            "eos_token_id": self.eot_token,
++            "pad_token_id": self.n_vocab,
++        }
++
++    def save(self, path: str) -> None:
++        output = Path(path)
++        if output.exists() and output.read_bytes() != self.artifact:
++            raise ValueError("saved run tokenizer differs from the configured artifact")
++        output.write_bytes(self.artifact)
++
++    def encode(self, text: str) -> list[int]:
++        return self.tokenizer.encode(text, add_special_tokens=False).ids
++
++    def encode_ordinary(self, text: str) -> list[int]:
++        return self.encode(text)
++
++    def decode(self, tokens: list[int]) -> str:
++        return self.tokenizer.decode(tokens, skip_special_tokens=False)
++
++
++def load_tokenizer(backend: str, path: str):
++    if backend == "byte_bpe":
++        if not path:
++            raise ValueError("tokenizer_path is required for byte_bpe")
++        tokenizer = ByteBPETokenizer(path)
++        return tokenizer, tokenizer.identity
++    if backend != "gpt2":
++        raise ValueError("tokenizer_backend must be 'gpt2' or 'byte_bpe'")
++    if path:
++        raise ValueError("tokenizer_path must be empty for gpt2")
++    import tiktoken
++
++    tokenizer = tiktoken.get_encoding("gpt2")
++    return tokenizer, {
++        "backend": "gpt2",
++        "library_version": version("tiktoken"),
++        "n_vocab": tokenizer.n_vocab,
++        "eos_token_id": tokenizer.eot_token,
++        "pad_token_id": tokenizer.n_vocab,
++    }
++
++
++def validate_dataset_tokenizer(data_path: str, identity: dict) -> None:
++    folder = Path(data_path)
++    manifest_path = folder / "tokenizer_metadata.json"
++    if not manifest_path.is_file():
++        if identity["backend"] == "byte_bpe":
++            raise ValueError("custom tokenizers require new shards from tokenizer.prepare and tokenizer_metadata.json")
++        return
++    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
++    if manifest["tokenizer"] != identity:
++        raise ValueError("dataset tokenizer identity differs from the configured tokenizer; retokenize into a new directory")
++    if sorted(manifest["shards"]) != sorted(path.name for path in folder.glob("*.npy")):
++        raise ValueError("dataset shard files differ from tokenizer_metadata.json")
+diff --git a/tokenizer/prepare.py b/tokenizer/prepare.py
+new file mode 100644
+index 0000000..a0e921f
+--- /dev/null
++++ b/tokenizer/prepare.py
+@@ -0,0 +1,118 @@
++from __future__ import annotations
++
++import argparse
++import json
++from itertools import islice
++from pathlib import Path
++
++from tokenizer.loader import load_tokenizer
++
++
++def read_documents(paths: list[str]):
++    for path in paths:
++        with open(path, encoding="utf-8") as file:
++            for line in file:
++                yield json.loads(line)["text"]
++
++
++def train_tokenizer(args) -> None:
++    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
++
++    if not 257 <= args.vocab_size <= 65535:
++        raise ValueError("vocab_size must be between 257 and 65535, including EOS")
++    if args.min_frequency < 1 or args.max_documents < 1:
++        raise ValueError("min_frequency and max_documents must be positive")
++    output = Path(args.output)
++    if output.exists():
++        raise ValueError("output tokenizer already exists; use a new artifact path")
++    tokenizer = Tokenizer(models.BPE())
++    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
++    tokenizer.decoder = decoders.ByteLevel()
++    trainer = trainers.BpeTrainer(
++        vocab_size=args.vocab_size,
++        min_frequency=args.min_frequency,
++        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
++        special_tokens=["<|endoftext|>"],
++        show_progress=True,
++    )
++    # only training documents may fit the vocabulary; validation/test text is supplied later for encoding
++    documents = islice(read_documents(args.train_jsonl), args.max_documents)
++    tokenizer.train_from_iterator(documents, trainer=trainer)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    tokenizer.save(str(output))
++    _, identity = load_tokenizer("byte_bpe", str(output))
++    print(json.dumps(identity, indent=2))
++
++
++def write_shards(paths: list[str], split: str, output: Path, tokenizer, shard_size: int) -> list[str]:
++    import numpy as np
++
++    buffer = np.empty(shard_size, dtype=np.uint16)
++    token_count = 0
++    shard_names = []
++    for text in read_documents(paths):
++        ids = [tokenizer.eot_token] + tokenizer.encode_ordinary(text)
++        if min(ids) < 0 or max(ids) >= 2**16:
++            raise ValueError("token dictionary too large for uint16")
++        tokens = np.asarray(ids, dtype=np.uint16)
++        offset = 0
++        # a document can span any number of shards
++        while offset < len(tokens):
++            count = min(shard_size - token_count, len(tokens) - offset)
++            buffer[token_count:token_count + count] = tokens[offset:offset + count]
++            offset += count
++            token_count += count
++            if token_count == shard_size:
++                name = f"corpus_{split}_{len(shard_names):06d}.npy"
++                np.save(output / name, buffer)
++                shard_names.append(name)
++                token_count = 0
++    if token_count:
++        name = f"corpus_{split}_{len(shard_names):06d}.npy"
++        np.save(output / name, buffer[:token_count])
++        shard_names.append(name)
++    if not shard_names:
++        raise ValueError(f"no documents supplied for {split}")
++    return shard_names
++
++
++def tokenize_corpus(args) -> None:
++    if args.shard_size < 1:
++        raise ValueError("shard_size must be positive")
++    train_paths = {Path(path).resolve() for path in args.train_jsonl}
++    val_paths = {Path(path).resolve() for path in args.val_jsonl}
++    if train_paths & val_paths:
++        raise ValueError("training and validation must use separate source files")
++    tokenizer, identity = load_tokenizer(args.backend, args.tokenizer)
++    output = Path(args.output_dir)
++    # refusing existing directories prevents mixing these IDs with old GPT-2 shards
++    output.mkdir(parents=True, exist_ok=False)
++    shard_names = write_shards(args.train_jsonl, "train", output, tokenizer, args.shard_size)
++    shard_names.extend(write_shards(args.val_jsonl, "val", output, tokenizer, args.shard_size))
++    # publish the manifest only when both splits have completed
++    (output / "tokenizer_metadata.json").write_text(
++        json.dumps({"tokenizer": identity, "shards": shard_names}, indent=2) + "\n", encoding="utf-8",
++    )
++    print(f"saved {len(shard_names)} shards to {output}")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description="Train a byte-BPE tokenizer or tokenize local JSONL documents")
++    commands = parser.add_subparsers(dest="command", required=True)
++    train = commands.add_parser("train", help="fit BPE on training-only JSONL text")
++    train.add_argument("--train-jsonl", nargs="+", required=True)
++    train.add_argument("--output", required=True)
++    train.add_argument("--vocab-size", type=int, default=32768)
++    train.add_argument("--min-frequency", type=int, default=2)
++    train.add_argument("--max-documents", type=int, default=100000)
++    train.set_defaults(fn=train_tokenizer)
++    shards = commands.add_parser("shards", help="encode disjoint local train/val JSONL into uint16 npy shards")
++    shards.add_argument("--backend", choices=("gpt2", "byte_bpe"), default="byte_bpe")
++    shards.add_argument("--tokenizer", default="")
++    shards.add_argument("--train-jsonl", nargs="+", required=True)
++    shards.add_argument("--val-jsonl", nargs="+", required=True)
++    shards.add_argument("--output-dir", required=True)
++    shards.add_argument("--shard-size", type=int, default=100000000)
++    shards.set_defaults(fn=tokenize_corpus)
++    args = parser.parse_args()
++    args.fn(args)
+diff --git a/train.py b/train.py
+index fc35f3d..851d7e2 100644
+--- a/train.py
++++ b/train.py
+@@ -128,6 +128,11 @@ torch.manual_seed(seed)
+ torch.cuda.manual_seed(seed)
+ 
+ gpt_config = GPTConfig()
++if training_config.tokenizer_backend == "byte_bpe":
++    gpt_config.eos_token_id = tokenizer.eot_token
++    gpt_config.pad_token_id = tokenizer.n_vocab
++    multiple = training_config.tokenizer_vocab_multiple
++    gpt_config.vocab_size = ((tokenizer.n_vocab + 1 + multiple - 1) // multiple) * multiple
+ resume_config = {
+     "model": asdict(gpt_config),
+     "training": {
+@@ -156,6 +161,8 @@ resume_config = {
+         for spec in training_config.lr_schedule
+     ],
+ }
++if training_config.tokenizer_backend == "byte_bpe":
++    resume_config["tokenizer"] = training_config.tokenizer_identity
+ if training_config.resume_from_checkpoint:
+     (start_step, torch_rng_state_cpu, torch_rng_state_cuda, train_tokens_processed,
+         total_train_t, total_val_t, total_sample_t, total_hellaswag_t, total_t, best_val_loss, epoch,

@@ -1,0 +1,38 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -26,6 +26,10 @@
+     weighted_residual_path_init: float = 1.0 # alpha_1, alpha_2 init
+     use_weighted_main_path: bool = True
+     weighted_main_path_init: float = 0.0 # beta_1, beta_2 init
++
++    use_depth_scaled_main_init: bool = True
++    depth_main_init: float = 1.0
++    depth_main_power: float = 0.5 # init / (2 * (layer_index + 1)) ** power
+ 
+     # vocabulary and tokenizer
+     vocab_size: int = 50304
+diff --git a/model/block.py b/model/block.py
+--- a/model/block.py
++++ b/model/block.py
+@@ -26,13 +26,18 @@
+         self.use_weighted_residual_path = gpt_config.use_weighted_residual_path
+         self.use_weighted_main_path = gpt_config.use_weighted_main_path
+ 
++        main_init = gpt_config.weighted_main_path_init
++        if gpt_config.use_depth_scaled_main_init:
++            assert self.use_weighted_main_path, "depth-scaled initialization requires use_weighted_main_path=True"
++            main_init = gpt_config.depth_main_init / (2 * (layer_idx + 1)) ** gpt_config.depth_main_power
++
+         if self.use_weighted_residual_path:
+             self.attn_residual_scale = nn.Parameter(torch.full((1,), gpt_config.weighted_residual_path_init))
+             self.mlp_residual_scale = nn.Parameter(torch.full((1,), gpt_config.weighted_residual_path_init))
+ 
+         if self.use_weighted_main_path:
+-            self.attn_main_scale = nn.Parameter(torch.full((1,), gpt_config.weighted_main_path_init))
+-            self.mlp_main_scale = nn.Parameter(torch.full((1,), gpt_config.weighted_main_path_init))
++            self.attn_main_scale = nn.Parameter(torch.full((1,), main_init))
++            self.mlp_main_scale = nn.Parameter(torch.full((1,), main_init))
+ 
+         if (not self.use_weighted_residual_path) and (not self.use_weighted_main_path):
+             self.residual_scale = nn.Parameter(torch.full((1,), (2 * gpt_config.n_layers) ** -0.5), requires_grad=False)

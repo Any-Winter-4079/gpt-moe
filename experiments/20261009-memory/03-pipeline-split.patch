@@ -1,0 +1,49 @@
+diff --git a/config/training.py b/config/training.py
+--- a/config/training.py
++++ b/config/training.py
+@@ -17,6 +17,7 @@
+ class TrainingConfig:
+     # parallelism
+     parallel_mode: str = "ddp" # "ddp" or "pp"
++    pipeline_split_layer: int = -1 # -1 splits in half; otherwise the number of blocks on stage 0
+ 
+     # training loss
+     use_liger_loss: bool = True
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -116,8 +116,8 @@
+         if self.stage_index is not None:
+             # initialize the same full model on CPU, then retain only this GPU's stage
+             assert not self.use_tied_embeddings, "Pipeline parallelism requires untied embeddings"
+-            split = gpt_config.n_layers // 2
+-            assert 0 < split < gpt_config.n_layers, "Pipeline parallelism requires at least two blocks"
++            split = gpt_config.n_layers // 2 if training_config.pipeline_split_layer == -1 else training_config.pipeline_split_layer
++            assert 0 < split < gpt_config.n_layers, "Pipeline parallelism requires at least one block per stage"
+             if self.stage_index == 0:
+                 self.transformer.h = self.transformer.h[:split]
+                 self.layer_is_full_attention = self.layer_is_full_attention[:split]
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -156,6 +156,8 @@
+         for spec in training_config.lr_schedule
+     ],
+ }
++if parallel_mode == "pp" and training_config.pipeline_split_layer != -1:
++    resume_config["training"]["pipeline_split_layer"] = training_config.pipeline_split_layer
+ if training_config.resume_from_checkpoint:
+     (start_step, torch_rng_state_cpu, torch_rng_state_cuda, train_tokens_processed,
+         total_train_t, total_val_t, total_sample_t, total_hellaswag_t, total_t, best_val_loss, epoch,
+diff --git a/checkpointing/checkpoint.py b/checkpointing/checkpoint.py
+--- a/checkpointing/checkpoint.py
++++ b/checkpointing/checkpoint.py
+@@ -233,7 +233,7 @@
+     path = os.path.join(export_dir, f"full_model_step_{step:07d}.safetensors")
+     if os.path.exists(path):
+         raise FileExistsError(path)
+-    split = resume_config["model"]["n_layers"] // 2
++    split = resume_config["training"].get("pipeline_split_layer", resume_config["model"]["n_layers"] // 2)
+     merged_weights = {}
+     for stage_index, stage_path in enumerate(stage_paths):
+         for key, value in load_file(stage_path, device="cpu").items():

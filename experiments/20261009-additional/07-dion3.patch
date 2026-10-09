@@ -1,0 +1,164 @@
+diff --git a/config/training.py b/config/training.py
+--- a/config/training.py
++++ b/config/training.py
+@@ -4,7 +4,7 @@
+ import os
+ from dataclasses import dataclass, field
+ from datetime import datetime
+-from typing import Any, Dict, List, Tuple
++from typing import Any, Dict, List, Optional, Tuple
+ 
+ import tiktoken
+ import torch.nn as nn
+@@ -106,12 +106,21 @@
+     lr_warmup_and_cosine_tokens: int = 600 * 10**6
+     adamw_weight_decay: float = 0.01
+     adamw_hard_min_lr: float = 7e-4
+-    optimizer_type: str = "muon" # "muon" (and adamw) or any other name for "adamw"
++    optimizer_type: str = "dion3" # "muon" or "dion3" (and adamw), or any other name for "adamw"
+     muon_lr_scale: float = 0.15 # Muon usually likes a smaller LR than AdamW (e.g., 0.1x)
+     muon_backend: str = "polarexpress" # "svd" | "newtonschulz5" | "polarexpress"
+     muon_backend_steps: int = 5 # ~5-10; the higher, the slightly “tighter” orthogonalization (and slower)
+     muon_momentum: float = 0.95
+     muon_use_nesterov: bool = True
++    dion3_lr_scale: float = 0.75 # rms_norm applies another 0.2 * sqrt(max(matrix dimensions))
++    dion3_fraction: float = 0.25
++    dion3_mu: float = 0.95
++    dion3_beta2: float = 0.95
++    dion3_weight_decay: float = 0.0
++    dion3_eps: float = 1e-6
++    dion3_adjust_lr: Optional[str] = "rms_norm" # "rms_norm" | "spectral_norm" | None
++    dion3_use_triton: bool = False
++    dion3_triton_post_ortho: bool = False
+     # derived from the above
+     total_decay_tokens: int = lr_warmup_and_cosine_tokens - lr_warmup_tokens
+     # filled by resolve
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -32,6 +32,15 @@
+         self.muon_backend_steps = training_config.muon_backend_steps
+         self.muon_momentum = training_config.muon_momentum
+         self.muon_use_nesterov = training_config.muon_use_nesterov
++        self.dion3_lr_scale = training_config.dion3_lr_scale
++        self.dion3_fraction = training_config.dion3_fraction
++        self.dion3_mu = training_config.dion3_mu
++        self.dion3_beta2 = training_config.dion3_beta2
++        self.dion3_weight_decay = training_config.dion3_weight_decay
++        self.dion3_eps = training_config.dion3_eps
++        self.dion3_adjust_lr = training_config.dion3_adjust_lr
++        self.dion3_use_triton = training_config.dion3_use_triton
++        self.dion3_triton_post_ortho = training_config.dion3_triton_post_ortho
+ 
+         # <-- Uncomment for gradient norm clipping -->
+         # self.use_grad_norm_clipping = gpt_config.use_grad_norm_clipping
+@@ -167,16 +176,16 @@
+             print(message)
+             log_buffer.append(message)
+ 
+-        # muon params: 2d weights, excluding embeddings and lm_head
+-        muon_param_names = set()
+-        if self.optimizer_type == "muon":
++        # matrix optimizer params: 2d weights, excluding embeddings and lm_head
++        matrix_param_names = set()
++        if self.optimizer_type in ("muon", "dion3"):
+             for pn, p in param_dict.items():
+                 if p.dim() == 2 and ("wte" not in pn) and ("lm_head" not in pn):
+-                    muon_param_names.add(pn)
++                    matrix_param_names.add(pn)
+ 
+         # adamw gets everything else, split by decay rule
+-        decay_params = [p for n, p in param_dict.items() if (n not in muon_param_names) and (p.dim() >= 2)]
+-        nodecay_params = [p for n, p in param_dict.items() if (n not in muon_param_names) and (p.dim() < 2)]
++        decay_params = [p for n, p in param_dict.items() if (n not in matrix_param_names) and (p.dim() >= 2)]
++        nodecay_params = [p for n, p in param_dict.items() if (n not in matrix_param_names) and (p.dim() < 2)]
+         # create param groups
+         optim_groups = [
+             {'params': decay_params, 'weight_decay': adamw_weight_decay},
+@@ -191,9 +200,9 @@
+                 f"num decayed parameter tensors (AdamW): {len(decay_params)}, with {num_decay_params:,} parameters",
+                 f"num non-decayed parameter tensors (AdamW): {len(nodecay_params)}, with {num_nodecay_params:,} parameters",
+             ]
+-            if self.optimizer_type == "muon":
+-                muon_params_count = sum(param_dict[n].numel() for n in muon_param_names)
+-                messages.append(f"num Muon parameter tensors: {len(muon_param_names)}, with {muon_params_count:,} parameters")
++            if self.optimizer_type in ("muon", "dion3"):
++                muon_params_count = sum(param_dict[n].numel() for n in matrix_param_names)
++                messages.append(f"num {self.optimizer_type} parameter tensors: {len(matrix_param_names)}, with {muon_params_count:,} parameters")
+             for message in messages:
+                 print(message)
+                 log_buffer.append(message)
+@@ -209,12 +218,40 @@
+         # initialize adamw
+         adamw = torch.optim.AdamW(optim_groups, lr=lr, betas=adamw_betas, eps=adamw_eps, fused=use_fused)
+ 
++        if self.optimizer_type == "dion3":
++            from dion import Dion3
++
++            # retain model order for repeatable optimizer state loading
++            matrix_params = [p for n, p in param_dict.items() if n in matrix_param_names]
++            dion3_groups = [
++                {"params": [p for p in matrix_params if p.size(0) != 3 * p.size(1)]},
++                {"params": [p for p in matrix_params if p.size(0) == 3 * p.size(1)], "num_heads": 3},
++            ]
++            dion3_groups = [group for group in dion3_groups if group["params"]]
++            dion3 = Dion3(
++                dion3_groups,
++                # DDP synchronizes gradients; PP owns separate stage parameters
++                distributed_mesh=None,
++                lr=lr * self.dion3_lr_scale,
++                fraction=self.dion3_fraction,
++                mu=self.dion3_mu,
++                muon_beta2=self.dion3_beta2,
++                weight_decay=self.dion3_weight_decay,
++                epsilon=self.dion3_eps,
++                adjust_lr=self.dion3_adjust_lr,
++                flatten=False,
++                use_polar_express=True,
++                use_triton=self.dion3_use_triton,
++                triton_post_ortho=self.dion3_triton_post_ortho,
++            )
++            return {"adamw": adamw, "dion3": dion3}
++
+         # if not using Muon, still return a dict for consistency with the training loop
+         if self.optimizer_type != "muon":
+             return {"adamw": adamw}
+ 
+         # initialize muon over its selected params
+-        muon_params = [param_dict[n] for n in muon_param_names]
++        muon_params = [param_dict[n] for n in matrix_param_names]
+         muon = muon_class(
+             muon_params,
+             lr=lr * self.muon_lr_scale,
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -140,6 +140,9 @@
+             "data_path", "data_uses_padding", "base_seed", "optimizer_type",
+             "adamw_betas", "adamw_eps", "adamw_weight_decay", "muon_lr_scale",
+             "muon_backend", "muon_backend_steps", "muon_momentum", "muon_use_nesterov",
++            "dion3_lr_scale", "dion3_fraction", "dion3_mu", "dion3_beta2",
++            "dion3_weight_decay", "dion3_eps", "dion3_adjust_lr",
++            "dion3_use_triton", "dion3_triton_post_ortho",
+             "moe_load_balance_weight", "use_bf16_autocast", "use_all_bf16_and_null_ctx",
+             "use_bf16_weights_params_or_scales",
+             "keep_1d_weights_params_and_scales_in_fp32", "keep_fp32_loss",
+@@ -423,6 +426,9 @@
+         if "muon" in optimizers:
+             for param_group in optimizers["muon"].param_groups:
+                 param_group['lr'] = adamw_lr * raw_gpt_model.muon_lr_scale
++        if "dion3" in optimizers:
++            for param_group in optimizers["dion3"].param_groups:
++                param_group['lr'] = adamw_lr * raw_gpt_model.dion3_lr_scale
+         # step present optimizers
+         for optimizer in optimizers.values():
+             optimizer.step()
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,2 +1,5 @@
+ # additional dependency for the fused training loss
+ liger-kernel==0.8.4
++
++# Dion3 (NorDion2) optimizer
++dion @ git+https://github.com/microsoft/dion.git@7692479288f928a3d61d1cc58137b4dbe4f71000
