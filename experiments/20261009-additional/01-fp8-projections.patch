@@ -6,7 +6,7 @@ diff --git a/config/model.py b/config/model.py
      use_fair_swiglu: bool = True # only if swiglu
  
 +    # selective fp8 MLP and expert projections
-+    fp8_projections: str = "off" # "off", "up", "down" or "both"
++    fp8_projections: str = "both" # "off", "up", "down" or "both"
 +    fp8_min_features: int = 256
 +    fp8_backward: bool = False
 +    fp8_scaling: str = "dynamic" # "dynamic" or "fixed"
