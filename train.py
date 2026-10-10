@@ -85,7 +85,7 @@ if master_process:
         f"torch.cuda: {torch.version.cuda}",
         f"triton: {triton.__version__}",
     ])
-    if training_config.use_liger_loss or training_config.use_fp8_lm_head:
+    if training_config.use_liger_loss:
         log_buffer.append(f"liger-kernel: {version('liger-kernel')}")
     log_source_code(log_buffer)
     log_buffer.append("=" * 100)

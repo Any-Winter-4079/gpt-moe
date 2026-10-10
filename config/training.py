@@ -20,9 +20,9 @@ class TrainingConfig:
 
     # training loss
     # retained as a workaround for NaNs previously observed with large dense logits
-    # re-enable if instability returns; the suspected indexing issue was not confirmed
     use_liger_loss: bool = False
-    use_fp8_lm_head: bool = True # training-only FP8 head with chunked Liger cross-entropy
+    # training-only FP8 projection with dynamic scales and ordinary cross-entropy; requires use_liger_loss=False
+    use_fp8_lm_head: bool = False
 
     # MoE training objective
     moe_load_balance_weight: float = 0.01

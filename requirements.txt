@@ -1,2 +1,0 @@
-# additional dependency for the fused training loss
-liger-kernel==0.8.4
