@@ -178,6 +178,8 @@ if training_config.use_all_bf16_and_null_ctx or training_config.use_bf16_weights
         training_config.bf16_weights_params_and_scales,
         training_config.keep_1d_weights_params_and_scales_in_fp32,
     )
+if training_config.use_fp8_lm_head and parallel_mode == "ddp":
+    torch._dynamo.config.optimize_ddp = False
 gpt_model = torch.compile(
     gpt_model,
     mode=training_config.torch_compile_mode,
