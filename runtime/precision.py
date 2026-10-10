@@ -31,6 +31,9 @@ def convert_to_bf16(
             for m in gpt_model.modules():
                 if isinstance(m, module_classes):
                     m.bfloat16()
+            # TE Linear does not inherit nn.Linear
+            if nn.Linear in module_classes and gpt_model.use_fp8_lm_head and gpt_model.stage_index != 0:
+                gpt_model.lm_head.bfloat16()
 
         # nn.Parameter
         if any(cls is nn.Parameter for cls in target_classes):

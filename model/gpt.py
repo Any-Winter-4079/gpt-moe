@@ -65,10 +65,6 @@ class GPT(nn.Module):
         self.use_fp8_lm_head = training_config.use_fp8_lm_head
         if self.use_liger_loss and self.use_fp8_lm_head:
             raise ValueError("use_liger_loss and use_fp8_lm_head select separate training loss paths; enable only one")
-        if self.use_fp8_lm_head and stage_index != 0:
-            from .fp8_lm_head import fp8_lm_head
-
-            self.fp8_lm_head = fp8_lm_head
         if self.use_liger_loss and stage_index != 0:
             from .loss import FusedLinearCrossEntropyLoss
 
@@ -136,6 +132,11 @@ class GPT(nn.Module):
                 if "wpe" in self.transformer:
                     del self.transformer.wpe
             self.has_full_attention_layers = any(self.layer_is_full_attention)
+
+        if self.use_fp8_lm_head and stage_index != 0:
+            from .fp8_lm_head import FP8LMHead
+
+            self.lm_head = FP8LMHead(self.lm_head.weight)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -726,7 +727,7 @@ class GPT(nn.Module):
         if self.training and targets is not None and self.use_liger_loss:
             loss = self.liger_loss(self.lm_head.weight, x.reshape(-1, x.size(-1)), targets.reshape(-1))
         else:
-            logits = self.fp8_lm_head(x, self.lm_head.weight) if self.training and targets is not None and self.use_fp8_lm_head else self.lm_head(x)
+            logits = self.lm_head(x, use_fp8=True) if self.training and targets is not None and self.use_fp8_lm_head else self.lm_head(x)
             if targets is not None:
                 logits_for_loss = logits.float() if self.keep_fp32_loss and logits.dtype != torch.float32 else logits
                 if self.data_uses_padding:
