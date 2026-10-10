@@ -21,7 +21,7 @@ class TrainingConfig:
     # training loss
     # retained as a workaround for NaNs previously observed with large dense logits
     use_liger_loss: bool = False
-    # training-only Transformer Engine FP8 head with current scaling and ordinary cross-entropy; requires use_liger_loss=False
+    # training-only Transformer Engine FP8 head with block scaling and ordinary cross-entropy; requires use_liger_loss=False
     use_fp8_lm_head: bool = True
 
     # MoE training objective

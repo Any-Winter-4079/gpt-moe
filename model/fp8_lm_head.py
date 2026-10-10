@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import Float8CurrentScaling, Format
+from transformer_engine.common.recipe import Float8BlockScaling, Format
 
 
 class FP8LMHead(te.Linear):
@@ -16,10 +16,14 @@ class FP8LMHead(te.Linear):
         )
         # reuse the initialized parameter, including its embedding tie
         self.weight = weight
-        # TE 2.20.2 supports current scaling under fullgraph compilation, but not delayed scaling
-        self.fp8_recipe = Float8CurrentScaling(fp8_format=Format.HYBRID)
+        self.fp8_recipe = Float8BlockScaling(
+            fp8_format=Format.E4M3,
+            x_block_scaling_dim=1,
+            w_block_scaling_dim=2,
+            grad_block_scaling_dim=1,
+        )
 
-    # current scaling has no persistent scale state; retain the nn.Linear checkpoint format
+    # block scaling has no persistent scale state; retain the nn.Linear checkpoint format
     get_extra_state = nn.Module.get_extra_state
     set_extra_state = nn.Module.set_extra_state
 
