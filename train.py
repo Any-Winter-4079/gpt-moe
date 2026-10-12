@@ -16,7 +16,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from config.model import GPTConfig
 from config.training import TrainingConfig
 from model.gpt import GPT
-from model.attention import qk_scale_debug_string
+from model.attention.self_attention import qk_scale_debug_string
 from optimizers.muon import Muon
 from data.loader import DataLoader
 from schedules.token import get_next_update_tokens
@@ -143,7 +143,7 @@ resume_config = {
             "moe_load_balance_weight", "use_bf16_autocast", "use_all_bf16_and_null_ctx",
             "use_bf16_weights_params_or_scales", "use_bf16_adamw_moments",
             "keep_1d_weights_params_and_scales_in_fp32", "keep_fp32_loss",
-            "cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast", "use_liger_loss", "use_fp8_lm_head",
+            "cast_activations_to_weight_dtype_if_no_autocast", "use_liger_loss", "linear_precision",
         )
     },
     "bf16_weights_params_and_scales": {
@@ -178,7 +178,7 @@ if training_config.use_all_bf16_and_null_ctx or training_config.use_bf16_weights
         training_config.bf16_weights_params_and_scales,
         training_config.keep_1d_weights_params_and_scales_in_fp32,
     )
-if training_config.use_fp8_lm_head and parallel_mode == "ddp":
+if parallel_mode == "ddp" and any("fp8" in policy.values() for policy in training_config.linear_precision.values()):
     torch._dynamo.config.optimize_ddp = False
 gpt_model = torch.compile(
     gpt_model,
@@ -301,9 +301,6 @@ if training_config.resume_from_checkpoint:
     torch.set_rng_state(torch_rng_state_cpu)
     torch.cuda.set_rng_state(torch_rng_state_cuda)
 
-##################################################################
-#          Training, Validation, Sampling, HellaSwag loop        #
-##################################################################
 try:
     swa_schedule_keys = training_config.swa_schedule_keys
     swa_schedule_values = training_config.swa_schedule_values
@@ -342,6 +339,7 @@ try:
         torch.cuda.synchronize()
         start_train_t = time.time()
         gpt_model.train()
+        raw_gpt_model.set_precision_phase("training")
         for optimizer in optimizers.values():
             optimizer.zero_grad()
         train_loss = 0.0
@@ -406,7 +404,7 @@ try:
         # # that (if gradient clipping is applied) is rescaled to 
         # # have its L2 norm <= grad_clip_norm_threshold
         # grad_norm_pre_clipping = torch.nn.utils.clip_grad_norm_(gpt_model.parameters(), gradient_clipping_norm)
-        # # recompute global norm after clipping (cheap)
+        # # derive the post-clipping norm from the pre-clipping norm and threshold
         # if grad_clip_enabled:
         #     # grad_sq = [p.grad.detach().float().pow(2).sum() for p in gpt_model.parameters() if p.grad is not None]
         #     # grad_norm_post_clipping = float(torch.stack(grad_sq).sum().sqrt())

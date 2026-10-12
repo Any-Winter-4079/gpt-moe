@@ -64,8 +64,8 @@ class PipelineRuntime:
             x = None
             y = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)
             doc_ids = torch.empty_like(y) if self.use_doc_masking else None
-        # broadcast from one loader to avoid duplicating CPU shard storage, prefetching, and batch preparation
-        # targets belong to the final stage; document masks must agree at both stages
+        # broadcast from one loader to avoid duplicating CPU shard storage, prefetching, and batch preparation.
+        # Targets belong to the final stage; document masks must agree at both stages
         dist.broadcast(y, src=0)
         if doc_ids is not None:
             dist.broadcast(doc_ids, src=0)

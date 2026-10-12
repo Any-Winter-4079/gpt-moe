@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Iterator
 
 import torch
 import torch.nn as nn
@@ -28,12 +28,13 @@ def convert_to_bf16(
         # module classes (e.g., nn.Linear, nn.Embedding)
         module_classes = tuple(cls for cls in target_classes if isinstance(cls, type) and issubclass(cls, nn.Module))
         if module_classes:
+            if nn.Linear in module_classes:
+                from model.linear.linear import Linear
+
+                module_classes += (Linear,)
             for m in gpt_model.modules():
                 if isinstance(m, module_classes):
                     m.bfloat16()
-            # TE Linear does not inherit nn.Linear
-            if nn.Linear in module_classes and gpt_model.use_fp8_lm_head and gpt_model.stage_index != 0:
-                gpt_model.lm_head.bfloat16()
 
         # nn.Parameter
         if any(cls is nn.Parameter for cls in target_classes):
@@ -41,7 +42,7 @@ def convert_to_bf16(
                 if p.is_floating_point() and p.dtype != torch.bfloat16:
                     p.data = p.data.to(torch.bfloat16)
 
-    # revert excluded weights, params, scales (as nn.Parameters with requires_grad=False)
+    # restore one-dimensional bf16 parameters to fp32
     if keep_1d_weights_params_and_scales_in_fp32:
         for p in gpt_model.parameters():
             if p.dim() == 1 and p.dtype == torch.bfloat16:
@@ -78,3 +79,13 @@ def precision_context(training_config, device_type: str):
     if training_config.use_all_bf16_and_null_ctx or not training_config.use_bf16_autocast:
         return contextlib.nullcontext()
     return torch.autocast(device_type=device_type, dtype=torch.bfloat16)
+
+
+@contextlib.contextmanager
+def linear_precision_phase(gpt_model: GPT, phase: str) -> Iterator[None]:
+    previous_phase = gpt_model.precision_phase
+    gpt_model.set_precision_phase(phase)
+    try:
+        yield
+    finally:
+        gpt_model.set_precision_phase(previous_phase)

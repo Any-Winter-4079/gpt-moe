@@ -62,10 +62,10 @@ class DataLoader:
 
         # there are world_size (e.g., 2) gpus,
         # each to get gpu_batch_size (e.g., 2) sequences,
-        # each of seq_len (e.g., 1024) tokens
-        # then for the current shard (loading the next shard upon token exhaustion):
+        # each of seq_len (e.g., 1024) tokens.
+        # Then for the current shard (loading the next shard upon token exhaustion):
         # we discard tokens that wouldn't fit into the final grad accumulation mini-step,
-        # e.g., tokens in positions 12289-16000 if there were 16000 tokens total in 
+        # e.g., tokens in positions 12289-15999 if there were 16000 tokens total in 
         # the shard, keeping 0-12288 (12289 tokens, with 12288 fitting nicely into 3 
         # grad accum mini steps of 2 * 2 * 1024 = 4096 tokens each plus a final token
         # for y, since it is always one token ahead of x)

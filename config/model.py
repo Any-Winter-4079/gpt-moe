@@ -39,7 +39,7 @@ class GPTConfig:
     # NOTE: increasing n_heads (fixing n_kv_heads) reduces the parameters for GQA/MQA
     # q_proj: (d_model → attn_dim)
     # k_proj: (d_model → n_kv_heads * head_size)
-    # when attn_dim is split, the more (q) heads, the smaller the head_size, which is reused for k, v
+    # when attn_dim is split, the more (q) heads, the smaller the head_size, which is reused for k, v.
     # head_size ~128 looks good
     n_heads: int = 16
     n_kv_heads: int = 16
@@ -54,7 +54,7 @@ class GPTConfig:
     use_qk_norm: bool = True
     qk_norm_type: str = "rms" # "rms" or any other name for "l2"
     qk_scale_init: float = 1.0 # init per-head scale
-    qk_scale_max: float = 5.0 # cap scales to keep logits in range
+    qk_scale_max: float = 5.0 # cap the magnitude of the learned Q/K scales
     qk_eps: float = 1e-6
     use_qk_debug_log: bool = True
 

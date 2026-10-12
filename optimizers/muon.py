@@ -8,33 +8,31 @@ from torch import Tensor
 
 from .polar_express import zeropower_via_polar_express
 
-################################################
-#                     Muon                     #
-################################################
+
 # In Muon, the goal is:
 #   For 2D weight matrices (e.g., Linear weights of shape (out_features, in_features)),
-#   build an SGD+momentum update g, then REPLACE it with its nearest orthogonal
-#   matrix (orthogonalization), and apply that as the step. This helps keep layers
-#   well-conditioned and discourages rank collapse.
+#   build an SGD+momentum update g, then replace it with an approximation to its nearest
+#   orthogonal matrix (exact for SVD), and apply that as the step. This helps keep layers
+#   well-conditioned and discourages rank collapse
 # ---------
 # Muon vs AdamW:
-#   Muon uses SGD + momentum to form g, then orthogonalizes g (via the backend) and scales it.
-#   Use Muon for 2D block weights (e.g., transformer.h.*.weight).
-#   Keep embeddings, layer norms, biases, and the final lm_head on AdamW.
-#   Train these disjoint  param sets with their respective optimizers in parallel.
-#   To use it with 4D convolutional filters, flatten the last 3 dimensions.
+#   Muon uses SGD + momentum to form g, then orthogonalizes g (via the backend) and scales it
+#   use Muon for 2D block weights (e.g., transformer.h.*.weight)
+#   keep embeddings, layer norms, biases, and the final lm_head on AdamW
+#   train these disjoint param sets with their respective optimizers in parallel
+#   to use it with 4D convolutional filters, flatten the last 3 dimensions
 # ---------
 # The backend is simply the algorithm used to orthogonalize the 2D update matrix. Three choices are:
 #   svd:
-#       Exact, via SVD. If G = U S V^T, the projection of G (in Frobenius norm) onto the Stiefel
+#       exact, via SVD. If G = U S V^T, the projection of G (in Frobenius norm) onto the Stiefel
 #       manifold (the set of all orthonormal k-frames, with a k-frame an ordered set of 
 #       k linearly independent vectors in an n-dimensional vector space) is U V^T 
-#       (i.e., the closest matrix with orthonormal columns/rows).
+#       (i.e., the closest matrix with orthonormal columns/rows)
 #   newtonschulz5:
-#       Fast, iterative approximation (GPU-friendly) using a quintic Newton-Schulz iteration.
-#       It avoids an SVD on every step, runs well in bfloat16, and plays nice with torch.compile.
+#       fast, iterative approximation (GPU-friendly) using a quintic Newton-Schulz iteration.
+#       It avoids an SVD on every step, runs well in bfloat16, and plays nice with torch.compile
 #   polarexpress:
-#       Polar Express sign method (fast iterative), fixed 5-step coefficients.
+#       Polar Express sign method (fast iterative), fixed 5-step coefficients
 # ---------
 # It is recommended to use Nesterov-style momentum in the internal SGD.
 # ---------
@@ -82,7 +80,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, muon_eps: float = 1e
     X = (X / denom).to(torch.bfloat16)
 
     m, n = X.shape  # m <= n
-    # reusable buffers (compiled graph will persist them between calls)
+    # reuse buffers across iterations within this call
     A = torch.empty((m, m), dtype=X.dtype, device=X.device)
     B = torch.empty_like(X)
     AB = torch.empty_like(X)
@@ -113,9 +111,9 @@ class Muon(torch.optim.Optimizer):
     Muon: MomentUm Orthogonalized by Newton-Schulz
 
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
+    processing step, in which each 2D parameter's update is replaced with an approximation to
+    its nearest orthogonal matrix. SVD computes this directly; Newton-Schulz and Polar Express
+    approximate it with iterations that can run in bfloat16 on the GPU.
 
     Some warnings:
     - This optimizer assumes that all parameters passed in are 2D.
@@ -124,7 +122,6 @@ class Muon(torch.optim.Optimizer):
     - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
     - We believe it is unlikely to work well for training with small batch size.
     - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
 
     Arguments:
         lr: The learning rate used by the internal SGD.
@@ -163,7 +160,9 @@ class Muon(torch.optim.Optimizer):
                 buf.mul_(momentum).add_(g)
                 if group['nesterov']:
                     g.add_(buf, alpha=momentum)
-                if g.size(0) == 3 * g.size(1):  # split grouped QKV parameters
+                else:
+                    g = buf
+                if g.size(0) == 3 * g.size(1):  # split (3d, d) matrices into three (d, d) updates
                     updates = zip(p.data.split(g.size(1)), g.split(g.size(1)))
                 else:
                     updates = [(p.data, g)]

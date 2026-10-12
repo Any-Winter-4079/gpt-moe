@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+from runtime.precision import linear_precision_phase
+
 
 def evaluate_validation(run, val_data_loader, val_steps: int, gpu_batch_size_val: int, seq_len_val: int) -> torch.Tensor:
     run.gpt_model.eval()
@@ -12,7 +14,7 @@ def evaluate_validation(run, val_data_loader, val_steps: int, gpu_batch_size_val
     else:
         val_data_loader.reset()
 
-    with torch.inference_mode(), run.ctx:
+    with linear_precision_phase(run.raw_gpt_model, "validation"), torch.inference_mode(), run.ctx:
         val_loss = torch.zeros((), device=run.device)
         for val_step in range(val_steps):
             if run.parallel_mode == "pp":

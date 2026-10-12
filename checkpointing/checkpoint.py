@@ -59,7 +59,7 @@ def save_checkpoint(
         allow_val: bool,
         ) -> str:
 
-    # create the model path by adding its timestamp, and train and val losses, if available
+    # build the model filename from the step number and train/val losses, using val_na if validation is unavailable
     parts = ["model", f"step_{step:07d}"]
     parts.append(f"val_{val_loss:.4f}" if val_loss is not None else "val_na")
     parts.append(f"train_{train_loss:.4f}")
@@ -164,7 +164,6 @@ def load_checkpoint(training_config, gpt_config, rank: int, world_size: int, res
         'training': {
             **training_state['resume_config']['training'],
             'use_bf16_adamw_moments': training_config.use_bf16_adamw_moments,
-            'use_fp8_lm_head': training_state['resume_config']['training'].get('use_fp8_lm_head', False),
         },
     }
     if checkpoint_resume_config != resume_config:

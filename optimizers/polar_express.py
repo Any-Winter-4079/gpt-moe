@@ -123,7 +123,7 @@ def XXT_kernel(
 
 def XXT(A: Tensor, out: Tensor):
     """
-    Launch Triton kernel to compute C = A @ A.T
+    Launch Triton kernel to compute C = A @ A.mT
     """
     assert A.ndim == 2 or A.ndim == 3
     M, K = A.shape[-2:]
@@ -169,7 +169,7 @@ def ba_plus_cAA_kernel(
     GROUP_SIZE_M: tl.constexpr,
     LOWER_UPPER: tl.constexpr,
 ):
-    # This is mostly duplicated from XXT_kernel, but also loads and adds a block of A
+    # This is mostly duplicated from XXT_kernel, but also loads and adds a block of A.
     # Performance is slightly slower than XXT_kernel, so we use two separate kernels
     pid = tl.program_id(axis=0)
     batch_idx, m_idx, n_idx = _pid_to_block(
@@ -232,7 +232,7 @@ def ba_plus_cAA_kernel(
 
 def ba_plus_cAA(A: Tensor, alpha: float, beta: float, out: Tensor):
     """
-    Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
+    Launch Triton kernel to compute C = alpha * A @ A.mT + beta * A for symmetric A
     """
     assert A.ndim == 2 or A.ndim == 3
     M, K = A.shape[-2:]
@@ -306,10 +306,8 @@ def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool =
         XXT(X, out=A)  # A = X @ X.mT
         ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
 
-        # Referencing X twice causes pytorch to make a defensive copy, 
-        # resulting in a cudaMemcpyAsync in baddbmm.
-        # For large matrices (i.e., the mlp weights), it's faster to split 
-        # the operation into two kernels to avoid this.
+        # splitting matmul and addition can avoid a defensive copy in baddbmm.
+        # The performance benefit depends on matrix shape and backend
         if split_baddbmm:
             BX_matmul(B, X, out=C)  # C = B @ X  
             C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)

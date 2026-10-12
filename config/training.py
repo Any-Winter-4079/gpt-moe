@@ -21,8 +21,6 @@ class TrainingConfig:
     # training loss
     # retained as a workaround for NaNs previously observed with large dense logits
     use_liger_loss: bool = False
-    # training-only Transformer Engine FP8 head with block scaling and ordinary cross-entropy; requires use_liger_loss=False
-    use_fp8_lm_head: bool = True
 
     # MoE training objective
     moe_load_balance_weight: float = 0.01
@@ -56,7 +54,7 @@ class TrainingConfig:
             # "count": 4,
         },
     })
-    # custom_schedule expects: "values", with a list of batch sizes to increase to (e.g., 128, 256, etc. window tokens)
+    # custom_schedule expects: "values", with a list of batch sizes to increase to (e.g., 4, 8 sequences per microbatch)
     # add_schedule expects:    "start", "increment", "end"|"count" to set the schedule of batch sizes to change to
     # factor_schedule expects: "start", "factor", "end"|"count", to set the schedule of batch sizes to change to
     batch_size_values_schedule: Dict[str, Any] = field(default_factory=lambda: {
@@ -114,7 +112,7 @@ class TrainingConfig:
     optimizer_type: str = "muon" # "muon" (and adamw) or any other name for "adamw"
     muon_lr_scale: float = 0.15 # Muon usually likes a smaller LR than AdamW (e.g., 0.1x)
     muon_backend: str = "polarexpress" # "svd" | "newtonschulz5" | "polarexpress"
-    muon_backend_steps: int = 5 # ~5-10; the higher, the slightly “tighter” orthogonalization (and slower)
+    muon_backend_steps: int = 5 # Newton-Schulz iteration count; Polar Express requires 5; SVD ignores it
     muon_momentum: float = 0.95
     muon_use_nesterov: bool = True
     # derived from the above
@@ -204,17 +202,60 @@ class TrainingConfig:
     # torch._inductor.config.cpp_wrapper = True
 
     # precision
-    # upon initialization, weights are fp32; we can cast them to bf16 with .bfloat16()
+    # default inherits the surrounding precision context; fp8 explicitly enables block scaling
+    linear_precision: Dict[str, Dict[str, str]] = field(default_factory=lambda: {
+        "training": {
+            "q_proj": "default",
+            "k_proj": "default",
+            "v_proj": "default",
+            "out_proj": "default",
+            "up_proj": "default",
+            "down_proj": "default",
+            "router": "default",
+            "lm_head": "fp8",
+        },
+        "validation": {
+            "q_proj": "default",
+            "k_proj": "default",
+            "v_proj": "default",
+            "out_proj": "default",
+            "up_proj": "default",
+            "down_proj": "default",
+            "router": "default",
+            "lm_head": "default",
+        },
+        "evaluation": {
+            "q_proj": "default",
+            "k_proj": "default",
+            "v_proj": "default",
+            "out_proj": "default",
+            "up_proj": "default",
+            "down_proj": "default",
+            "router": "default",
+            "lm_head": "default",
+        },
+        "sampling": {
+            "q_proj": "default",
+            "k_proj": "default",
+            "v_proj": "default",
+            "out_proj": "default",
+            "up_proj": "default",
+            "down_proj": "default",
+            "router": "default",
+            "lm_head": "default",
+        },
+    })
+    # upon initialization, weights are fp32; we can cast them to bf16 with .bfloat16().
     # torch.autocast(..., dtype=torch.bfloat16) does not change weight datatypes; it
     # (momentarily) casts (for operations eligible to run in bf16) the operands to bf16, e.g.
     # - the input/previous activation
     # - the weight matrix
-    # therefore the output being bf16
-    # However, with autocast alone, fp32 weights are still read from memory using 4 bytes, and only some operations are eligible
-    # set_float32_matmul_precision applies if operands are fp32
-    # - highest -> perform matmul in fp32 (24 mantissa bits with 23 bits explicitly stored)
-    # - high -> perform matmul either in tf32 or treat fp32 as the sum of 2 bf16 numbers
-    # - medium -> perform matmul in bf16 (8 mantissa bits with 7 bits explicitly stored)
+    # therefore the output being bf16.
+    # However, with autocast alone, fp32 weights are still read from memory using 4 bytes, and only some operations are eligible.
+    # set_float32_matmul_precision controls internal computation for fp32 matmul; output remains fp32:
+    # - highest -> use fp32 internally (24 mantissa bits with 23 bits explicitly stored)
+    # - high -> use tf32 or represent each fp32 input as the sum of 2 bf16 numbers; fall back to highest if unavailable
+    # - medium -> use bf16 internally; fall back to high if unavailable
     # Source: https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
     keep_fp32_loss: bool = True
     use_bf16_adamw_moments: bool = False # False stores AdamW moments in fp32
@@ -228,7 +269,7 @@ class TrainingConfig:
     float32_matmul_precision: str = "high" # "highest" | "high" | "medium" (ignored if no fp32 operands or if they are eligible by autocast to run in bf16)
     use_bf16_autocast: bool = True # autocast eligible inputs/weights (momentarily) to bf16 (can be overwritten/ignored if use_all_bf16_and_null_ctx=True -which uses null context-)
     keep_1d_weights_params_and_scales_in_fp32: bool = False # keep 1d weights, nn.Parameter, and scales in fp32 overwriting bf16_weights_params_and_scales={...} or use_all_bf16_and_null_ctx=True
-    cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast: bool = False # match 1d weights, learnable nn.Parameter, and scales data type (e.g., fp32) to that of other operands (e.g., bf16 for 2d weights), applicable when use_bf16_autocast=False
+    cast_activations_to_weight_dtype_if_no_autocast: bool = False # match activation dtype to the receiving module's weight dtype when autocast is disabled
 
     # filled by resolve(world_size)
     # steps and tokens

@@ -54,7 +54,8 @@ def log_source_code(log_buffer: List[str]) -> None:
     # read only Python files in the source directories, without traversing datasets or environments
     source_dirs = ("", "checkpointing", "config", "data", "evaluation", "model", "optimizers", "runtime", "sampling", "schedules")
     for directory in source_dirs:
-        for path in sorted((source_root / directory).glob("*.py")):
+        pattern = "**/*.py" if directory == "model" else "*.py"
+        for path in sorted((source_root / directory).glob(pattern)):
             log_buffer.extend([
                 "=" * 100,
                 f"source: {path.relative_to(source_root).as_posix()}",

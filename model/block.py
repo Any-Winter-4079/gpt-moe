@@ -7,9 +7,9 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask
 
-from .attention import SelfAttention
-from .mlp import MLP
-from .moe import MoE
+from .attention.self_attention import SelfAttention
+from .feedforward.mlp import MLP
+from .feedforward.moe import MoE
 
 if TYPE_CHECKING:
     from config.model import GPTConfig
@@ -21,7 +21,7 @@ class Block(nn.Module):
         super().__init__()
         self.use_moe = gpt_config.use_moe
         self.use_bf16_autocast = training_config.use_bf16_autocast
-        self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
+        self.cast_activations_to_weight_dtype_if_no_autocast = training_config.cast_activations_to_weight_dtype_if_no_autocast
 
         self.use_weighted_residual_path = gpt_config.use_weighted_residual_path
         self.use_weighted_main_path = gpt_config.use_weighted_main_path
@@ -60,9 +60,9 @@ class Block(nn.Module):
         balance_loss = None
         # weighted path
         if self.use_weighted_residual_path or self.use_weighted_main_path:
-            # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+            # match activation dtype to the receiving module's weight dtype when autocast is disabled
             x_ln1 = x
-            if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln1.dtype != self.ln_1.weight.dtype:
+            if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln1.dtype != self.ln_1.weight.dtype:
                 x_ln1 = x_ln1.to(dtype=self.ln_1.weight.dtype)
 
             # Attention
@@ -76,9 +76,9 @@ class Block(nn.Module):
                 # x = alpha_1 * x + beta_1 * Attn(norm(x))
                 x = self.attn_residual_scale * x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
 
-            # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+            # match activation dtype to the receiving module's weight dtype when autocast is disabled
             x_ln2 = x
-            if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+            if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
                 x_ln2 = x_ln2.to(dtype=self.ln_2.weight.dtype)
             mlp_output = self.mlp(self.ln_2(x_ln2))
             if self.use_moe:
@@ -97,14 +97,14 @@ class Block(nn.Module):
 
         # standard path
         else:
-            # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+            # match activation dtype to the receiving module's weight dtype when autocast is disabled
             x_ln1 = x
-            if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln1.dtype != self.ln_1.weight.dtype:
+            if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln1.dtype != self.ln_1.weight.dtype:
                 x_ln1 = x_ln1.to(dtype=self.ln_1.weight.dtype)
             x = x + self.residual_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
-            # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+            # match activation dtype to the receiving module's weight dtype when autocast is disabled
             x_ln2 = x
-            if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+            if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
                 x_ln2 = x_ln2.to(dtype=self.ln_2.weight.dtype)
             mlp_output = self.mlp(self.ln_2(x_ln2))
             if self.use_moe:

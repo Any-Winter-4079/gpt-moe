@@ -9,6 +9,8 @@ import torch
 import torch.distributed as dist
 from datasets import load_dataset
 
+from runtime.precision import linear_precision_phase
+
 
 def extract_gsm8k_answer(completion: str) -> Optional[Decimal]:
     match = re.search(r"(?:^|\n)####[ \t]*(-?[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)[ \t]*(?:\r?\n|$)", completion)
@@ -81,7 +83,7 @@ def evaluate_gsm8k(run) -> float:
     run.gpt_model.eval()
 
     try:
-        with torch.inference_mode(), run.ctx:
+        with linear_precision_phase(raw_gpt_model, "evaluation"), torch.inference_mode(), run.ctx:
             for start in range(0, len(examples), config.gsm8k_examples_per_batch):
                 batch = examples[start:start + config.gsm8k_examples_per_batch]
                 prompt_lengths = [len(ids) for ids, _ in batch]

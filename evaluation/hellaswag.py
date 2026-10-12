@@ -7,6 +7,8 @@ import torch.distributed as dist
 from datasets import load_dataset
 from torch.nn import functional as F
 
+from runtime.precision import linear_precision_phase
+
 
 def load_hellaswag_data(run) -> None:
     run.hellaswag_train_dataset = load_dataset("hellaswag", split="train")
@@ -176,7 +178,7 @@ def evaluate_hellaswag_one_shot(run, hellaswag_examples_per_batch: int = 16) -> 
 
     max_model_seq_len = raw_gpt_model.max_seq_len 
 
-    with torch.inference_mode():
+    with linear_precision_phase(raw_gpt_model, "evaluation"), torch.inference_mode():
         num_example_batches = (total_dataset_examples + hellaswag_examples_per_batch - 1) // hellaswag_examples_per_batch
 
         for i in range(num_example_batches):
@@ -260,8 +262,7 @@ def evaluate_hellaswag_one_shot(run, hellaswag_examples_per_batch: int = 16) -> 
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
             with ctx:
-                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
-                # so we can skip passing an attn_mask
+                # with causal attention, real tokens cannot attend to right padding, so no padding mask is needed
                 eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
                 logits = run.forward(eager_gpt_model, pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             if run.parallel_mode == "pp" and rank != world_size - 1:
@@ -349,7 +350,7 @@ def evaluate_hellaswag_standard(run, hellaswag_examples_per_batch: int = 16) -> 
 
     max_model_seq_len = raw_gpt_model.max_seq_len 
     
-    with torch.inference_mode():
+    with linear_precision_phase(raw_gpt_model, "evaluation"), torch.inference_mode():
         num_example_batches = (total_dataset_examples + hellaswag_examples_per_batch - 1) // hellaswag_examples_per_batch
 
         for i in range(num_example_batches):
@@ -415,8 +416,7 @@ def evaluate_hellaswag_standard(run, hellaswag_examples_per_batch: int = 16) -> 
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
             with ctx:
-                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
-                # so we can skip passing an attn_mask
+                # with causal attention, real tokens cannot attend to right padding, so no padding mask is needed
                 eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
                 logits = run.forward(eager_gpt_model, pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             if run.parallel_mode == "pp" and rank != world_size - 1:

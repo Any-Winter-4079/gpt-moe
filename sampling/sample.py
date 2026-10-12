@@ -7,6 +7,8 @@ import torch
 import torch.distributed as dist
 from torch.nn import functional as F
 
+from runtime.precision import linear_precision_phase
+
 
 def get_sample_token_count(step: int, base: int = 5, step_interval: int = 1000, max_tokens: int = 50) -> int:
     return min(base + (step // step_interval) * base, max_tokens)
@@ -30,7 +32,7 @@ def sample(
     master_process = run.master_process
     log_buffer = run.log_buffer
     gpt_model.eval()
-    with torch.inference_mode():
+    with linear_precision_phase(raw_gpt_model, "sampling"), torch.inference_mode():
         # convert all prompts to ids,
         # e.g., 'AGI is' to [4760, 40, 318]
         # 'AGI is not' to [4760, 40, 318, 407]
@@ -69,15 +71,13 @@ def sample(
         actual_sequence_lengths = torch.tensor([len(seq) for seq in initial_input_ids_list], dtype=torch.long, device=device)
 
         for _ in range(max_new_tokens):
-            # then, for each new token to generate, update the mask by effectively comparing if 0, ..., alloc_len < the non-padded length for each sequence
-            # using unsqueeze(0) to add a new dimension of size 1 at the beginning to give size (1, alloc_len)
-            # and unsqueeze(1) to add a new dimension of size 1 at the end to give size (len(sample_sequences), 1)
+            # an optional padding mask would compare positions 0, ..., alloc_len - 1 with each non-padded sequence length.
+            # Broadcasting (1, alloc_len) against (len(sample_sequences), 1) gives (len(sample_sequences), alloc_len)
             # attn_mask = torch.arange(alloc_len, device=device).unsqueeze(0) < actual_sequence_lengths.unsqueeze(1)
             
             with ctx:
                 # and predict, resulting in (len(sample_sequences), seq_len, vocab_size)
-                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
-                # so we can skip passing an attn_mask
+                # with causal attention, real tokens cannot attend to right padding, so no padding mask is needed
                 eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
                 logits = run.forward(eager_gpt_model, generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
             
@@ -96,7 +96,7 @@ def sample(
                     # apply top_k filtering
                     if top_k is not None and top_k > 0:
                         # topk returns the k largest elements of the given input tensor along a given dimension
-                        # resulting in len(sample_sequences), vocab_size
+                        # resulting in len(sample_sequences), top_k
                         sorted_values, _ = torch.topk(temp_adjusted_logits, min(top_k, temp_adjusted_logits.size(-1)), dim=-1, largest=True, sorted=True)
                         # get the k-th largest logit of each sequence (i.e., last in sorted_values)
                         # and add a new dimension of size 1 at the end to give size (len(sample_sequences), 1)
@@ -127,7 +127,7 @@ def sample(
                                 log_buffer.append(message)
                         # obtain the indices of logits to remove,
                         # initially excluding the logit that makes the cumulative sum match top_p,
-                        # as we then shift to the right one position
+                        # as we then shift to the right one position.
                         # cumulative_probs [0.3, 0.6, 0.8, 1.0], top_p 0.75 would thus give (for a single sequence):
                         # [False, False, True, True] which shifted to the right is [False, False, False, True]
                         # while cumulative_probs [0.3, 0.6, 0.8, 1.0], top_p 0.8:
@@ -136,7 +136,7 @@ def sample(
                         sorted_indices_to_remove = cumulative_probs >= top_p
                         # shift the indices to the right one position
                         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        # replacing the last index value, now in the first position, to False
+                        # keep the highest-probability token eligible after the right shift
                         sorted_indices_to_remove[..., 0] = False
                         mask = sorted_indices_to_remove.to(torch.bool)
 
@@ -167,7 +167,7 @@ def sample(
             # increase the actual, non-padded sequence endings
             actual_sequence_lengths += 1
 
-        # and decode, ignoring above 50256
+        # decode token ids below the configured pad_token_id
         local_messages = []
         if run.parallel_mode == "ddp" or rank == world_size - 1:
             if run.parallel_mode == "pp":

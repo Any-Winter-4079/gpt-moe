@@ -21,18 +21,10 @@ def get_token_based_adamw_lr(
         coeff = 0.5 * (1.0 + math.cos(math.pi * (train_tokens_processed - lr_warmup_tokens) / total_decay_tokens))
         return adamw_hard_min_lr + coeff * (adamw_max_lr - adamw_hard_min_lr)
 
-################################################
-#                Schedule Helpers              #
-################################################
-
 
 def get_next_update_tokens(schedule_keys: List[int], idx: int, max_tokens: int) -> int:
     next_idx = (idx + 1) if schedule_keys[0] == 0 else idx
     return schedule_keys[next_idx] if next_idx < len(schedule_keys) else max_tokens + 1
-
-################################################
-#             Schedule Constraints             #
-################################################
 
 
 def enforce_flex_block_constraints(value: int, flex_block_size: int, enforce_even_blocks: bool) -> int:
@@ -51,10 +43,6 @@ def enforce_min_max_constraints(raw_values: List[int], min_value: Optional[int],
             value = max_value
         values.append(value if not values or value >= values[-1] else values[-1])
     return values
-
-################################################
-#            Pure Schedule Functions           #
-################################################
 
 
 def factor_schedule(

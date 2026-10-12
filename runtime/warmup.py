@@ -6,6 +6,8 @@ import time
 import torch
 import torch.distributed as dist
 
+from .precision import linear_precision_phase
+
 
 def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
     raw_gpt_model = run.raw_gpt_model
@@ -37,7 +39,7 @@ def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
 
     # train-shape warmup (compile this pipeline stage)
     gpt_model.train()
-    with torch.enable_grad():
+    with linear_precision_phase(raw_gpt_model, "training"), torch.enable_grad():
         for batch_size in warmup_batch_sizes:
             print(f"kernel_warmup: gpu {rank} compiling kernels for batch size: {batch_size}")
             for _ in range(num_train_steps):
@@ -85,7 +87,7 @@ def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
 
     # val-shape warmup (compile eval forward)
     gpt_model.eval()
-    with torch.inference_mode(), ctx:
+    with linear_precision_phase(raw_gpt_model, "validation"), torch.inference_mode(), ctx:
         x_val = torch.randint(
             0, raw_gpt_model.pad_token_id,
             (gpu_batch_size_val, seq_len_val), device=device
@@ -153,7 +155,7 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
 
     # train-shape warmup (compile both DDP graphs)
     gpt_model.train()
-    with torch.enable_grad():
+    with linear_precision_phase(raw_gpt_model, "training"), torch.enable_grad():
         for batch_size in warmup_batch_sizes:
             print(f"kernel_warmup: gpu {rank} compiling kernels for batch size: {batch_size}")
             for _ in range(num_train_steps):
@@ -200,7 +202,7 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
 
     # val-shape warmup (compile eval forward)
     gpt_model.eval()
-    with torch.inference_mode(), ctx:
+    with linear_precision_phase(raw_gpt_model, "validation"), torch.inference_mode(), ctx:
         x_val = torch.randint(
             0, raw_gpt_model.pad_token_id,
             (gpu_batch_size_val, seq_len_val), device=device

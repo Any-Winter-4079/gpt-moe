@@ -4,7 +4,7 @@ FineWeb-Edu dataset (for srs pretraining)
 https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
 Downloads and tokenizes the data and saves data shards to disk.
 Run simply as:
-$ python fineweb.py
+$ python data/fineweb-npy.py
 Will save shards to the local directory "edu_fineweb10B".
 """
 

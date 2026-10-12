@@ -11,6 +11,7 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask, and_
 from torch.utils.checkpoint import checkpoint
 
 from .block import Block
+from .linear.linear import Linear
 
 if TYPE_CHECKING:
     from config.model import GPTConfig
@@ -58,13 +59,17 @@ class GPT(nn.Module):
         self.attn_logit_softcap = gpt_config.attn_logit_softcap
 
         self.use_bf16_autocast = training_config.use_bf16_autocast
-        self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
+        self.cast_activations_to_weight_dtype_if_no_autocast = training_config.cast_activations_to_weight_dtype_if_no_autocast
         self.data_uses_padding = training_config.data_uses_padding
         self.keep_fp32_loss = training_config.keep_fp32_loss
         self.use_liger_loss = training_config.use_liger_loss
-        self.use_fp8_lm_head = training_config.use_fp8_lm_head
-        if self.use_liger_loss and self.use_fp8_lm_head:
-            raise ValueError("use_liger_loss and use_fp8_lm_head select separate training loss paths; enable only one")
+        self.linear_precision = training_config.linear_precision
+        for phase in ("training", "validation", "evaluation", "sampling"):
+            for role in ("q_proj", "k_proj", "v_proj", "out_proj", "up_proj", "down_proj", "router", "lm_head"):
+                if self.linear_precision[phase][role] not in ("default", "fp8"):
+                    raise ValueError(f"unsupported linear precision for {phase}.{role}: {self.linear_precision[phase][role]}")
+        if self.use_liger_loss and self.linear_precision["training"]["lm_head"] == "fp8":
+            raise ValueError("use_liger_loss requires linear_precision['training']['lm_head']='default'")
         if self.use_liger_loss and stage_index != 0:
             from .loss import FusedLinearCrossEntropyLoss
 
@@ -83,7 +88,7 @@ class GPT(nn.Module):
         self.register_buffer(
             "sliding_window_size",
             torch.tensor(self.initial_sliding_window_size, dtype=torch.int32),
-            # keep this out of state_dict, it's set by step count
+            # keep this out of state_dict, it's set by the number of training tokens processed
             persistent=False
         )
 
@@ -108,7 +113,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(gpt_config, training_config, layer_idx=i) for i in range(gpt_config.n_layers)]),
             ln_f = nn.RMSNorm(gpt_config.d_model) if gpt_config.norm_type.lower() == "rms" else nn.LayerNorm(gpt_config.d_model),
         ))
-        self.lm_head = nn.Linear(gpt_config.d_model, gpt_config.vocab_size, bias=False)
+        self.lm_head = Linear(gpt_config.d_model, gpt_config.vocab_size, role="lm_head", bias=False)
         
         self.use_tied_embeddings = gpt_config.use_tied_embeddings
         if self.use_tied_embeddings:
@@ -133,13 +138,20 @@ class GPT(nn.Module):
                     del self.transformer.wpe
             self.has_full_attention_layers = any(self.layer_is_full_attention)
 
-        if self.use_fp8_lm_head and stage_index != 0:
-            from .fp8_lm_head import FP8LMHead
+        self._linear_modules = tuple(module for module in self.modules() if isinstance(module, Linear))
+        self.precision_phase = None
+        self.set_precision_phase("training")
 
-            self.lm_head = FP8LMHead(self.lm_head.weight)
+    def set_precision_phase(self, phase: str) -> None:
+        if phase == self.precision_phase:
+            return
+        policy = self.linear_precision[phase]
+        for module in self._linear_modules:
+            module.precision = policy[module.role]
+        self.precision_phase = phase
 
     def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, Linear)):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -178,7 +190,7 @@ class GPT(nn.Module):
         muon_param_names = set()
         if self.optimizer_type == "muon":
             for pn, p in param_dict.items():
-                if p.dim() == 2 and ("wte" not in pn) and ("lm_head" not in pn):
+                if p.dim() == 2 and ("wte" not in pn) and ("wpe" not in pn) and ("lm_head" not in pn):
                     muon_param_names.add(pn)
 
         # adamw gets everything else, split by decay rule
@@ -242,7 +254,7 @@ class GPT(nn.Module):
             ignore_doc_mask: bool = False,
             apply_swa: bool = True,
             ) -> Optional[BlockMask]:
-        # Attention builds, per sequence, a matrix of shape (seq_len, seq_len) when it does Q @ K^T
+        # Attention builds, per sequence, a matrix of shape (seq_len, seq_len) when it does Q @ K^T.
         # Splitting into 128x128 blocks (if block_size=128), each a 128×128 submatrix of 128 rows
         # (queries) × 128 columns (keys), we get:
         #                                       ┌───────────┬───────────┬───────────┬───────────┐
@@ -256,7 +268,7 @@ class GPT(nn.Module):
         #                                       └───────────┴───────────┴───────────┴───────────┘
         #                                        keys 0-127  keys 128-255    ...     keys (seq_len-128)-(seq_len-1)
         
-        # In other words, (seq_len, seq_len) → (num_blocks_per_axis, num_blocks_per_axis)
+        # In other words, (seq_len, seq_len) → (num_blocks_per_axis, num_blocks_per_axis).
         # The goal is to skip applying a mask to the full matrix, and prematurely
         # determine which blocks of 128x128 can compute full attention, 
         # which need partial masking and which can be dropped entirely
@@ -309,7 +321,7 @@ class GPT(nn.Module):
             mask_mod = and_masks(mask_mod, same_doc_mod)
 
         # tiny bit faster path: supports gpu_batch_size >= 1, but currently needs is_causal, plus used 
-        # only for training to avoid hitting re-compilation
+        # only for training to avoid hitting re-compilation.
         # Builds full/partial blocks up front, uses from_kv_blocks to skip applying mask_mod to certain blocks
         # -- Start of (modified) source: https://github.com/KellerJordan/modded-nanogpt/blob/master/records/071225_BosAlign/c1fd8a38-bb9f-45c4-8af0-d37f70c993f3.txt --
         if self.is_causal and self.training:
@@ -324,7 +336,7 @@ class GPT(nn.Module):
             # for keys:    k ∈ [j*block_size, (j+1)*block_size-1] with j=0..num_blocks_per_axis-1
             # and we will compute 2 variables for each of causal, doc, and attn_mask masks:
             # - which blocks are fully dense or valid, i.e., all (q, k) pairs are valid
-            # - which blocks are sparse, i.e., some (q, k) pairs are valid, yet not all
+            # - which blocks have at least one valid (q, k) pair, including fully valid blocks
 
             # Starting with causality:
             # block_indices is e.g. (8,), and inserting a length-1 dimension at the end,
@@ -457,7 +469,7 @@ class GPT(nn.Module):
                 attn_mask_blockmask_all = attn_mask_blockmask_any
 
             # combining the constraints:
-            # blockmask_any → tiles that may have some valid (q,k) pairs and must run mask_mod pointwise, e.g.,
+            # blockmask_any → tiles that may have valid (q,k) pairs, including fully valid tiles, e.g.,
             # [[True,  False, False, False],
             #  [True,  True,  False, False],
             #  [False, True,  True,  False],
@@ -471,8 +483,9 @@ class GPT(nn.Module):
             blockmask_all = causal_fully_valid_blocks & doc_fully_valid_blocks & attn_mask_blockmask_all
 
             def map_to_ordered(blockmask_full_or_partial):
-                # map (num_blocks_per_axis, num_blocks_per_axis) into its ordered representation
-                # and return blockmask and sort-indices, both as (B?, H?, num_query_blocks)
+                # map (gpu_batch_size, num_query_blocks, num_key_blocks) into its ordered representation.
+                # Return block counts as (gpu_batch_size, 1, num_query_blocks)
+                # and key-block indices as (gpu_batch_size, 1, num_query_blocks, num_key_blocks)
                 num_valid_kv_blocks_per_q_block = blockmask_full_or_partial.sum(dim=-1, dtype=torch.int32)
                 # descending=False argsort → False before True
                 # stable=True argsort      → keep order of appearance, e.g., [True, True] → [0, 1] (and not [1, 0])
@@ -486,8 +499,8 @@ class GPT(nn.Module):
                 # argsort(False-first) gives indices [0, 1, 2, 3] → flipped is [3, 2, 1, 0] (True-first)
                 fully_valid_kv_indices = blockmask_full_or_partial.argsort(dim=-1, descending=False, 
                                                                         stable=True).flip(-1).to(torch.int32)
-                # BlockMask expects (B?, H?, num_query_blocks), so we insert two leading dims; 
-                # and flip() may produce a non-contiguous view, so we call contiguous(), resulting in, e.g.,
+                # insert a size-one head dimension into each tensor for BlockMask;
+                # ensure both returned tensors are contiguous, resulting in, e.g.,
                 # -------------------------------------------------------------------------
                 # (given) blockmask_any & ~blockmask_all:
                 # -------------------------------------------------------------------------
@@ -506,7 +519,7 @@ class GPT(nn.Module):
                 # index 0 is kept for the first row (because it is the first column and we keep only 1 block)
                 # index 1 is kept for the second row (because it is the first column and we keep only 1 block)
                 # index 2 is kept for the third row (because it is the first column and we keep only 1 block)
-                # index 3 is kept for the fourth row (because it is the first column and we keep only 1 block)
+                # no block is kept for the fourth row because its valid-block count is zero
                 # NOTE:
                 # Despite not being used in this fast path (the path enforces is_causal), it must be noted:
                 # This order fails if not is_causal because it keeps last valid block(s), which if is_causal 
@@ -525,14 +538,14 @@ class GPT(nn.Module):
 
             # SWA window clamping (skipped for full attention layers)
             if apply_swa:
-                # when using block_size, window_size is not exact (e.g., 2 full blocks + 1 partial block attended to
-                # -in general, for block_size = 128 and window_size = 384 (window_size_blocks = 3)
-                # excluding doc and other attn masks, that means 128 + 128 + 64 attended to tokens (64 tokens short))-
-                # use tensor math: (window_size / block_size).ceil()
+                # block-based window clamping makes the attended token count depend on the query position.
+                # For block_size = 128 and window_size = 384, with two preceding full blocks available
+                # and no doc or other attn masks, queries attend to 128 + 128 + (1 to 128) = 257 to 384 tokens.
+                # Use tensor math: (window_size / block_size).ceil()
                 window_size_blocks = (window_size.float() / block_size).ceil().to(torch.int32)
 
-                # is_causal → the diagonal block is partial
-                # therefore, always exclude one full block per row to make room for the diagonal block (in other words,
+                # is_causal → the diagonal block is partial.
+                # Therefore, always exclude one full block per row to make room for the diagonal block (in other words,
                 # start counting window_size from the diagonal to the left)
                 clamped_num_fully_valid_kv_blocks = torch.clamp_max(num_fully_valid_kv_blocks, window_size_blocks - 1)
                 clamped_num_only_partially_valid_kv_blocks = torch.clamp_max(num_only_partially_valid_kv_blocks,
@@ -551,7 +564,7 @@ class GPT(nn.Module):
                 # kv_indices (Tensor) – Indices of key-value blocks in each Q_BLOCK_SIZE row tile
                 only_partial_kv_indices,
                 # -------------------------------------------------------------------------
-                # subset of the above that are known to be fully dense 
+                # fully valid blocks, separate from the partial blocks above
                 # (every (q,k) pair in the tile is valid)
                 # -------------------------------------------------------------------------
                 # full_kv_num_blocks (Optional[Tensor]) – Number of full kv_blocks 
@@ -652,7 +665,7 @@ class GPT(nn.Module):
             previous_stage_balance_loss: Optional[Tensor] = None,
             ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]], Tuple[Tensor, Tensor, Tensor]]:
         # ignore_doc_mask to avoid using it in:
-        # val, sampling, hellaswag
+        # sampling, hellaswag
         # even if used in train
         gpu_batch_size, seq_len = indices.shape[:2]
         if self.stage_index != 1:
@@ -714,20 +727,20 @@ class GPT(nn.Module):
                 balance_loss = block_balance_loss if balance_loss is None else balance_loss + block_balance_loss
         if self.stage_index == 0:
             return (x, balance_loss) if balance_loss is not None else x
-        # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+        # match activation dtype to the receiving module's weight dtype when autocast is disabled
         x_ln_f = x
-        if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln_f.dtype != self.transformer.ln_f.weight.dtype:
+        if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln_f.dtype != self.transformer.ln_f.weight.dtype:
             x_ln_f = x_ln_f.to(dtype=self.transformer.ln_f.weight.dtype)
         x = self.transformer.ln_f(x_ln_f)
 
-        # [gpu_batch_size, seq_len, vocab_size]
-        # cast if no autocast and cast is requested (x can be fp32, lm_head weights can be bf16)
-        if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.lm_head.weight.dtype:
+        # match activation dtype to the receiving module's weight dtype when autocast is disabled
+        if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x.dtype != self.lm_head.weight.dtype:
             x = x.to(dtype=self.lm_head.weight.dtype)
         if self.training and targets is not None and self.use_liger_loss:
             loss = self.liger_loss(self.lm_head.weight, x.reshape(-1, x.size(-1)), targets.reshape(-1))
         else:
-            logits = self.lm_head(x, use_fp8=True) if self.training and targets is not None and self.use_fp8_lm_head else self.lm_head(x)
+            # [gpu_batch_size, seq_len, vocab_size]
+            logits = self.lm_head(x)
             if targets is not None:
                 logits_for_loss = logits.float() if self.keep_fp32_loss and logits.dtype != torch.float32 else logits
                 if self.data_uses_padding:
