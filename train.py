@@ -178,14 +178,35 @@ if training_config.use_all_bf16_and_null_ctx or training_config.use_bf16_weights
         training_config.bf16_weights_params_and_scales,
         training_config.keep_1d_weights_params_and_scales_in_fp32,
     )
-if parallel_mode == "ddp" and any("fp8" in policy.values() for policy in training_config.linear_precision.values()):
+if parallel_mode == "ddp" and (training_config.activation_offload_layers or any("fp8" in policy.values() for policy in training_config.linear_precision.values())):
     torch._dynamo.config.optimize_ddp = False
-gpt_model = torch.compile(
-    gpt_model,
-    mode=training_config.torch_compile_mode,
-    fullgraph=training_config.torch_compile_fullgraph,
-    dynamic=training_config.torch_compile_dynamic,
-)
+if training_config.activation_offload_layers:
+    # keep transfer hooks outside compiled blocks and avoid CUDA graph pools retaining activations
+    compile_options = torch._inductor.list_mode_options(training_config.torch_compile_mode)
+    compile_options["triton.cudagraphs"] = False
+    gpt_model.activation_offloader.compile(
+        options=compile_options,
+        fullgraph=training_config.torch_compile_fullgraph,
+        dynamic=training_config.torch_compile_dynamic,
+    )
+    gpt_model = torch.compile(
+        gpt_model, options=compile_options, fullgraph=False,
+        dynamic=training_config.torch_compile_dynamic,
+    )
+    if master_process:
+        message = (
+            f"activation offloading: first {training_config.activation_offload_layers} blocks per GPU; "
+            "prefetch one block ahead; compiled blocks with eager transfer scheduling; CUDA graphs disabled"
+        )
+        print(message)
+        log_buffer.append(message)
+else:
+    gpt_model = torch.compile(
+        gpt_model,
+        mode=training_config.torch_compile_mode,
+        fullgraph=training_config.torch_compile_fullgraph,
+        dynamic=training_config.torch_compile_dynamic,
+    )
 if parallel_mode == "ddp":
     gpt_model = DDP(gpt_model, device_ids=[local_rank])
     raw_gpt_model = gpt_model.module
@@ -295,6 +316,15 @@ if master_process:
 log_parameter_counts(run, gpt_config)
 flush_log(run)
 kernel_warmup(run, num_train_steps=training_config.kernel_warmup_train_steps)
+if raw_gpt_model.activation_offloader is not None:
+    message = (
+        f"activation offloading: gpu {rank} copied "
+        f"{raw_gpt_model.activation_offloader.last_offloaded_bytes / 1024**2:,.2f} MiB "
+        "in the last training warmup microbatch"
+    )
+    print(message)
+    if master_process:
+        log_buffer.append(message)
 # warmup restores optimizer state, which casts moments to the parameter dtype
 configure_adamw_moments(optimizers["adamw"], training_config.use_bf16_adamw_moments)
 if training_config.resume_from_checkpoint:

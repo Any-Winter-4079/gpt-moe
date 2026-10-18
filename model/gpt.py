@@ -138,6 +138,20 @@ class GPT(nn.Module):
                     del self.transformer.wpe
             self.has_full_attention_layers = any(self.layer_is_full_attention)
 
+        self.activation_offloader = None
+        if not 0 <= training_config.activation_offload_layers <= len(self.transformer.h):
+            raise ValueError("activation_offload_layers must be between 0 and the number of blocks on this GPU")
+        if training_config.activation_offload_layers:
+            from runtime.activation_offloading import ActivationOffloading
+
+            if training_config.activation_offload_min_bytes < 0:
+                raise ValueError("activation_offload_min_bytes must be non-negative")
+            self.activation_offloader = ActivationOffloading(
+                training_config.activation_offload_layers,
+                training_config.activation_offload_min_bytes,
+                self.use_activation_checkpointing,
+            )
+
         self._linear_modules = tuple(module for module in self.modules() if isinstance(module, Linear))
         self.precision_phase = None
         self.set_precision_phase("training")
@@ -714,17 +728,23 @@ class GPT(nn.Module):
             sdpa_attn_mask = attn_mask
 
         balance_loss = None
-        for block, is_full in zip(self.transformer.h, self.layer_is_full_attention):
-            flex_mask = full_flex_attn_block_mask if is_full else swa_flex_attn_block_mask
-            if self.use_activation_checkpointing and self.training and torch.is_grad_enabled():
-                x, block_balance_loss = checkpoint(
-                    block, x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=sdpa_attn_mask,
-                    use_reentrant=False,
-                )
-            else:
-                x, block_balance_loss = block(x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=sdpa_attn_mask)
-            if block_balance_loss is not None:
-                balance_loss = block_balance_loss if balance_loss is None else balance_loss + block_balance_loss
+        if self.activation_offloader is not None and self.training and torch.is_grad_enabled():
+            x, balance_loss = self.activation_offloader.run(
+                self.transformer.h, self.layer_is_full_attention, x,
+                swa_flex_attn_block_mask, full_flex_attn_block_mask, sdpa_attn_mask,
+            )
+        else:
+            for block, is_full in zip(self.transformer.h, self.layer_is_full_attention):
+                flex_mask = full_flex_attn_block_mask if is_full else swa_flex_attn_block_mask
+                if self.use_activation_checkpointing and self.training and torch.is_grad_enabled():
+                    x, block_balance_loss = checkpoint(
+                        block, x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=sdpa_attn_mask,
+                        use_reentrant=False,
+                    )
+                else:
+                    x, block_balance_loss = block(x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=sdpa_attn_mask)
+                if block_balance_loss is not None:
+                    balance_loss = block_balance_loss if balance_loss is None else balance_loss + block_balance_loss
         if self.stage_index == 0:
             return (x, balance_loss) if balance_loss is not None else x
         # match activation dtype to the receiving module's weight dtype when autocast is disabled

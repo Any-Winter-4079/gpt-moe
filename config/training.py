@@ -191,6 +191,10 @@ class TrainingConfig:
     # activation checkpointing
     use_activation_checkpointing: bool = False
 
+    # offload saved activations from the first N blocks of each GPU's stage; 0 disables
+    activation_offload_layers: int = 0
+    activation_offload_min_bytes: int = 1024 * 1024
+
     # torch compile
     # NOTE: workaround for RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run is 
     # to disable cudagraphs in max-autotune when grad_accum_mini_steps > 1
