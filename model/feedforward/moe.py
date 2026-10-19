@@ -17,9 +17,8 @@ if TYPE_CHECKING:
     from config.training import TrainingConfig
 
 
-@torch.compiler.disable
-def split_expert_inputs(packed: Tensor, counts: Tensor) -> Tuple[Tensor, ...]:
-    return packed.split(counts.cpu().tolist())
+def _run_experts(experts: nn.ModuleList, parts: Tuple[Tensor, ...]) -> Tensor:
+    return torch.cat([expert(part) for expert, part in zip(experts, parts)], dim=0)
 
 
 class MoE(nn.Module):
@@ -33,6 +32,16 @@ class MoE(nn.Module):
         self.use_grouped_moe = gpt_config.use_grouped_moe
         self.router = Linear(gpt_config.d_model, num_experts, role="router", bias=False)
         self.experts = nn.ModuleList([MLP(gpt_config, training_config) for _ in range(num_experts)])
+        self.expert_forward = _run_experts
+
+    def compile_experts(self, **kwargs) -> None:
+        self.expert_forward = torch.compile(_run_experts, fullgraph=False, dynamic=True, **kwargs)
+
+    @torch.compiler.disable
+    def forward_experts(self, packed: Tensor, counts: Tensor) -> Tensor:
+        # isolate variable expert sizes from the surrounding static graph
+        parts = packed.split(counts.cpu().tolist())
+        return self.expert_forward(self.experts, parts)
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
         input_shape = x.shape
@@ -87,8 +96,7 @@ class MoE(nn.Module):
             0, expert_indices, torch.ones_like(expert_indices, dtype=torch.int32),
         )
         packed = hidden_states[order // self.top_k]
-        parts = split_expert_inputs(packed, counts)
-        packed = torch.cat([expert(part) for expert, part in zip(self.experts, parts)], dim=0)
+        packed = self.forward_experts(packed, counts)
         inverse_order = torch.empty_like(order).scatter_(0, order, torch.arange(order.numel(), device=order.device))
         expert_output = packed[inverse_order].view(hidden_states.shape[0], self.top_k, -1).to(hidden_states.dtype)
         return (expert_output * top_k_weights[:, :, None].to(hidden_states.dtype)).sum(dim=1)
