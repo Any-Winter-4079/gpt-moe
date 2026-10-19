@@ -1,0 +1,29 @@
+diff --git a/model/linear/grouped_fp8.py b/model/linear/grouped_fp8.py
+index b4550dc..22b2e92 100644
+--- a/model/linear/grouped_fp8.py
++++ b/model/linear/grouped_fp8.py
+@@ -5,6 +5,7 @@ from typing import Any, Tuple
+ import torch
+ import triton
+ import triton.language as tl
++from deep_gemm.utils import per_block_cast_to_fp8
+ from torch import Tensor
+ from torch.library import triton_op, wrap_triton
+ 
+@@ -224,12 +225,10 @@ def _forward(
+     x: Tensor, weight: Tensor, offsets: Tensor, save_backward: bool, deepgemm: bool,
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+     row, row_scale, column, column_scale, _ = _quantize_activations(x, offsets, save_backward, deepgemm)
+-    experts, n, k = weight.shape
+-    weight_fp8 = torch.empty(weight.shape, device=weight.device, dtype=torch.float8_e4m3fn)
+-    weight_scale = torch.empty((experts, triton.cdiv(n, 128), triton.cdiv(k, 128)), device=weight.device, dtype=torch.float32)
+-    wrap_triton(_quantize_weights_kernel)[(experts, triton.cdiv(n, 128), triton.cdiv(k, 128))](
+-        weight, weight_fp8, weight_scale, n, k, *weight.stride(), num_warps=8,
+-    )
++    # quantize each expert independently so 128x128 blocks cannot cross expert boundaries
++    quantized_weights = [per_block_cast_to_fp8(expert, use_ue8m0=True) for expert in weight.unbind(0)]
++    weight_fp8 = torch.stack([quantized for quantized, _ in quantized_weights])
++    weight_scale = torch.stack([scale for _, scale in quantized_weights])
+     out = _grouped_fp8_mm(
+         row, weight_fp8.transpose(-2, -1), row_scale, weight_scale.transpose(-2, -1), offsets, torch.bfloat16,
+     )

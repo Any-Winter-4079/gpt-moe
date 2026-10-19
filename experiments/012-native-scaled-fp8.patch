@@ -1,0 +1,40 @@
+diff --git a/model/linear/grouped_fp8.py b/model/linear/grouped_fp8.py
+index b4550dc..b8c6835 100644
+--- a/model/linear/grouped_fp8.py
++++ b/model/linear/grouped_fp8.py
+@@ -106,8 +106,9 @@ def _quantize_weights_kernel(
+ 
+ @triton.autotune(
+     configs=[
+-        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_stages=3, num_warps=4)
++        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_stages=3, num_warps=warps)
+         for bm, bn in [(64, 64), (64, 128), (128, 64)]
++        for warps in (4, 8)
+     ],
+     key=["M", "N", "K", "NUM_EXPERTS", "GROUP_K", "a_stride_m", "a_stride_k", "b_stride_k", "b_stride_n"],
+ )
+@@ -169,9 +170,12 @@ def _grouped_fp8_mm_kernel(
+                     BScale + bs_base + block * bs_stride_k + scale_col * bs_stride_n,
+                     mask=col < N, other=0.0,
+                 )
+-                # rescale each 128-term partial sum before accumulating in fp32
+-                partial = tl.dot(a, b, max_num_imprecise_acc=0)
+-                acc += partial * a_scale[:, None] * b_scale[None, :]
++                # retain 128-element scales while using four native 32-element scale groups
++                a_exponent = (a_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++                b_exponent = (b_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++                a_exponents = tl.broadcast_to(a_exponent[:, None], (BLOCK_M, 4))
++                b_exponents = tl.broadcast_to(b_exponent[:, None], (BLOCK_N, 4))
++                acc = tl.dot_scaled(a, a_exponents, "e4m3", b, b_exponents, "e4m3", acc)
+             tl.store(
+                 C + c_base + row[:, None] * N + col[None, :], acc,
+                 mask=(row[:, None] < rows) & (col[None, :] < N),
+@@ -204,6 +208,8 @@ def _quantize_activations(
+ 
+ 
+ def _grouped_fp8_mm(a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, offsets: Tensor, dtype: torch.dtype) -> Tensor:
++    if torch.cuda.get_device_capability(a.device) != (12, 0):
++        raise ValueError("native scaled FP8 grouped projections require SM120")
+     group_k = b.ndim == 2
+     m, k = a.shape
+     n = b.shape[-1]

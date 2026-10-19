@@ -1,0 +1,92 @@
+diff --git a/optimizers/polar_express.py b/optimizers/polar_express.py
+index 4650f0f..e4456b6 100644
+--- a/optimizers/polar_express.py
++++ b/optimizers/polar_express.py
+@@ -263,6 +263,65 @@ def ba_plus_cAA(A: Tensor, alpha: float, beta: float, out: Tensor):
+     return out
+ 
+ 
++@triton.autotune(
++    configs=[
++        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4),
++        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4),
++        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8),
++        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4),
++    ],
++    key=["M", "N", "BATCH", "b_stride_r", "b_stride_c", "x_stride_r", "x_stride_c", "c_stride_r", "c_stride_c"],
++)
++@triton.jit
++def aX_plus_BX_kernel(
++    B_ptr, X_ptr, C_ptr,
++    M: tl.constexpr, N: tl.constexpr, BATCH: tl.constexpr,
++    b_stride_b, b_stride_r, b_stride_c,
++    x_stride_b, x_stride_r, x_stride_c,
++    c_stride_b, c_stride_r, c_stride_c,
++    alpha,
++    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    batch = tl.program_id(1)
++    num_pid_m = tl.cdiv(M, BLOCK_M)
++    num_pid_n = tl.cdiv(N, BLOCK_N)
++    pid_m, pid_n = tl.swizzle2d(pid // num_pid_n, pid % num_pid_n, num_pid_m, num_pid_n, 8)
++    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    reduction = tl.arange(0, BLOCK_K)
++    B_ptr += batch * b_stride_b
++    X_ptr += batch * x_stride_b
++    C_ptr += batch * c_stride_b
++    accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
++    for block in range(tl.cdiv(M, BLOCK_K)):
++        k = block * BLOCK_K + reduction
++        b = tl.load(B_ptr + rows[:, None] * b_stride_r + k[None, :] * b_stride_c,
++                    mask=(rows[:, None] < M) & (k[None, :] < M), other=0.0)
++        x = tl.load(X_ptr + k[:, None] * x_stride_r + cols[None, :] * x_stride_c,
++                    mask=(k[:, None] < M) & (cols[None, :] < N), other=0.0)
++        accumulator = tl.dot(b, x, accumulator)
++    mask = (rows[:, None] < M) & (cols[None, :] < N)
++    original = tl.load(X_ptr + rows[:, None] * x_stride_r + cols[None, :] * x_stride_c,
++                       mask=mask, other=0.0).to(tl.float32)
++    output = tl.fma(alpha, original, accumulator).to(C_ptr.dtype.element_ty)
++    tl.store(C_ptr + rows[:, None] * c_stride_r + cols[None, :] * c_stride_c, output, mask=mask)
++
++
++def aX_plus_BX(B: Tensor, X: Tensor, alpha: float, out: Tensor):
++    M, N = X.shape[-2:]
++    batch_size = X.size(0) if X.ndim == 3 else 1
++    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), batch_size)
++    aX_plus_BX_kernel[grid](
++        B, X, out, M, N, batch_size,
++        B.stride(0) if B.ndim == 3 else 0, B.stride(-2), B.stride(-1),
++        X.stride(0) if X.ndim == 3 else 0, X.stride(-2), X.stride(-1),
++        out.stride(0) if out.ndim == 3 else 0, out.stride(-2), out.stride(-1),
++        alpha,
++    )
++    return out
++
++
+ # Computed for num_iters=5, safety_factor=2e-2, cushion=2
+ polar_express_coeffs = [
+     (8.156554524902461, -22.48329292557795, 15.878769915207462),
+@@ -299,7 +358,7 @@ def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool =
+     if split_baddbmm:
+         BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
+     else:
+-        aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
++        addmm = torch.baddbmm if X.ndim > 2 else torch.addmm
+ 
+     # Perform the iterations
+     for a, b, c in polar_express_coeffs:
+@@ -311,8 +370,10 @@ def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool =
+         if split_baddbmm:
+             BX_matmul(B, X, out=C)  # C = B @ X  
+             C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
++        elif X.is_cuda:
++            aX_plus_BX(B, X, alpha=a, out=C)
+         else:
+-            aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
++            addmm(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+ 
+         X, C = C, X  # Swap references to avoid unnecessary copies
+ 
+

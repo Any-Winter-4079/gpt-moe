@@ -1,0 +1,272 @@
+diff --git a/model/feedforward/moe.py b/model/feedforward/moe.py
+index 0ad2c8e..915aa52 100644
+--- a/model/feedforward/moe.py
++++ b/model/feedforward/moe.py
+@@ -9,6 +9,7 @@ from torch.nn import functional as F
+ 
+ from ..linear.grouped import grouped_linear
+ from ..linear.grouped_fp8 import grouped_linear_fp8, grouped_linear_fp8_relu2
++from ..linear.grouped_fp8_mlp import grouped_mlp_fp8_relu2
+ from ..linear.linear import Linear
+ from .mlp import MLP
+ 
+@@ -92,33 +93,43 @@ class MoE(nn.Module):
+ 
+         # stack for computation while keeping each 2d parameter and its Muon update
+         up_weight = torch.stack([expert.up_proj.weight for expert in self.experts])
+-        if self.experts[0].up_proj.precision == "fp8":
+-            packed = grouped_linear_fp8(packed, up_weight, offsets, self.fp8_wgrad_backend)
+-        else:
+-            dtype = torch.get_autocast_dtype(hidden_states.device.type) if torch.is_autocast_enabled(hidden_states.device.type) else up_weight.dtype
+-            packed = grouped_linear(packed.to(dtype), up_weight.to(dtype), offsets)
+-        if self.experts[0].up_proj.bias is not None:
+-            up_bias = torch.stack([expert.up_proj.bias for expert in self.experts]).to(packed.dtype)
+-            packed = packed + up_bias[expert_indices]
+-        fuse_relu2 = (
++        fuse_projections = (
+             self.experts[0].activation_name == "relu2"
++            and self.experts[0].up_proj.precision == "fp8"
+             and self.experts[0].down_proj.precision == "fp8"
+-            and packed.dtype == torch.bfloat16
++            and self.experts[0].up_proj.bias is None
++            and self.experts[0].down_proj.bias is None
+         )
+-        if not fuse_relu2:
+-            packed = self.experts[0].activate(packed)
+         down_weight = torch.stack([expert.down_proj.weight for expert in self.experts])
+-        if self.experts[0].down_proj.precision == "fp8":
+-            if fuse_relu2:
+-                packed = grouped_linear_fp8_relu2(packed, down_weight, offsets, self.fp8_wgrad_backend)
+-            else:
+-                packed = grouped_linear_fp8(packed, down_weight, offsets, self.fp8_wgrad_backend)
++        if fuse_projections:
++            packed = grouped_mlp_fp8_relu2(packed, up_weight, down_weight, offsets, self.fp8_wgrad_backend)
+         else:
+-            dtype = torch.get_autocast_dtype(hidden_states.device.type) if torch.is_autocast_enabled(hidden_states.device.type) else down_weight.dtype
+-            packed = grouped_linear(packed.to(dtype), down_weight.to(dtype), offsets)
+-        if self.experts[0].down_proj.bias is not None:
+-            down_bias = torch.stack([expert.down_proj.bias for expert in self.experts]).to(packed.dtype)
+-            packed = packed + down_bias[expert_indices]
++            if self.experts[0].up_proj.precision == "fp8":
++                packed = grouped_linear_fp8(packed, up_weight, offsets, self.fp8_wgrad_backend)
++            else:
++                dtype = torch.get_autocast_dtype(hidden_states.device.type) if torch.is_autocast_enabled(hidden_states.device.type) else up_weight.dtype
++                packed = grouped_linear(packed.to(dtype), up_weight.to(dtype), offsets)
++            if self.experts[0].up_proj.bias is not None:
++                up_bias = torch.stack([expert.up_proj.bias for expert in self.experts]).to(packed.dtype)
++                packed = packed + up_bias[expert_indices]
++            fuse_relu2 = (
++                self.experts[0].activation_name == "relu2"
++                and self.experts[0].down_proj.precision == "fp8"
++                and packed.dtype == torch.bfloat16
++            )
++            if not fuse_relu2:
++                packed = self.experts[0].activate(packed)
++            if self.experts[0].down_proj.precision == "fp8":
++                if fuse_relu2:
++                    packed = grouped_linear_fp8_relu2(packed, down_weight, offsets, self.fp8_wgrad_backend)
++                else:
++                    packed = grouped_linear_fp8(packed, down_weight, offsets, self.fp8_wgrad_backend)
++            else:
++                dtype = torch.get_autocast_dtype(hidden_states.device.type) if torch.is_autocast_enabled(hidden_states.device.type) else down_weight.dtype
++                packed = grouped_linear(packed.to(dtype), down_weight.to(dtype), offsets)
++            if self.experts[0].down_proj.bias is not None:
++                down_bias = torch.stack([expert.down_proj.bias for expert in self.experts]).to(packed.dtype)
++                packed = packed + down_bias[expert_indices]
+ 
+         # restore token/top-k order before summing, avoiding atomic output accumulation
+         inverse_order = torch.empty_like(order).scatter_(0, order, torch.arange(order.numel(), device=order.device))
+diff --git a/model/linear/grouped_fp8_mlp.py b/model/linear/grouped_fp8_mlp.py
+new file mode 100644
+index 0000000..0d026e4
+--- /dev/null
++++ b/model/linear/grouped_fp8_mlp.py
+@@ -0,0 +1,188 @@
++from __future__ import annotations
++
++from typing import Any, Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import triton_op, wrap_triton
++
++from .grouped_fp8 import _backward_gemms, _grouped_fp8_mm, _inverse_scale, _quantize_activations, _quantize_weights_kernel
++
++
++@triton.jit
++def _up_relu2_quantize_kernel(
++    A, Weight, AScale, WeightScale, Preactivation, Row, Column, RowScale, ColumnScale, Offsets,
++    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, NUM_EXPERTS: tl.constexpr,
++    SAVE_COLUMN: tl.constexpr, DEEPGEMM: tl.constexpr, COLUMN_M: tl.constexpr,
++):
++    tile = tl.program_id(0)
++    feature_tile = tl.program_id(1)
++    row = tl.arange(0, 128)
++    col = feature_tile * 128 + tl.arange(0, 128)
++    inner = tl.arange(0, 128)
++    start = 0
++    first_tile = 0
++    first_scale_word = 0
++    for expert in range(NUM_EXPERTS):
++        end = tl.load(Offsets + expert)
++        last_tile = first_tile + tl.cdiv(end - start, 128)
++        if (tile >= first_tile) & (tile < last_tile):
++            local_tile = tile - first_tile
++            expert_row = local_tile * 128 + row
++            token = start + expert_row
++            mask = (token[:, None] < end) & (col[None, :] < N)
++            acc = tl.zeros((128, 128), dtype=tl.float32)
++            for block in range(tl.cdiv(K, 128)):
++                k = block * 128 + inner
++                a = tl.load(
++                    A + token[:, None] * K + k[None, :],
++                    mask=(token[:, None] < end) & (k[None, :] < K), other=0.0,
++                )
++                weight = tl.load(
++                    Weight + (expert * N + col[None, :]) * K + k[:, None],
++                    mask=(col[None, :] < N) & (k[:, None] < K), other=0.0,
++                )
++                a_scale = tl.load(
++                    AScale + token * tl.cdiv(K, 128) + block, mask=token < end, other=0.0,
++                )
++                weight_scale = tl.load(
++                    WeightScale + (expert * tl.cdiv(N, 128) + feature_tile) * tl.cdiv(K, 128) + block,
++                )
++                partial = tl.dot(a, weight, max_num_imprecise_acc=0)
++                acc += partial * a_scale[:, None] * weight_scale
++            preactivation = acc.to(tl.bfloat16)
++            tl.store(Preactivation + token[:, None] * N + col[None, :], preactivation, mask=mask)
++
++            # the producer's 128x128 tile supplies both independent activation scales
++            positive = tl.maximum(preactivation.to(tl.float32), 0.0)
++            values = (positive * positive).to(tl.bfloat16).to(tl.float32)
++            row_scale = _inverse_scale(tl.max(tl.abs(values), axis=1))
++            quantized_row = (values / row_scale[:, None]).to(tl.float8e4nv)
++            tl.store(Row + token[:, None] * N + col[None, :], quantized_row, mask=mask)
++            tl.store(RowScale + token * tl.cdiv(N, 128) + feature_tile, row_scale, mask=token < end)
++
++            if SAVE_COLUMN:
++                column_scale = _inverse_scale(tl.max(tl.abs(values), axis=0))
++                quantized_column = (values / column_scale[None, :]).to(tl.float8e4nv)
++                if DEEPGEMM:
++                    tl.store(
++                        Column + col[None, :] * COLUMN_M + first_tile * 128 + expert_row[:, None],
++                        quantized_column, mask=col[None, :] < N,
++                    )
++                    scale_row = first_scale_word + local_tile // 4
++                    scale_byte = local_tile % 4
++                    scale_ptr = ColumnScale.to(tl.pointer_type(tl.uint8)) + (scale_row * N + col) * 4
++                    exponent = (column_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++                    tl.store(scale_ptr + scale_byte, exponent, mask=col < N)
++                    if tile == last_tile - 1:
++                        for padding in tl.static_range(1, 4):
++                            tl.store(scale_ptr + scale_byte + padding, 0, mask=(col < N) & (scale_byte + padding < 4))
++                else:
++                    tl.store(Column + col[None, :] * M + token[:, None], quantized_column, mask=mask)
++                    scale_row = start // 128 + expert + local_tile
++                    tl.store(ColumnScale + scale_row * N + col, column_scale, mask=col < N)
++        first_scale_word += tl.cdiv(end - start, 512)
++        first_tile = last_tile
++        start = end
++
++
++def _quantize_weight(weight: Tensor) -> Tuple[Tensor, Tensor]:
++    experts, n, k = weight.shape
++    quantized = torch.empty(weight.shape, device=weight.device, dtype=torch.float8_e4m3fn)
++    scale = torch.empty((experts, triton.cdiv(n, 128), triton.cdiv(k, 128)), device=weight.device, dtype=torch.float32)
++    wrap_triton(_quantize_weights_kernel)[(experts, triton.cdiv(n, 128), triton.cdiv(k, 128))](
++        weight, quantized, scale, n, k, *weight.stride(), num_warps=8,
++    )
++    return quantized, scale
++
++
++@triton_op("gpt_moe::grouped_fp8_up_relu2_quantize", mutates_args=())
++def _up_forward(
++    x: Tensor, weight: Tensor, offsets: Tensor, save_backward: bool, deepgemm: bool,
++) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
++    input_row, input_scale, input_column, input_column_scale, _ = _quantize_activations(x, offsets, save_backward, deepgemm)
++    weight_fp8, weight_scale = _quantize_weight(weight)
++    m = x.shape[0]
++    experts, n, k = weight.shape
++    scale_rows = triton.cdiv(m, 128) + experts
++    column_m = scale_rows * 128 if deepgemm else m
++    preactivation = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
++    row = torch.empty((m, n), device=x.device, dtype=torch.float8_e4m3fn)
++    row_scale = torch.empty((m, triton.cdiv(n, 128)), device=x.device, dtype=torch.float32)
++    column = torch.empty((n, column_m) if save_backward else (0,), device=x.device, dtype=torch.float8_e4m3fn)
++    column_scale_rows = triton.cdiv(m, 512) + experts if deepgemm else scale_rows
++    column_scale = torch.empty(
++        (column_scale_rows, n) if save_backward else (0,), device=x.device,
++        dtype=torch.int32 if deepgemm else torch.float32,
++    )
++    wrap_triton(_up_relu2_quantize_kernel)[(scale_rows, triton.cdiv(n, 128))](
++        input_row, weight_fp8, input_scale, weight_scale, preactivation, row, column, row_scale, column_scale,
++        offsets, m, n, k, experts, save_backward, deepgemm, column_m, num_warps=8, num_stages=2,
++    )
++    return preactivation, row, row_scale, column, column_scale, input_column, input_column_scale, weight_fp8, weight_scale
++
++
++def _setup_up_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
++    x, weight, offsets, _, ctx.deepgemm = inputs
++    ctx.input_dtype = x.dtype
++    ctx.weight_dtype = weight.dtype
++    ctx.set_materialize_grads(False)
++    ctx.mark_non_differentiable(*output[1:])
++    ctx.save_for_backward(*output[5:], offsets)
++
++
++def _up_backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
++    x_column, x_scale, weight, weight_scale, offsets = ctx.saved_tensors
++    grad_x, grad_weight = _backward_gemms(
++        grad, x_column, x_scale, weight, weight_scale, offsets, ctx.input_dtype, ctx.weight_dtype, ctx.deepgemm,
++    )
++    return grad_x, grad_weight, None, None, None
++
++
++_up_forward.register_autograd(_up_backward, setup_context=_setup_up_context)
++
++
++@triton_op("gpt_moe::grouped_fp8_down_prepared", mutates_args=())
++def _down_forward(
++    preactivation: Tensor, weight: Tensor, offsets: Tensor, deepgemm: bool,
++    row: Tensor, row_scale: Tensor, column: Tensor, column_scale: Tensor,
++) -> Tuple[Tensor, Tensor, Tensor]:
++    weight_fp8, weight_scale = _quantize_weight(weight)
++    out = _grouped_fp8_mm(
++        row, weight_fp8.transpose(-2, -1), row_scale, weight_scale.transpose(-2, -1), offsets, torch.bfloat16,
++    )
++    return out, weight_fp8, weight_scale
++
++
++def _setup_down_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
++    preactivation, weight, offsets, ctx.deepgemm, _, _, column, column_scale = inputs
++    ctx.input_dtype = preactivation.dtype
++    ctx.weight_dtype = weight.dtype
++    ctx.set_materialize_grads(False)
++    ctx.mark_non_differentiable(*output[1:])
++    ctx.save_for_backward(column, column_scale, *output[1:], offsets, preactivation)
++
++
++def _down_backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
++    x_column, x_scale, weight, weight_scale, offsets, preactivation = ctx.saved_tensors
++    grad_x, grad_weight = _backward_gemms(
++        grad, x_column, x_scale, weight, weight_scale, offsets, ctx.input_dtype, ctx.weight_dtype,
++        ctx.deepgemm, preactivation,
++    )
++    return grad_x, grad_weight, None, None, None, None, None, None
++
++
++_down_forward.register_autograd(_down_backward, setup_context=_setup_down_context)
++
++
++def grouped_mlp_fp8_relu2(
++    x: Tensor, up_weight: Tensor, down_weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton",
++) -> Tensor:
++    if wgrad_backend not in ("triton", "deepgemm"):
++        raise ValueError(f"unsupported grouped FP8 weight-gradient backend: {wgrad_backend}")
++    save_backward = torch.is_grad_enabled() and (x.requires_grad or up_weight.requires_grad or down_weight.requires_grad)
++    deepgemm = wgrad_backend == "deepgemm"
++    preactivation, row, row_scale, column, column_scale, *_ = _up_forward(x, up_weight, offsets, save_backward, deepgemm)
++    return _down_forward(preactivation, down_weight, offsets, deepgemm, row, row_scale, column, column_scale)[0]

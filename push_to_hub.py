@@ -245,7 +245,8 @@ def main():
 
     create_repo(repo_id=hub_repo_id, exist_ok=True, token=HF_TOKEN, repo_type="model")
     print(f"repository created: {hub_repo_id}")
-    push_to_hub(repo_id=hub_repo_id, timestamp=timestamp)
+    if not push_to_hub(repo_id=hub_repo_id, timestamp=timestamp):
+        raise SystemExit(1)
     print(f"repository pushed to HF repo id: {hub_repo_id}")
 
 if __name__ == "__main__":

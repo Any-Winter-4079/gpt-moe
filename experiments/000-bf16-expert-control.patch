@@ -1,0 +1,15 @@
+diff --git a/config/training.py b/config/training.py
+index f6a57ea..8e84ea9 100644
+--- a/config/training.py
++++ b/config/training.py
+@@ -213,8 +213,8 @@ class TrainingConfig:
+             "k_proj": "default",
+             "v_proj": "default",
+             "out_proj": "default",
+-            "up_proj": "fp8",
+-            "down_proj": "fp8",
++            "up_proj": "default",
++            "down_proj": "default",
+             "router": "default",
+             "lm_head": "fp8",
+         },

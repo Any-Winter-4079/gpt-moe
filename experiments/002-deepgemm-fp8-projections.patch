@@ -1,0 +1,323 @@
+diff --git a/config/model.py b/config/model.py
+index e9f2fe9..381f433 100644
+--- a/config/model.py
++++ b/config/model.py
+@@ -80,6 +80,7 @@ class GPTConfig:
+     moe_top_k: int = 2
+     use_grouped_moe: bool = True # packed tokens and grouped projections; False uses the expert loop
+     grouped_fp8_wgrad_backend: str = "deepgemm" # "triton" or "deepgemm" (patched SM120 build)
++    grouped_fp8_projection_backend: str = "deepgemm" # "triton" or "deepgemm" for forward and input gradients
+     # for top-k > 1, use full-softmax gates instead of renormalizing the selected experts; top-1 always uses full softmax
+     moe_full_softmax_gating: bool = False
+ 
+diff --git a/model/feedforward/moe.py b/model/feedforward/moe.py
+index adb02b5..da19dab 100644
+--- a/model/feedforward/moe.py
++++ b/model/feedforward/moe.py
+@@ -27,6 +27,7 @@ class MoE(nn.Module):
+         self.use_bf16_autocast = training_config.use_bf16_autocast
+         self.use_grouped_moe = gpt_config.use_grouped_moe
+         self.fp8_wgrad_backend = gpt_config.grouped_fp8_wgrad_backend
++        self.fp8_projection_backend = gpt_config.grouped_fp8_projection_backend
+         self.router = Linear(gpt_config.d_model, num_experts, role="router", bias=False)
+         self.experts = nn.ModuleList([MLP(gpt_config, training_config) for _ in range(num_experts)])
+ 
+@@ -93,7 +94,7 @@ class MoE(nn.Module):
+         # stack for computation while keeping each 2d parameter and its Muon update
+         up_weight = torch.stack([expert.up_proj.weight for expert in self.experts])
+         if self.experts[0].up_proj.precision == "fp8":
+-            packed = grouped_linear_fp8(packed, up_weight, offsets, self.fp8_wgrad_backend)
++            packed = grouped_linear_fp8(packed, up_weight, offsets, self.fp8_wgrad_backend, self.fp8_projection_backend)
+         else:
+             dtype = torch.get_autocast_dtype(hidden_states.device.type) if torch.is_autocast_enabled(hidden_states.device.type) else up_weight.dtype
+             packed = grouped_linear(packed.to(dtype), up_weight.to(dtype), offsets)
+@@ -103,7 +104,7 @@ class MoE(nn.Module):
+         packed = self.experts[0].activate(packed)
+         down_weight = torch.stack([expert.down_proj.weight for expert in self.experts])
+         if self.experts[0].down_proj.precision == "fp8":
+-            packed = grouped_linear_fp8(packed, down_weight, offsets, self.fp8_wgrad_backend)
++            packed = grouped_linear_fp8(packed, down_weight, offsets, self.fp8_wgrad_backend, self.fp8_projection_backend)
+         else:
+             dtype = torch.get_autocast_dtype(hidden_states.device.type) if torch.is_autocast_enabled(hidden_states.device.type) else down_weight.dtype
+             packed = grouped_linear(packed.to(dtype), down_weight.to(dtype), offsets)
+diff --git a/model/linear/deepgemm.py b/model/linear/deepgemm.py
+index d079524..686350f 100644
+--- a/model/linear/deepgemm.py
++++ b/model/linear/deepgemm.py
+@@ -5,6 +5,38 @@ from torch import Tensor
+ from torch.library import custom_op
+ 
+ 
++@custom_op("gpt_moe::deepgemm_fp8_projection", mutates_args=())
++def grouped_fp8_projection(
++    x: Tensor, x_scale: Tensor, weight: Tensor, weight_scale: Tensor,
++    offsets: Tensor, dtype: torch.dtype,
++) -> Tensor:
++    # DeepGEMM b64107f with docker_build/cu134-deepgemm/deepgemm-sm120-fp32-output.patch
++    import deep_gemm
++
++    if torch.cuda.get_device_capability(x.device) != (12, 0):
++        raise ValueError("DeepGEMM grouped FP8 projections require SM120; select the triton backend on other GPUs")
++    if x.shape[1] % 128 or weight.shape[1] % 128:
++        raise ValueError("DeepGEMM grouped FP8 projections require widths divisible by 128")
++    if dtype not in (torch.float32, torch.bfloat16):
++        raise ValueError("DeepGEMM grouped FP8 projections require float32 or bfloat16 outputs")
++    out = torch.empty((x.shape[0], weight.shape[1]), device=x.device, dtype=dtype)
++    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
++        (x, x_scale), (weight, weight_scale), out, offsets,
++        recipe=(1, 1, 128), disable_ue8m0_cast=True,
++        use_psum_layout=True, ensure_zero_padding=False,
++        expected_m_for_psum_layout=x.shape[0] // offsets.numel(),
++    )
++    return out
++
++
++@grouped_fp8_projection.register_fake
++def _fake_grouped_fp8_projection(
++    x: Tensor, x_scale: Tensor, weight: Tensor, weight_scale: Tensor,
++    offsets: Tensor, dtype: torch.dtype,
++) -> Tensor:
++    return torch.empty((x.shape[0], weight.shape[1]), device=x.device, dtype=dtype)
++
++
+ @custom_op("gpt_moe::deepgemm_fp8_wgrad", mutates_args=())
+ def grouped_fp8_wgrad(
+     grad: Tensor, grad_scale: Tensor, x: Tensor, x_scale: Tensor,
+diff --git a/model/linear/grouped_fp8.py b/model/linear/grouped_fp8.py
+index b4550dc..986113d 100644
+--- a/model/linear/grouped_fp8.py
++++ b/model/linear/grouped_fp8.py
+@@ -8,7 +8,7 @@ import triton.language as tl
+ from torch import Tensor
+ from torch.library import triton_op, wrap_triton
+ 
+-from .deepgemm import grouped_fp8_wgrad
++from .deepgemm import grouped_fp8_projection, grouped_fp8_wgrad
+ 
+ 
+ @triton.jit
+@@ -24,6 +24,7 @@ def _quantize_activations_kernel(
+     M: tl.constexpr, K: tl.constexpr, NUM_EXPERTS: tl.constexpr,
+     stride_m: tl.constexpr, stride_k: tl.constexpr, SAVE_COLUMN: tl.constexpr,
+     DEEPGEMM: tl.constexpr, COLUMN_M: tl.constexpr, WRITE_OFFSETS: tl.constexpr,
++    GROUP_M: tl.constexpr, ROW_M: tl.constexpr,
+ ):
+     tile = tl.program_id(0)
+     col = tl.program_id(1) * 128 + tl.arange(0, 128)
+@@ -42,11 +43,24 @@ def _quantize_activations_kernel(
+             ).to(tl.float32)
+             row_scale = _inverse_scale(tl.max(tl.abs(values), axis=1))
+             quantized = (values / row_scale[:, None]).to(tl.float8e4nv)
+-            tl.store(Row + (start + row[:, None]) * K + col[None, :], quantized, mask=mask)
+-            tl.store(
+-                RowScale + (start + row) * tl.cdiv(K, 128) + tl.program_id(1),
+-                row_scale, mask=start + row < end,
+-            )
++            if GROUP_M:
++                # write each expert directly into its 128-aligned M-grouped layout
++                padded_row = first_tile * 128 + row
++                tl.store(Row + padded_row[:, None] * K + col[None, :], quantized, mask=col[None, :] < K)
++                word = tl.program_id(1) // 4
++                byte = tl.program_id(1) % 4
++                scale_ptr = RowScale.to(tl.pointer_type(tl.uint8)) + (word * ROW_M + padded_row) * 4
++                exponent = (row_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++                tl.store(scale_ptr + byte, exponent)
++                if tl.program_id(1) == tl.cdiv(K, 128) - 1:
++                    for padding in tl.static_range(1, 4):
++                        tl.store(scale_ptr + byte + padding, 0, mask=byte + padding < 4)
++            else:
++                tl.store(Row + (start + row[:, None]) * K + col[None, :], quantized, mask=mask)
++                tl.store(
++                    RowScale + (start + row) * tl.cdiv(K, 128) + tl.program_id(1),
++                    row_scale, mask=start + row < end,
++                )
+             if SAVE_COLUMN:
+                 # transpose quantization uses 128 tokens from the same expert per scale
+                 column_scale = _inverse_scale(tl.max(tl.abs(values), axis=0))
+@@ -83,9 +97,10 @@ def _quantize_activations_kernel(
+ 
+ @triton.jit
+ def _quantize_weights_kernel(
+-    W, Quantized, Scale,
++    W, Quantized, Scale, Transposed, PackedScale, TransposedScale,
+     N: tl.constexpr, K: tl.constexpr,
+     stride_e: tl.constexpr, stride_n: tl.constexpr, stride_k: tl.constexpr,
++    GROUP_M: tl.constexpr, SAVE_TRANSPOSE: tl.constexpr,
+ ):
+     expert = tl.program_id(0)
+     row = tl.program_id(1) * 128 + tl.arange(0, 128)
+@@ -102,6 +117,56 @@ def _quantize_weights_kernel(
+         Scale + (expert * tl.cdiv(N, 128) + tl.program_id(1)) * tl.cdiv(K, 128) + tl.program_id(2),
+         scale,
+     )
++    if GROUP_M:
++        exponent = (scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++        word = tl.program_id(2) // 4
++        byte = tl.program_id(2) % 4
++        scale_ptr = PackedScale.to(tl.pointer_type(tl.uint8)) + ((expert * tl.cdiv(K, 512) + word) * N + row) * 4
++        tl.store(scale_ptr + byte, exponent, mask=row < N)
++        if tl.program_id(2) == tl.cdiv(K, 128) - 1:
++            for padding in tl.static_range(1, 4):
++                tl.store(scale_ptr + byte + padding, 0, mask=(row < N) & (byte + padding < 4))
++        if SAVE_TRANSPOSE:
++            tl.store(
++                Transposed + expert * K * N + col[None, :] * N + row[:, None], quantized, mask=mask,
++            )
++            word = tl.program_id(1) // 4
++            byte = tl.program_id(1) % 4
++            scale_ptr = TransposedScale.to(tl.pointer_type(tl.uint8)) + ((expert * tl.cdiv(N, 512) + word) * K + col) * 4
++            tl.store(scale_ptr + byte, exponent, mask=col < K)
++            if tl.program_id(1) == tl.cdiv(N, 128) - 1:
++                for padding in tl.static_range(1, 4):
++                    tl.store(scale_ptr + byte + padding, 0, mask=(col < K) & (byte + padding < 4))
++
++
++@triton.jit
++def _unpad_projection_kernel(Padded, Out, Offsets, M: tl.constexpr, N: tl.constexpr, NUM_EXPERTS: tl.constexpr):
++    tile = tl.program_id(0)
++    col = tl.program_id(1) * 128 + tl.arange(0, 128)
++    start = 0
++    first_tile = 0
++    for expert in range(NUM_EXPERTS):
++        end = tl.load(Offsets + expert)
++        last_tile = first_tile + tl.cdiv(end - start, 128)
++        if (tile >= first_tile) & (tile < last_tile):
++            row = (tile - first_tile) * 128 + tl.arange(0, 128)
++            mask = (start + row[:, None] < end) & (col[None, :] < N)
++            values = tl.load(Padded + (first_tile * 128 + row[:, None]) * N + col[None, :], mask=mask, other=0)
++            tl.store(Out + (start + row[:, None]) * N + col[None, :], values, mask=mask)
++        first_tile = last_tile
++        start = end
++
++
++def _deepgemm_projection(
++    row: Tensor, row_scale: Tensor, weight: Tensor, weight_scale: Tensor,
++    offsets: Tensor, padded_offsets: Tensor, m: int, dtype: torch.dtype,
++) -> Tensor:
++    padded = grouped_fp8_projection(row, row_scale.t(), weight, weight_scale.transpose(-2, -1), padded_offsets, dtype)
++    out = torch.empty((m, weight.shape[1]), device=row.device, dtype=dtype)
++    wrap_triton(_unpad_projection_kernel)[(row.shape[0] // 128, triton.cdiv(out.shape[1], 128))](
++        padded, out, offsets, m, out.shape[1], offsets.numel(), num_warps=8,
++    )
++    return out
+ 
+ 
+ @triton.autotune(
+@@ -183,11 +248,16 @@ def _grouped_fp8_mm_kernel(
+ 
+ def _quantize_activations(
+     x: Tensor, offsets: Tensor, save_column: bool, deepgemm: bool = False, write_offsets: bool = False,
++    group_m: bool = False,
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+     m, k = x.shape
+     scale_rows = triton.cdiv(m, 128) + offsets.numel()
+-    row = torch.empty((m, k), device=x.device, dtype=torch.float8_e4m3fn)
+-    row_scale = torch.empty((m, triton.cdiv(k, 128)), device=x.device, dtype=torch.float32)
++    row_m = scale_rows * 128 if group_m else m
++    row = torch.empty((row_m, k), device=x.device, dtype=torch.float8_e4m3fn)
++    row_scale = torch.empty(
++        (triton.cdiv(k, 512), row_m) if group_m else (m, triton.cdiv(k, 128)),
++        device=x.device, dtype=torch.int32 if group_m else torch.float32,
++    )
+     column_m = scale_rows * 128 if deepgemm else m
+     column = torch.empty((k, column_m) if save_column else (0,), device=x.device, dtype=torch.float8_e4m3fn)
+     column_scale_rows = triton.cdiv(m, 512) + offsets.numel() if deepgemm else scale_rows
+@@ -198,7 +268,7 @@ def _quantize_activations(
+     padded_offsets = torch.empty(offsets.shape if write_offsets else (0,), device=x.device, dtype=torch.int32)
+     wrap_triton(_quantize_activations_kernel)[(scale_rows, triton.cdiv(k, 128))](
+         x, row, column, row_scale, column_scale, offsets, padded_offsets,
+-        m, k, offsets.numel(), *x.stride(), save_column, deepgemm, column_m, write_offsets, num_warps=8,
++        m, k, offsets.numel(), *x.stride(), save_column, deepgemm, column_m, write_offsets, group_m, row_m, num_warps=8,
+     )
+     return row, row_scale, column, column_scale, padded_offsets
+ 
+@@ -221,29 +291,40 @@ def _grouped_fp8_mm(a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, offs
+ 
+ @triton_op("gpt_moe::grouped_linear_fp8_forward", mutates_args=())
+ def _forward(
+-    x: Tensor, weight: Tensor, offsets: Tensor, save_backward: bool, deepgemm: bool,
+-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+-    row, row_scale, column, column_scale, _ = _quantize_activations(x, offsets, save_backward, deepgemm)
++    x: Tensor, weight: Tensor, offsets: Tensor, save_backward: bool, deepgemm: bool, group_m: bool,
++) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
++    row, row_scale, column, column_scale, padded_offsets = _quantize_activations(x, offsets, save_backward, deepgemm, group_m, group_m)
+     experts, n, k = weight.shape
+     weight_fp8 = torch.empty(weight.shape, device=weight.device, dtype=torch.float8_e4m3fn)
+     weight_scale = torch.empty((experts, triton.cdiv(n, 128), triton.cdiv(k, 128)), device=weight.device, dtype=torch.float32)
++    weight_t = torch.empty((experts, k, n) if group_m and save_backward else (0,), device=weight.device, dtype=torch.float8_e4m3fn)
++    forward_scale = torch.empty((experts, triton.cdiv(k, 512), n) if group_m else (0,), device=weight.device, dtype=torch.int32)
++    transpose_scale = torch.empty((experts, triton.cdiv(n, 512), k) if group_m and save_backward else (0,), device=weight.device, dtype=torch.int32)
+     wrap_triton(_quantize_weights_kernel)[(experts, triton.cdiv(n, 128), triton.cdiv(k, 128))](
+-        weight, weight_fp8, weight_scale, n, k, *weight.stride(), num_warps=8,
++        weight, weight_fp8, weight_scale, weight_t, forward_scale, transpose_scale,
++        n, k, *weight.stride(), group_m, group_m and save_backward, num_warps=8,
+     )
+-    out = _grouped_fp8_mm(
+-        row, weight_fp8.transpose(-2, -1), row_scale, weight_scale.transpose(-2, -1), offsets, torch.bfloat16,
+-    )
+-    return out, column, column_scale, weight_fp8, weight_scale
++    if group_m:
++        out = _deepgemm_projection(row, row_scale, weight_fp8, forward_scale, offsets, padded_offsets, x.shape[0], torch.bfloat16)
++    else:
++        out = _grouped_fp8_mm(
++            row, weight_fp8.transpose(-2, -1), row_scale, weight_scale.transpose(-2, -1), offsets, torch.bfloat16,
++        )
++    return out, column, column_scale, weight_fp8, weight_scale, weight_t, transpose_scale
+ 
+ 
+ @triton_op("gpt_moe::grouped_linear_fp8_backward", mutates_args=())
+ def _backward_gemms(
+     grad: Tensor, x_column: Tensor, x_scale: Tensor, weight: Tensor, weight_scale: Tensor,
++    weight_t: Tensor, transpose_scale: Tensor,
+     offsets: Tensor, input_dtype: torch.dtype, weight_dtype: torch.dtype,
+-    deepgemm: bool,
++    deepgemm: bool, group_m: bool,
+ ) -> Tuple[Tensor, Tensor]:
+-    row, row_scale, column, column_scale, padded_offsets = _quantize_activations(grad, offsets, True, deepgemm, deepgemm)
+-    grad_x = _grouped_fp8_mm(row, weight, row_scale, weight_scale, offsets, input_dtype)
++    row, row_scale, column, column_scale, padded_offsets = _quantize_activations(grad, offsets, True, deepgemm, deepgemm or group_m, group_m)
++    if group_m:
++        grad_x = _deepgemm_projection(row, row_scale, weight_t, transpose_scale, offsets, padded_offsets, grad.shape[0], input_dtype)
++    else:
++        grad_x = _grouped_fp8_mm(row, weight, row_scale, weight_scale, offsets, input_dtype)
+     if deepgemm:
+         grad_weight = grouped_fp8_wgrad(column, column_scale, x_column, x_scale, padded_offsets, weight_dtype)
+     else:
+@@ -252,7 +333,7 @@ def _backward_gemms(
+ 
+ 
+ def _setup_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
+-    x, weight, offsets, _, ctx.deepgemm = inputs
++    x, weight, offsets, _, ctx.deepgemm, ctx.group_m = inputs
+     ctx.input_dtype = x.dtype
+     ctx.weight_dtype = weight.dtype
+     ctx.set_materialize_grads(False)
+@@ -261,18 +342,23 @@ def _setup_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
+ 
+ 
+ def _backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
+-    x_column, x_scale, weight, weight_scale, offsets = ctx.saved_tensors
++    x_column, x_scale, weight, weight_scale, weight_t, transpose_scale, offsets = ctx.saved_tensors
+     grad_x, grad_weight = _backward_gemms(
+-        grad, x_column, x_scale, weight, weight_scale, offsets, ctx.input_dtype, ctx.weight_dtype, ctx.deepgemm,
++        grad, x_column, x_scale, weight, weight_scale, weight_t, transpose_scale,
++        offsets, ctx.input_dtype, ctx.weight_dtype, ctx.deepgemm, ctx.group_m,
+     )
+-    return grad_x, grad_weight, None, None, None
++    return grad_x, grad_weight, None, None, None, None
+ 
+ 
+ _forward.register_autograd(_backward, setup_context=_setup_context)
+ 
+ 
+-def grouped_linear_fp8(x: Tensor, weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton") -> Tensor:
++def grouped_linear_fp8(
++    x: Tensor, weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton", projection_backend: str = "triton",
++) -> Tensor:
+     if wgrad_backend not in ("triton", "deepgemm"):
+         raise ValueError(f"unsupported grouped FP8 weight-gradient backend: {wgrad_backend}")
++    if projection_backend not in ("triton", "deepgemm"):
++        raise ValueError(f"unsupported grouped FP8 projection backend: {projection_backend}")
+     save_backward = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
+-    return _forward(x, weight, offsets, save_backward, wgrad_backend == "deepgemm")[0]
++    return _forward(x, weight, offsets, save_backward, wgrad_backend == "deepgemm", projection_backend == "deepgemm")[0]

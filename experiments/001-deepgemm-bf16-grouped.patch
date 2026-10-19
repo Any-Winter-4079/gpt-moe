@@ -1,0 +1,154 @@
+diff --git a/config/training.py b/config/training.py
+index f6a57ea..8e84ea9 100644
+--- a/config/training.py
++++ b/config/training.py
+@@ -213,8 +213,8 @@ class TrainingConfig:
+             "k_proj": "default",
+             "v_proj": "default",
+             "out_proj": "default",
+-            "up_proj": "fp8",
+-            "down_proj": "fp8",
++            "up_proj": "default",
++            "down_proj": "default",
+             "router": "default",
+             "lm_head": "fp8",
+         },
+diff --git a/model/linear/deepgemm_bf16.py b/model/linear/deepgemm_bf16.py
+new file mode 100644
+index 0000000..4754127
+--- /dev/null
++++ b/model/linear/deepgemm_bf16.py
+@@ -0,0 +1,111 @@
++from __future__ import annotations
++
++from typing import Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import custom_op
++
++
++@triton.jit
++def _copy_rows_kernel(
++    X, Out, Offsets, Layout,
++    K: tl.constexpr, NUM_EXPERTS: tl.constexpr,
++    x_stride_m: tl.constexpr, x_stride_k: tl.constexpr,
++    out_stride_m: tl.constexpr, UNPACK: tl.constexpr,
++):
++    tile = tl.program_id(0)
++    row = tl.arange(0, 128)
++    col = tl.program_id(1) * 128 + tl.arange(0, 128)
++    first_tile = 0
++    start = 0
++    for expert in range(NUM_EXPERTS):
++        end = tl.load(Offsets + expert)
++        count = end - start
++        last_tile = first_tile + tl.cdiv(count, 128)
++        if (tile >= first_tile) & (tile < last_tile):
++            local_row = (tile - first_tile) * 128 + row
++            packed_row = tile * 128 + row
++            logical_row = start + local_row
++            mask = (local_row[:, None] < count) & (col[None, :] < K)
++            if UNPACK:
++                values = tl.load(
++                    X + packed_row[:, None] * x_stride_m + col[None, :] * x_stride_k,
++                    mask=mask, other=0.0,
++                )
++                tl.store(Out + logical_row[:, None] * out_stride_m + col[None, :], values, mask=mask)
++            else:
++                values = tl.load(
++                    X + logical_row[:, None] * x_stride_m + col[None, :] * x_stride_k,
++                    mask=mask, other=0.0,
++                )
++                tl.store(
++                    Out + packed_row[:, None] * out_stride_m + col[None, :], values,
++                    mask=col[None, :] < K,
++                )
++        if not UNPACK:
++            if (tile == 0) & (tl.program_id(1) == 0):
++                # PSUM stores each logical end after aligning the preceding expert
++                tl.store(Layout + expert, first_tile * 128 + count)
++        first_tile = last_tile
++        start = end
++    if not UNPACK:
++        if tile >= first_tile:
++            tl.store(
++                Out + (tile * 128 + row[:, None]) * out_stride_m + col[None, :], 0.0,
++                mask=col[None, :] < K,
++            )
++
++
++def _pack_rows(x: Tensor, offsets: Tensor) -> Tuple[Tensor, Tensor]:
++    rows = (triton.cdiv(x.shape[0], 128) + offsets.numel()) * 128
++    out = x.new_empty((rows, x.shape[1]))
++    layout = torch.empty_like(offsets)
++    _copy_rows_kernel[(rows // 128, triton.cdiv(x.shape[1], 128))](
++        x, out, offsets, layout, x.shape[1], offsets.numel(), *x.stride(), out.stride(0), False,
++        num_warps=8,
++    )
++    return out, layout
++
++
++def _unpack_rows(x: Tensor, offsets: Tensor, rows: int) -> Tensor:
++    out = x.new_empty((rows, x.shape[1]))
++    _copy_rows_kernel[(x.shape[0] // 128, triton.cdiv(x.shape[1], 128))](
++        x, out, offsets, offsets, x.shape[1], offsets.numel(), *x.stride(), out.stride(0), True,
++        num_warps=8,
++    )
++    return out
++
++
++@custom_op("gpt_moe::deepgemm_grouped_bf16_mm", mutates_args=())
++def grouped_bf16_mm(a: Tensor, b: Tensor, offsets: Tensor) -> Tensor:
++    import deep_gemm
++
++    if torch.cuda.get_device_capability(a.device) != (12, 0):
++        raise ValueError("the DeepGEMM grouped BF16 experiment requires SM120")
++    if deep_gemm.get_mk_alignment_for_contiguous_layout() != 128:
++        raise ValueError("the DeepGEMM grouped BF16 experiment requires 128-row alignment")
++    if b.ndim == 2:
++        grad, layout = _pack_rows(a.t(), offsets)
++        x, _ = _pack_rows(b, offsets)
++        out = a.new_empty((offsets.numel(), a.shape[0], b.shape[1]))
++        deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
++            grad, x, out, None, layout, use_psum_layout=True,
++        )
++        return out
++
++    x, layout = _pack_rows(a, offsets)
++    out = a.new_empty((x.shape[0], b.shape[2]))
++    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
++        x, b.transpose(-2, -1), out, layout, use_psum_layout=True, ensure_zero_padding=False,
++    )
++    return _unpack_rows(out, offsets, a.shape[0])
++
++
++@grouped_bf16_mm.register_fake
++def _fake_grouped_bf16_mm(a: Tensor, b: Tensor, offsets: Tensor) -> Tensor:
++    if b.ndim == 2:
++        return a.new_empty((offsets.numel(), a.shape[0], b.shape[1]))
++    return a.new_empty((a.shape[0], b.shape[2]))
+diff --git a/model/linear/grouped.py b/model/linear/grouped.py
+index a7dcc2c..4f420f5 100644
+--- a/model/linear/grouped.py
++++ b/model/linear/grouped.py
+@@ -8,6 +8,8 @@ import triton.language as tl
+ from torch import Tensor
+ from torch.library import triton_op, wrap_triton
+ 
++from .deepgemm_bf16 import grouped_bf16_mm
++
+ 
+ @triton.autotune(
+     configs=[
+@@ -71,6 +73,8 @@ def _grouped_mm_kernel(
+ 
+ 
+ def _grouped_mm(a: Tensor, b: Tensor, offsets: Tensor) -> Tensor:
++    if a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16:
++        return grouped_bf16_mm(a, b, offsets)
+     # 2d @ 3d partitions output rows; 2d @ 2d partitions the weight-gradient reduction
+     group_k = b.ndim == 2
+     m, k = a.shape

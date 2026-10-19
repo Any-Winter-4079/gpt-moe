@@ -1,0 +1,45 @@
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+index 54cb635..ef2e0a9 100644
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -106,6 +106,17 @@ zeropower_backends = dict(
+ )
+ 
+ 
++@torch.compile(dynamic=False, fullgraph=True)
++def row_energy_weighted_update(G: Tensor, update: Tensor) -> Tensor:
++    # restore bounded row activity and match the projected norm before output rounding
++    row_rms = G.float().square().mean(dim=-1, keepdim=True).sqrt()
++    gain = (row_rms / row_rms.mean(dim=-2, keepdim=True).clamp_min(1e-12)).sqrt().clamp(0.5, 2.0)
++    weighted = update * gain
++    original_norm = update.float().norm(dim=(-2, -1), keepdim=True)
++    weighted_norm = weighted.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
++    return (weighted * (original_norm / weighted_norm)).to(update.dtype)
++
++
+ class Muon(torch.optim.Optimizer):
+     """
+     Muon: MomentUm Orthogonalized by Newton-Schulz
+@@ -171,7 +182,8 @@ class Muon(torch.optim.Optimizer):
+                         key = (update.shape, update.device, update.dtype)
+                         buckets.setdefault(key, []).append((weight, update))
+                     else:
+-                        update = zeropower_backend(update, steps=group['backend_steps'])
++                        projected = zeropower_backend(update, steps=group['backend_steps'])
++                        update = row_energy_weighted_update(update, projected)
+                         scale = max(update.shape) ** 0.5
+                         weight.add_(update, alpha=-lr * scale)
+ 
+@@ -179,8 +191,9 @@ class Muon(torch.optim.Optimizer):
+                 # bound temporary memory while batching independent matrix updates
+                 for start in range(0, len(bucket), 8):
+                     batch = bucket[start:start + 8]
+-                    updates = torch.stack([g for _, g in batch])
+-                    updates = zeropower_backend(updates, steps=group['backend_steps'])
++                    gradients = torch.stack([g for _, g in batch])
++                    updates = zeropower_backend(gradients, steps=group['backend_steps'])
++                    updates = row_energy_weighted_update(gradients, updates)
+                     scale = max(updates.shape[-2:]) ** 0.5
+                     for (weight, _), update in zip(batch, updates):
+                         weight.add_(update, alpha=-lr * scale)
+

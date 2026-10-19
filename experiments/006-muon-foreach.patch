@@ -1,0 +1,102 @@
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+index 54cb635..56fce6d 100644
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -4,6 +4,8 @@ from typing import Iterable, Optional
+ 
+ import torch
+ import torch.nn as nn
++import triton
++import triton.language as tl
+ from torch import Tensor
+ 
+ from .polar_express import zeropower_via_polar_express
+@@ -106,6 +108,37 @@ zeropower_backends = dict(
+ )
+ 
+ 
++@triton.jit
++def apply_muon_updates_kernel(
++    Weights, Updates,
++    M: tl.constexpr, N: tl.constexpr,
++    stride_b: tl.constexpr, stride_m: tl.constexpr, stride_n: tl.constexpr,
++    alpha,
++    BLOCK: tl.constexpr,
++):
++    matrix = tl.program_id(0)
++    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    mask = offsets < M * N
++    update_offsets = matrix * stride_b + (offsets // N) * stride_m + (offsets % N) * stride_n
++    update = tl.load(Updates + update_offsets, mask=mask, other=0).to(tl.float32)
++    for index in tl.static_range(len(Weights)):
++        if matrix == index:
++            weight = tl.load(Weights[index] + offsets, mask=mask, other=0)
++            tl.store(Weights[index] + offsets, tl.fma(update, alpha, weight), mask=mask)
++
++
++def apply_muon_updates(weights, updates: Tensor, alpha: float) -> None:
++    if updates.is_cuda and all(weight.dtype == torch.float32 and weight.is_contiguous() for weight in weights):
++        # tuple arguments pass the existing weight pointers without a device metadata allocation
++        apply_muon_updates_kernel[(len(weights), triton.cdiv(updates.size(-2) * updates.size(-1), 1024))](
++            tuple(weights), updates, updates.size(-2), updates.size(-1),
++            *updates.stride(), alpha, BLOCK=1024,
++        )
++    else:
++        for weight, update in zip(weights, updates):
++            weight.add_(update, alpha=alpha)
++
++
+ class Muon(torch.optim.Optimizer):
+     """
+     Muon: MomentUm Orthogonalized by Newton-Schulz
+@@ -149,6 +182,10 @@ class Muon(torch.optim.Optimizer):
+             momentum = group['momentum']
+             zeropower_backend = zeropower_backends[group['backend']]
+             buckets = {}
++            params = []
++            gradients = []
++            buffers = []
++            prepared = []
+             for p in group['params']:
+                 g = p.grad
+                 if g is None:
+@@ -157,11 +194,26 @@ class Muon(torch.optim.Optimizer):
+                 if 'momentum_buffer' not in state:
+                     state['momentum_buffer'] = torch.zeros_like(g)
+                 buf = state['momentum_buffer']
+-                buf.mul_(momentum).add_(g)
+-                if group['nesterov']:
+-                    g.add_(buf, alpha=momentum)
++                params.append(p)
++                if g.dtype == torch.float32:
++                    gradients.append(g)
++                    buffers.append(buf)
+                 else:
+-                    g = buf
++                    # retain the scalar path's rounding for reduced precision momentum
++                    buf.mul_(momentum).add_(g)
++                    if group['nesterov']:
++                        g.add_(buf, alpha=momentum)
++                prepared.append(g if group['nesterov'] else buf)
++
++            if not params:
++                continue
++            # batch pointwise work across parameters without changing momentum or projection math
++            if gradients:
++                torch._foreach_mul_(buffers, momentum)
++                torch._foreach_add_(buffers, gradients)
++                if group['nesterov']:
++                    torch._foreach_add_(gradients, buffers, alpha=momentum)
++            for p, g in zip(params, prepared):
+                 if g.size(0) == 3 * g.size(1):  # split (3d, d) matrices into three (d, d) updates
+                     updates = zip(p.data.split(g.size(1)), g.split(g.size(1)))
+                 else:
+@@ -182,6 +234,5 @@ class Muon(torch.optim.Optimizer):
+                     updates = torch.stack([g for _, g in batch])
+                     updates = zeropower_backend(updates, steps=group['backend_steps'])
+                     scale = max(updates.shape[-2:]) ** 0.5
+-                    for (weight, _), update in zip(batch, updates):
+-                        weight.add_(update, alpha=-lr * scale)
++                    apply_muon_updates([weight for weight, _ in batch], updates, alpha=-lr * scale)
+ # -- End of (modified) source: https://github.com/tyler-romero/nanogpt-speedrun/blob/main/src/train_gpt2.py --
+

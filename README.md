@@ -107,6 +107,23 @@ docker buildx build --platform linux/amd64 \
 
 Use `anywinter4079/pytorch:2.16.0.dev20261009-cu134-devel` in the new instance template. The built image contains the installed nightly; starting a container does not reinstall it. Rebuilding later still requires the pinned nightly to remain available in the [PyTorch nightly index](https://download.pytorch.org/whl/nightly/cu134/torch/).
 
+## Build and push the experimental CUDA 13.4 DeepGEMM image
+
+This extends the CUDA 13.4 image above with [DeepGEMM revision b64107f](https://github.com/deepseek-ai/DeepGEMM/tree/b64107f2b9599ca76445b7f62eedf66bae1d095b), its pinned submodules, and two SM120 API patches: GPU offsets for grouped FP8 weight gradients, and FP32 grouped FP8 outputs for the projection experiment. It includes GCC 13, the C++20 standard library, and `libdw-dev`; the compiler selections persist in the image for DeepGEMM's runtime kernel compilation. Ubuntu's repository helper runs explicitly with Python 3.10, while training continues to use Python 3.11.
+
+Run from the repository root with Docker Desktop running. Select `amd64-builder` as above, then build and push under a separate tag:
+
+```bash
+docker buildx build --platform linux/amd64 \
+  -f docker_build/cu134-deepgemm/Dockerfile \
+  -t anywinter4079/pytorch:2.16.0.dev20261009-cu134-deepgemm-experimental \
+  ./docker_build --push
+```
+
+Use `anywinter4079/pytorch:2.16.0.dev20261009-cu134-deepgemm-experimental` in the instance template. The source checkout remains at `/opt/DeepGEMM` for inspecting or rebuilding the installed dependency. The image build checks the required headers and Python imports; GPU kernels compile during the first training warmup on the instance.
+
+The ordered code experiments and their application instructions are in [experiments/README.md](experiments/README.md).
+
 ## Run
 
 ```

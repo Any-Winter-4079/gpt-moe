@@ -1,0 +1,27 @@
+diff --git a/model/linear/grouped_fp8_mlp.py b/model/linear/grouped_fp8_mlp.py
+index 572b746..6185db6 100644
+--- a/model/linear/grouped_fp8_mlp.py
++++ b/model/linear/grouped_fp8_mlp.py
+@@ -11,6 +11,13 @@ from torch.library import triton_op, wrap_triton
+ from .grouped_fp8 import _backward_gemms, _grouped_fp8_mm, _inverse_scale, _quantize_activations, _quantize_weights_kernel
+ 
+ 
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=8, num_stages=2),
++        triton.Config({}, num_warps=16, num_stages=1),
++    ],
++    key=["M", "N", "K", "NUM_EXPERTS", "SAVE_COLUMN", "DEEPGEMM", "COLUMN_M"],
++)
+ @triton.jit
+ def _up_relu2_quantize_kernel(
+     A, Weight, AScale, WeightScale, Preactivation, Row, Column, RowScale, ColumnScale, Offsets,
+@@ -123,7 +130,7 @@ def _up_forward(
+     )
+     wrap_triton(_up_relu2_quantize_kernel)[(scale_rows, triton.cdiv(n, 128))](
+         input_row, weight_fp8, input_scale, weight_scale, preactivation, row, column, row_scale, column_scale,
+-        offsets, m, n, k, experts, save_backward, deepgemm, column_m, num_warps=8, num_stages=2,
++        offsets, m, n, k, experts, save_backward, deepgemm, column_m,
+     )
+     return preactivation, row, row_scale, column, column_scale, input_column, input_column_scale, weight_fp8, weight_scale
+ 

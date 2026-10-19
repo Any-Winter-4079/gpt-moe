@@ -1,0 +1,112 @@
+diff --git a/model/position/rotary.py b/model/position/rotary.py
+--- a/model/position/rotary.py
++++ b/model/position/rotary.py
+@@ -47,6 +47,10 @@
+         cos: Tensor,
+         sin: Tensor,
+         ) -> Tuple[Tensor, Tensor]:
++    if q.is_cuda:
++        from .rotary_triton import apply_rotation_triton
++        return apply_rotation_triton(q, k, cos, sin)
++
+     gpu_batch_size, n_heads, seq_len, head_size = q.shape
+     _, n_kv_heads_k, _, _ = k.shape
+ 
+diff --git a/model/position/rotary_triton.py b/model/position/rotary_triton.py
+new file mode 100644
+index 0000000..604b7bf
+--- /dev/null
++++ b/model/position/rotary_triton.py
+@@ -0,0 +1,92 @@
++from __future__ import annotations
++
++from typing import Any, Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import triton_op, wrap_triton
++
++
++@triton.jit
++def _rotation_kernel(
++    Q, K, Cos, Sin, QOut, KOut,
++    SEQ_LEN: tl.constexpr, HEAD_SIZE: tl.constexpr,
++    Q_HEADS: tl.constexpr, K_HEADS: tl.constexpr,
++    qb: tl.constexpr, qh: tl.constexpr, qt: tl.constexpr, qd: tl.constexpr,
++    kb: tl.constexpr, kh: tl.constexpr, kt: tl.constexpr, kd: tl.constexpr,
++    ct: tl.constexpr, cd: tl.constexpr, st: tl.constexpr, sd: tl.constexpr,
++    INVERSE: tl.constexpr, BLOCK: tl.constexpr,
++):
++    batch_head = tl.program_id(0)
++    batch = batch_head // (Q_HEADS + K_HEADS)
++    head = batch_head % (Q_HEADS + K_HEADS)
++    pair = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    token = pair // (HEAD_SIZE // 2)
++    feature = pair % (HEAD_SIZE // 2)
++    valid = token < SEQ_LEN
++
++    if head < Q_HEADS:
++        base = Q + batch * qb + head * qh + token * qt + 2 * feature * qd
++        a = tl.load(base, valid, 0).to(tl.float32)
++        b = tl.load(base + qd, valid, 0).to(tl.float32)
++        out = QOut + ((batch * Q_HEADS + head) * SEQ_LEN + token) * HEAD_SIZE + 2 * feature
++    else:
++        head -= Q_HEADS
++        base = K + batch * kb + head * kh + token * kt + 2 * feature * kd
++        a = tl.load(base, valid, 0).to(tl.float32)
++        b = tl.load(base + kd, valid, 0).to(tl.float32)
++        out = KOut + ((batch * K_HEADS + head) * SEQ_LEN + token) * HEAD_SIZE + 2 * feature
++
++    c = tl.load(Cos + token * ct + feature * cd, valid, 0).to(tl.float32)
++    s = tl.load(Sin + token * st + feature * sd, valid, 0).to(tl.float32)
++    # retain the eager pointwise product rounding before addition or subtraction
++    ac = (a * c).to(Q.dtype.element_ty).to(tl.float32)
++    bs = (b * s).to(Q.dtype.element_ty).to(tl.float32)
++    a_s = (a * s).to(Q.dtype.element_ty).to(tl.float32)
++    bc = (b * c).to(Q.dtype.element_ty).to(tl.float32)
++    if INVERSE:
++        first = ac + bs
++        second = bc - a_s
++    else:
++        first = ac - bs
++        second = a_s + bc
++    tl.store(out, first.to(Q.dtype.element_ty), valid)
++    tl.store(out + 1, second.to(Q.dtype.element_ty), valid)
++
++
++@triton_op("gpt_moe::rotation", mutates_args=())
++def _rotation(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, inverse: bool) -> Tuple[Tensor, Tensor]:
++    batch, q_heads, seq_len, head_size = q.shape
++    k_heads = k.shape[1]
++    q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
++    k_out = torch.empty(k.shape, device=k.device, dtype=k.dtype)
++    grid = (batch * (q_heads + k_heads), triton.cdiv(seq_len * (head_size // 2), 1024))
++    wrap_triton(_rotation_kernel)[grid](
++        q, k, cos, sin, q_out, k_out, seq_len, head_size, q_heads, k_heads,
++        *q.stride(), *k.stride(), *cos.stride()[-2:], *sin.stride()[-2:],
++        inverse, 1024, num_warps=4, enable_fp_fusion=False,
++    )
++    return q_out, k_out
++
++
++def _setup_context(ctx: Any, inputs: Tuple, output: Tuple[Tensor, Tensor]) -> None:
++    _, _, cos, sin, inverse = inputs
++    ctx.save_for_backward(cos, sin)
++    ctx.inverse = inverse
++
++
++def _backward(ctx: Any, grad_q: Tensor, grad_k: Tensor) -> Tuple:
++    cos, sin = ctx.saved_tensors
++    grad_q, grad_k = _rotation(grad_q, grad_k, cos, sin, not ctx.inverse)
++    return grad_q, grad_k, None, None, None
++
++
++_rotation.register_autograd(_backward, setup_context=_setup_context)
++
++
++def apply_rotation_triton(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
++    if cos.requires_grad or sin.requires_grad:
++        raise ValueError("Triton RoPE requires non-trainable cosine and sine buffers")
++    return _rotation(q, k, cos, sin, False)
