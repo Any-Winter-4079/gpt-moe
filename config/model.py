@@ -54,7 +54,8 @@ class GPTConfig:
     use_qk_norm: bool = True
     qk_norm_type: str = "rms" # "rms" or any other name for "l2"
     qk_scale_init: float = 1.0 # init per-head scale
-    qk_scale_max: float = 5.0 # cap the magnitude of the learned Q/K scales
+    qk_scale_min: float = float("-inf") # lower bound for learned Q/K scales; -inf disables it
+    qk_scale_max: float = 5.0 # upper bound for learned Q/K scales
     qk_eps: float = 1e-6
     use_qk_debug_log: bool = True
 

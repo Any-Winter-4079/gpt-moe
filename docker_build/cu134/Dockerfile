@@ -13,7 +13,8 @@ ENV LD_LIBRARY_PATH="/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 RUN python -m pip install --no-cache-dir --pre --upgrade torch==2.16.0.dev20261009+cu134 \
  --index-url https://download.pytorch.org/whl/nightly/cu134 \
- && python -m pip install --no-cache-dir --no-deps liger-kernel==0.8.4
+ && python -m pip install --no-cache-dir --no-deps liger-kernel==0.8.4 \
+ && python -m pip install --no-cache-dir --no-build-isolation "transformer_engine[pytorch,core_cu13]==2.20.2"
 
 RUN nvcc --version \
  && python -c "import torch, triton; from importlib.metadata import version; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'triton:', triton.__version__, 'liger-kernel:', version('liger-kernel')); assert torch.__version__ == '2.16.0.dev20261009+cu134'; assert torch.version.cuda == '13.4'"

@@ -36,8 +36,8 @@ def qk_scale_debug_string(model: "GPT") -> str:
         k_raw = attn.k_scale.max()
 
         # effective values used in forward (after clamping)
-        q_eff = torch.clamp(attn.q_scale, min=-attn.qk_scale_max, max=attn.qk_scale_max).max()
-        k_eff = torch.clamp(attn.k_scale, min=-attn.qk_scale_max, max=attn.qk_scale_max).max()
+        q_eff = torch.clamp(attn.q_scale, min=attn.qk_scale_min, max=attn.qk_scale_max).max()
+        k_eff = torch.clamp(attn.k_scale, min=attn.qk_scale_min, max=attn.qk_scale_max).max()
 
         max_q_raw = max(max_q_raw, float(q_raw))
         max_k_raw = max(max_k_raw, float(k_raw))
@@ -81,6 +81,7 @@ class SelfAttention(nn.Module):
         
         self.use_qk_norm = gpt_config.use_qk_norm
         self.qk_norm_type = gpt_config.qk_norm_type
+        self.qk_scale_min = gpt_config.qk_scale_min
         self.qk_scale_max = gpt_config.qk_scale_max
         self.qk_eps = gpt_config.qk_eps
 
@@ -150,9 +151,9 @@ class SelfAttention(nn.Module):
                 q_gain = torch.rsqrt(q.pow(2).sum(dim=-1, keepdim=True) + self.qk_eps)
                 k_gain = torch.rsqrt(k.pow(2).sum(dim=-1, keepdim=True) + self.qk_eps)
 
-            # cap the magnitude of the learned Q/K scales
-            q_scale = torch.clamp(self.q_scale, min=-self.qk_scale_max, max=self.qk_scale_max)
-            k_scale = torch.clamp(self.k_scale, min=-self.qk_scale_max, max=self.qk_scale_max)
+            # clamp the learned Q/K scales to the configured bounds
+            q_scale = torch.clamp(self.q_scale, min=self.qk_scale_min, max=self.qk_scale_max)
+            k_scale = torch.clamp(self.k_scale, min=self.qk_scale_min, max=self.qk_scale_max)
 
             # if we expanded K/V from n_kv_heads -> n_heads, do the same for k_scale
             if self.n_kv_heads != self.n_heads:

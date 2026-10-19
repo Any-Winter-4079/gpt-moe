@@ -56,7 +56,7 @@ docker buildx build --platform linux/amd64 \
 
 ## Build and push the CUDA 13.4 image
 
-Run locally with Docker Desktop running. This extends the CUDA 13.2 image above, keeps its Python 3.11 and data packages, and installs the full CUDA Toolkit 13.4.2, PyTorch nightly 2.16.0.dev20261009+cu134, and Liger 0.8.4. The nightly version is PyTorch; Python stays at 3.11. The separate build directory and image tag let you keep both images.
+Run locally with Docker Desktop running. This extends the CUDA 13.2 image above, keeps its Python 3.11 and data packages, and installs the full CUDA Toolkit 13.4.2, PyTorch nightly 2.16.0.dev20261009+cu134, Liger 0.8.4, and Transformer Engine 2.20.2 with CUDA 13 and PyTorch support. The nightly version is PyTorch; Python stays at 3.11. The separate build directory and image tag let you keep both images.
 
 ```bash
 mkdir -p docker_build/cu134 && \
@@ -78,12 +78,24 @@ RUN python -m pip install --no-cache-dir --pre --upgrade torch==2.16.0.dev202610
  --index-url https://download.pytorch.org/whl/nightly/cu134 \
  && python -m pip install --no-cache-dir --no-deps liger-kernel==0.8.4
 
+RUN TE_CUDNN_ROOT="$(python -c 'from importlib.metadata import distribution; d = distribution("nvidia-cudnn-cu13"); print(next(d.locate_file(p) for p in d.files if p.name == "cudnn_version.h").parent.parent)')" \
+ && ln -sfn "$TE_CUDNN_ROOT" /opt/te-cudnn
+
+ENV CUDNN_PATH=/opt/te-cudnn
+ENV CUDNN_HOME=/opt/te-cudnn
+ENV LD_LIBRARY_PATH="/opt/te-cudnn/lib:${LD_LIBRARY_PATH}"
+
+RUN NVTE_BUILD_USE_NVIDIA_WHEELS=0 \
+    CPPFLAGS="-I${CUDNN_PATH}/include ${CPPFLAGS:-}" \
+    python -m pip install --no-cache-dir --no-build-isolation \
+    "transformer_engine[pytorch,core_cu13]==2.20.2"
+
 RUN nvcc --version \
- && python -c "import torch, triton; from importlib.metadata import version; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'triton:', triton.__version__, 'liger-kernel:', version('liger-kernel')); assert torch.__version__ == '2.16.0.dev20261009+cu134'; assert torch.version.cuda == '13.4'"
+ && python -c "import torch, triton; import transformer_engine.pytorch; from importlib.metadata import version; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'triton:', triton.__version__, 'liger-kernel:', version('liger-kernel'), 'transformer-engine:', version('transformer-engine'), 'cuDNN:', torch.backends.cudnn.version()); assert torch.__version__ == '2.16.0.dev20261009+cu134'; assert torch.version.cuda == '13.4'"
 EOF
 ```
 
-The library path avoids inheriting the older toolkit's runtime libraries; PyTorch uses the CUDA libraries installed with its wheel. The full 13.4 toolkit remains available through `CUDA_HOME` and `PATH`.
+The library path avoids inheriting the older toolkit's runtime libraries; PyTorch uses the CUDA libraries installed with its wheel. The `/opt/te-cudnn` symlink points to the installed CUDA 13 cuDNN package, and its headers and libraries are selected explicitly for Transformer Engine compilation and runtime. The build verifies that Transformer Engine imports. The full 13.4 toolkit remains available through `CUDA_HOME` and `PATH`.
 
 Log in and select (or create) `amd64-builder` as above, then build and push:
 
