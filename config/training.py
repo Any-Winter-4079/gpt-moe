@@ -200,8 +200,7 @@ class TrainingConfig:
     # to disable cudagraphs in max-autotune when grad_accum_mini_steps > 1
     torch_compile_mode_no_grad_accum: str = "max-autotune" # "max-autotune" | "reduce-overhead" | "max-autotune-no-cudagraphs" | "default"
     torch_compile_mode_grad_accum: str = "max-autotune-no-cudagraphs" # "max-autotune" | "reduce-overhead" | "max-autotune-no-cudagraphs" | "default"
-    # packed PyTorch experts compile dynamically in a separate region
-    torch_compile_fullgraph: bool = False
+    torch_compile_fullgraph: bool = True
     torch_compile_dynamic: bool = False
 
     # torch._inductor.config.cpp_wrapper = True
@@ -214,8 +213,8 @@ class TrainingConfig:
             "k_proj": "default",
             "v_proj": "default",
             "out_proj": "default",
-            "up_proj": "default",
-            "down_proj": "default",
+            "up_proj": "fp8",
+            "down_proj": "fp8",
             "router": "default",
             "lm_head": "fp8",
         },

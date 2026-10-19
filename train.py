@@ -17,7 +17,6 @@ from config.model import GPTConfig
 from config.training import TrainingConfig
 from model.gpt import GPT
 from model.attention.self_attention import qk_scale_debug_string
-from model.feedforward.moe import MoE
 from optimizers.muon import Muon
 from data.loader import DataLoader
 from schedules.token import get_next_update_tokens
@@ -208,12 +207,6 @@ else:
         fullgraph=training_config.torch_compile_fullgraph,
         dynamic=training_config.torch_compile_dynamic,
     )
-for module in gpt_model.modules():
-    if isinstance(module, MoE) and not module.use_grouped_moe:
-        if training_config.activation_offload_layers:
-            module.compile_experts(options=compile_options)
-        else:
-            module.compile_experts(mode=training_config.torch_compile_mode)
 if parallel_mode == "ddp":
     gpt_model = DDP(gpt_model, device_ids=[local_rank])
     raw_gpt_model = gpt_model.module
