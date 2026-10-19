@@ -17,6 +17,11 @@ if TYPE_CHECKING:
     from config.training import TrainingConfig
 
 
+@torch.compiler.disable
+def split_expert_inputs(packed: Tensor, counts: Tensor) -> Tuple[Tensor, ...]:
+    return packed.split(counts.cpu().tolist())
+
+
 class MoE(nn.Module):
     def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig, num_experts: int, top_k: int = 2) -> None:
         super().__init__()
@@ -72,14 +77,21 @@ class MoE(nn.Module):
         if self.use_grouped_moe:
             output = self.forward_grouped(hidden_states, top_k_indices, top_k_weights)
         else:
-            output = torch.zeros_like(hidden_states)
-            for expert_idx, expert in enumerate(self.experts):
-                token_idx, top_k_pos = torch.where(top_k_indices == expert_idx)
-                expert_output = expert(hidden_states[token_idx])
-                weighted_output = expert_output.to(output.dtype) * top_k_weights[token_idx, top_k_pos, None].to(output.dtype)
-                output.index_add_(0, token_idx, weighted_output)
+            output = self.forward_packed(hidden_states, top_k_indices, top_k_weights)
 
         return output.reshape(input_shape), balance_loss
+
+    def forward_packed(self, hidden_states: Tensor, top_k_indices: Tensor, top_k_weights: Tensor) -> Tensor:
+        expert_indices, order = top_k_indices.reshape(-1).sort()
+        counts = torch.zeros(self.num_experts, device=hidden_states.device, dtype=torch.int32).scatter_add_(
+            0, expert_indices, torch.ones_like(expert_indices, dtype=torch.int32),
+        )
+        packed = hidden_states[order // self.top_k]
+        parts = split_expert_inputs(packed, counts)
+        packed = torch.cat([expert(part) for expert, part in zip(self.experts, parts)], dim=0)
+        inverse_order = torch.empty_like(order).scatter_(0, order, torch.arange(order.numel(), device=order.device))
+        expert_output = packed[inverse_order].view(hidden_states.shape[0], self.top_k, -1).to(hidden_states.dtype)
+        return (expert_output * top_k_weights[:, :, None].to(hidden_states.dtype)).sum(dim=1)
 
     def forward_grouped(self, hidden_states: Tensor, top_k_indices: Tensor, top_k_weights: Tensor) -> Tensor:
         expert_indices, order = top_k_indices.reshape(-1).sort()

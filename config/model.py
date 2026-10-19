@@ -78,7 +78,7 @@ class GPTConfig:
     use_moe: bool = True
     num_experts: int = 8
     moe_top_k: int = 2
-    use_grouped_moe: bool = True # packed tokens and grouped Triton projections; False uses the expert loop
+    use_grouped_moe: bool = False # True uses grouped Triton projections; False uses the packed PyTorch expert loop
     # for top-k > 1, use full-softmax gates instead of renormalizing the selected experts; top-1 always uses full softmax
     moe_full_softmax_gating: bool = False
 
