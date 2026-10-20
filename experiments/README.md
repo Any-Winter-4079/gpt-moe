@@ -71,6 +71,7 @@ Reversal requires that the patched files have not been edited further. Check `gi
 | `019-fused-pack-quantization.patch` | Gather routed tokens while preparing the up projection's FP8 operands | 005; requires 005 |
 | `020-direct-expert-weight-quantization.patch` | Quantize expert parameters without stacking their FP32 weights | 005; requires 005 |
 | `021-reuse-quantized-expert-weights.patch` | Reuse detached FP8 expert weights across accumulation microsteps | 005; requires 005 |
+| `022-fused-pack-direct-weight-quantization.patch` | Combine routed input quantization with direct expert-weight quantization | 005 + 019; requires both and incorporates 020 |
 
 ### 000 and 001: BF16 expert projections
 
@@ -236,6 +237,20 @@ python experiments/run.py 005 019 020 021
 ```
 
 The runner applies and reverses 005 automatically for each dependent experiment. Local checks cover patch application/reversal, Python syntax and CPU-adapted quantization/autograd comparisons. CUDA execution, full-graph compilation and performance of 019–021 remain untested.
+
+### 022: combine packing and direct weight quantization
+
+Apply 005 and 019, then 022. This incorporates 020's direct expert-weight quantization into 019's packed-input operation; do not apply 020 separately. Compare with 005 + 019 to measure the additional weight-preparation change.
+
+The up projection quantizes tokens directly in routed order and reads the individual expert parameters without stacking their FP32 weights. The down projection also quantizes individual weights and retains 005's fused ReLU² path. Backward accumulates each token's selected-expert contributions and returns gradients to the original expert parameters. The quantization blocks, scales, dtypes and configured weight-gradient backend remain unchanged.
+
+Run the unpatched baseline followed by the combined experiment:
+
+```bash
+python experiments/run.py 022
+```
+
+The runner applies 005, 019 and 022, then reverses them in the opposite order. With the patches applied, `python experiments/check_grouped.py --triton-wgrad` checks the combined operation and both weight-gradient backends. GPU compilation, performance and convergence of this combination still require testing.
 
 ## Validation and interpretation
 
