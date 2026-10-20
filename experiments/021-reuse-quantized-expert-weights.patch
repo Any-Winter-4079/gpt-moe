@@ -1,0 +1,342 @@
+diff --git a/experiments/check_grouped.py b/experiments/check_grouped.py
+index db514cd..70fa139 100644
+--- a/experiments/check_grouped.py
++++ b/experiments/check_grouped.py
+@@ -48,6 +48,21 @@ def run(operation, x, weight, offsets, grad):
+     return output.detach(), x.grad.detach(), weight.grad.detach()
+ 
+ 
++def run_accumulated(operation, inputs, weights, offsets, grads, prepared_weight):
++    for weight in weights:
++        weight.grad = None
++    outputs, input_grads = [], []
++    for source, grad in zip(inputs, grads):
++        x = source.detach().clone().requires_grad_()
++        output = operation(x, weights, offsets, prepared_weight)
++        (output / len(inputs)).backward(grad)
++        assert output.dtype == torch.bfloat16 and x.grad.dtype == x.dtype
++        outputs.append(output.detach())
++        input_grads.append(x.grad.detach())
++    assert all(weight.grad is not None and weight.grad.dtype == weight.dtype for weight in weights)
++    return torch.cat(outputs), torch.cat(input_grads), torch.stack([weight.grad for weight in weights])
++
++
+ def check(actual, expected, label, tolerance):
+     for weight_grad in actual[2:]:
+         for expert, count in enumerate(counts):
+@@ -148,6 +163,33 @@ for width, output_width in ((128, 256), (256, 128)):
+                 actual_fused = run(operation(fused), preactivation, weight, offsets, grad)
+                 check(actual_fused, expected_fused, f"fused ReLU2 {wgrad_backend} {suffix}", .001)
+ 
++        if "prepared_weight" in inspect.signature(grouped_fp8.grouped_linear_fp8).parameters:
++            for wgrad_backend in wgrad_backends:
++                for relu2 in (False, True):
++                    projection = grouped_fp8.grouped_linear_fp8_relu2 if relu2 else grouped_fp8.grouped_linear_fp8
++
++                    def accumulated(x, weights, offsets, prepared_weight):
++                        return projection(x, torch.stack(weights), offsets, wgrad_backend, prepared_weight)
++
++                    if label == "compiled":
++                        torch.compiler.reset()
++                    accumulated = operation(accumulated)
++                    source = x.bfloat16() if relu2 else x
++                    inputs = [source + torch.randn_like(source) * .01 for _ in range(4)]
++                    grads = [grad + torch.randn_like(grad) * .001 for _ in range(4)]
++                    reference_weights = [torch.nn.Parameter(value.clone()) for value in weight]
++                    cached_weights = [torch.nn.Parameter(value.clone()) for value in weight]
++                    for update in range(2):
++                        with torch.no_grad():
++                            prepared_weight = grouped_fp8.quantize_grouped_weights(torch.stack(cached_weights))
++                        expected_cached = run_accumulated(accumulated, inputs, reference_weights, offsets, grads, None)
++                        actual_cached = run_accumulated(accumulated, inputs, cached_weights, offsets, grads, prepared_weight)
++                        check(actual_cached, expected_cached, f"cached GA4 relu2={relu2} update={update} {wgrad_backend} {suffix}", .001)
++                        with torch.no_grad():
++                            for values in (reference_weights, cached_weights):
++                                for value in values:
++                                    value.add_(.125)
++
+         if grouped_mlp_fp8_relu2 is not None:
+             down_weight = torch.randn(len(counts), width, output_width, device="cuda") * .03
+             mlp_grad = torch.randn(sum(counts), width, device="cuda", dtype=torch.bfloat16) * .01
+diff --git a/model/feedforward/moe.py b/model/feedforward/moe.py
+index 0ad2c8e..a55e11b 100644
+--- a/model/feedforward/moe.py
++++ b/model/feedforward/moe.py
+@@ -8,7 +8,7 @@ from torch import Tensor
+ from torch.nn import functional as F
+ 
+ from ..linear.grouped import grouped_linear
+-from ..linear.grouped_fp8 import grouped_linear_fp8, grouped_linear_fp8_relu2
++from ..linear.grouped_fp8 import grouped_linear_fp8, grouped_linear_fp8_relu2, quantize_grouped_weights
+ from ..linear.linear import Linear
+ from .mlp import MLP
+ 
+@@ -29,6 +29,25 @@ class MoE(nn.Module):
+         self.fp8_wgrad_backend = gpt_config.grouped_fp8_wgrad_backend
+         self.router = Linear(gpt_config.d_model, num_experts, role="router", bias=False)
+         self.experts = nn.ModuleList([MLP(gpt_config, training_config) for _ in range(num_experts)])
++        self.prepared_up_weight = None
++        self.prepared_down_weight = None
++
++    @torch.no_grad()
++    def prepare_fp8_weights(self) -> None:
++        self.clear_fp8_weights()
++        if self.use_grouped_moe:
++            if self.experts[0].up_proj.precision == "fp8":
++                self.prepared_up_weight = quantize_grouped_weights(torch.stack([expert.up_proj.weight for expert in self.experts]))
++            if self.experts[0].down_proj.precision == "fp8":
++                self.prepared_down_weight = quantize_grouped_weights(torch.stack([expert.down_proj.weight for expert in self.experts]))
++
++    def clear_fp8_weights(self) -> None:
++        self.prepared_up_weight = None
++        self.prepared_down_weight = None
++
++    def _load_from_state_dict(self, *args, **kwargs) -> None:
++        self.clear_fp8_weights()
++        super()._load_from_state_dict(*args, **kwargs)
+ 
+     def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+         input_shape = x.shape
+@@ -92,8 +111,12 @@ class MoE(nn.Module):
+ 
+         # stack for computation while keeping each 2d parameter and its Muon update
+         up_weight = torch.stack([expert.up_proj.weight for expert in self.experts])
++        reuse_weights = self.training and torch.is_grad_enabled()
+         if self.experts[0].up_proj.precision == "fp8":
+-            packed = grouped_linear_fp8(packed, up_weight, offsets, self.fp8_wgrad_backend)
++            packed = grouped_linear_fp8(
++                packed, up_weight, offsets, self.fp8_wgrad_backend,
++                self.prepared_up_weight if reuse_weights else None,
++            )
+         else:
+             dtype = torch.get_autocast_dtype(hidden_states.device.type) if torch.is_autocast_enabled(hidden_states.device.type) else up_weight.dtype
+             packed = grouped_linear(packed.to(dtype), up_weight.to(dtype), offsets)
+@@ -110,9 +133,15 @@ class MoE(nn.Module):
+         down_weight = torch.stack([expert.down_proj.weight for expert in self.experts])
+         if self.experts[0].down_proj.precision == "fp8":
+             if fuse_relu2:
+-                packed = grouped_linear_fp8_relu2(packed, down_weight, offsets, self.fp8_wgrad_backend)
++                packed = grouped_linear_fp8_relu2(
++                    packed, down_weight, offsets, self.fp8_wgrad_backend,
++                    self.prepared_down_weight if reuse_weights else None,
++                )
+             else:
+-                packed = grouped_linear_fp8(packed, down_weight, offsets, self.fp8_wgrad_backend)
++                packed = grouped_linear_fp8(
++                    packed, down_weight, offsets, self.fp8_wgrad_backend,
++                    self.prepared_down_weight if reuse_weights else None,
++                )
+         else:
+             dtype = torch.get_autocast_dtype(hidden_states.device.type) if torch.is_autocast_enabled(hidden_states.device.type) else down_weight.dtype
+             packed = grouped_linear(packed.to(dtype), down_weight.to(dtype), offsets)
+diff --git a/model/gpt.py b/model/gpt.py
+index 96dcdc7..5834280 100644
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -159,6 +159,7 @@ class GPT(nn.Module):
+     def set_precision_phase(self, phase: str) -> None:
+         if phase == self.precision_phase:
+             return
++        self.clear_fp8_weights()
+         policy = self.linear_precision[phase]
+         for module in self._linear_modules:
+             module.precision = policy[module.role]
+@@ -172,6 +173,16 @@ class GPT(nn.Module):
+         elif isinstance(module, nn.Embedding):
+             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+ 
++    def prepare_fp8_weights(self) -> None:
++        for block in self.transformer.h:
++            if block.use_moe:
++                block.mlp.prepare_fp8_weights()
++
++    def clear_fp8_weights(self) -> None:
++        for block in self.transformer.h:
++            if block.use_moe:
++                block.mlp.clear_fp8_weights()
++
+     def configure_optimizers(
+             self,
+             lr: float,
+diff --git a/model/linear/grouped_fp8.py b/model/linear/grouped_fp8.py
+index 636c243..1b206d2 100644
+--- a/model/linear/grouped_fp8.py
++++ b/model/linear/grouped_fp8.py
+@@ -240,16 +240,21 @@ def _grouped_fp8_mm(
+     return out
+ 
+ 
+-def _forward_impl(
+-    x: Tensor, weight: Tensor, offsets: Tensor, save_backward: bool, deepgemm: bool, relu2: bool,
+-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+-    row, row_scale, column, column_scale, _ = _quantize_activations(x, offsets, save_backward, deepgemm, relu2=relu2)
++def quantize_grouped_weights(weight: Tensor) -> Tuple[Tensor, Tensor]:
+     experts, n, k = weight.shape
+     weight_fp8 = torch.empty(weight.shape, device=weight.device, dtype=torch.float8_e4m3fn)
+     weight_scale = torch.empty((experts, triton.cdiv(n, 128), triton.cdiv(k, 128)), device=weight.device, dtype=torch.float32)
+     wrap_triton(_quantize_weights_kernel)[(experts, triton.cdiv(n, 128), triton.cdiv(k, 128))](
+         weight, weight_fp8, weight_scale, n, k, *weight.stride(), num_warps=8,
+     )
++    return weight_fp8, weight_scale
++
++
++def _forward_impl(
++    x: Tensor, weight: Tensor, offsets: Tensor, save_backward: bool, deepgemm: bool, relu2: bool,
++) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
++    row, row_scale, column, column_scale, _ = _quantize_activations(x, offsets, save_backward, deepgemm, relu2=relu2)
++    weight_fp8, weight_scale = quantize_grouped_weights(weight)
+     out = _grouped_fp8_mm(
+         row, weight_fp8.transpose(-2, -1), row_scale, weight_scale.transpose(-2, -1), offsets, torch.bfloat16,
+     )
+@@ -327,17 +332,60 @@ def _relu2_backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
+ _relu2_forward.register_autograd(_relu2_backward, setup_context=_setup_relu2_context)
+ 
+ 
+-def grouped_linear_fp8(x: Tensor, weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton") -> Tensor:
++@triton_op("gpt_moe::grouped_linear_fp8_cached_forward", mutates_args=())
++def _cached_forward(
++    x: Tensor, weight: Tensor, weight_fp8: Tensor, weight_scale: Tensor, offsets: Tensor,
++    save_backward: bool, deepgemm: bool, relu2: bool,
++) -> Tuple[Tensor, Tensor, Tensor]:
++    row, row_scale, column, column_scale, _ = _quantize_activations(x, offsets, save_backward, deepgemm, relu2=relu2)
++    out = _grouped_fp8_mm(
++        row, weight_fp8.transpose(-2, -1), row_scale, weight_scale.transpose(-2, -1), offsets, torch.bfloat16,
++    )
++    return out, column, column_scale
++
++
++def _setup_cached_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
++    x, weight, weight_fp8, weight_scale, offsets, _, ctx.deepgemm, ctx.relu2 = inputs
++    ctx.input_dtype = x.dtype
++    ctx.weight_dtype = weight.dtype
++    ctx.set_materialize_grads(False)
++    ctx.mark_non_differentiable(*output[1:])
++    ctx.save_for_backward(*output[1:], weight_fp8, weight_scale, offsets, *([x] if ctx.relu2 else []))
++
++
++def _cached_backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
++    x_column, x_scale, weight, weight_scale, offsets, *preactivation = ctx.saved_tensors
++    grad_x, grad_weight = _backward_gemms(
++        grad, x_column, x_scale, weight, weight_scale, offsets, ctx.input_dtype, ctx.weight_dtype,
++        ctx.deepgemm, preactivation[0] if ctx.relu2 else None,
++    )
++    return grad_x, grad_weight, None, None, None, None, None, None
++
++
++_cached_forward.register_autograd(_cached_backward, setup_context=_setup_cached_context)
++
++
++def grouped_linear_fp8(
++    x: Tensor, weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton",
++    prepared_weight: Optional[Tuple[Tensor, Tensor]] = None,
++) -> Tensor:
+     if wgrad_backend not in ("triton", "deepgemm"):
+         raise ValueError(f"unsupported grouped FP8 weight-gradient backend: {wgrad_backend}")
+     save_backward = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
++    if prepared_weight is not None:
++        return _cached_forward(x, weight, *prepared_weight, offsets, save_backward, wgrad_backend == "deepgemm", False)[0]
+     return _forward(x, weight, offsets, save_backward, wgrad_backend == "deepgemm")[0]
+ 
+ 
+-def grouped_linear_fp8_relu2(x: Tensor, weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton") -> Tensor:
++def grouped_linear_fp8_relu2(
++    x: Tensor, weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton",
++    prepared_weight: Optional[Tuple[Tensor, Tensor]] = None,
++) -> Tensor:
+     if wgrad_backend not in ("triton", "deepgemm"):
+         raise ValueError(f"unsupported grouped FP8 weight-gradient backend: {wgrad_backend}")
+     if x.dtype != torch.bfloat16:
+         raise ValueError("fused grouped FP8 ReLU2 requires bfloat16 preactivations")
+     save_backward = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
++    if prepared_weight is not None:
++        return _cached_forward(x, weight, *prepared_weight, offsets, save_backward, wgrad_backend == "deepgemm", True)[0]
+     return _relu2_forward(x, weight, offsets, save_backward, wgrad_backend == "deepgemm")[0]
+diff --git a/runtime/warmup.py b/runtime/warmup.py
+index 0964341..c4f9045 100644
+--- a/runtime/warmup.py
++++ b/runtime/warmup.py
+@@ -46,6 +46,9 @@ def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
+                 for optimizer in optimizers.values():
+                     optimizer.zero_grad(set_to_none=True)
+ 
++                if grad_accum_mini_steps > 1:
++                    raw_gpt_model.prepare_fp8_weights()
++
+                 pipeline_batches = []
+                 for mini_step in range(grad_accum_mini_steps):
+                     # make shapes match training
+@@ -77,6 +80,7 @@ def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
+                 with ctx:
+                     pipeline_train_step(pipeline_batches)
+ 
++                raw_gpt_model.clear_fp8_weights()
+                 for optimizer in optimizers.values():
+                     optimizer.step()
+                     optimizer.zero_grad(set_to_none=True)
+@@ -162,6 +166,9 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
+                 for optimizer in optimizers.values():
+                     optimizer.zero_grad(set_to_none=True)
+ 
++                if grad_accum_mini_steps > 1:
++                    raw_gpt_model.prepare_fp8_weights()
++
+                 for mini_step in range(grad_accum_mini_steps):
+                     # mimic the real training loop’s DDP behavior
+                     gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
+@@ -192,6 +199,7 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
+ 
+                     (warm_loss / grad_accum_mini_steps).backward()
+ 
++                raw_gpt_model.clear_fp8_weights()
+                 for optimizer in optimizers.values():
+                     optimizer.step()
+                     optimizer.zero_grad(set_to_none=True)
+@@ -243,10 +251,13 @@ def kernel_warmup(run, num_train_steps: int = 2) -> None:
+     dist.barrier()
+     torch.cuda.synchronize()
+     start_t = time.perf_counter()
+-    if run.parallel_mode == "pp":
+-        _kernel_warmup_pp(run, num_train_steps)
+-    else:
+-        _kernel_warmup_ddp(run, num_train_steps)
++    try:
++        if run.parallel_mode == "pp":
++            _kernel_warmup_pp(run, num_train_steps)
++        else:
++            _kernel_warmup_ddp(run, num_train_steps)
++    finally:
++        run.raw_gpt_model.clear_fp8_weights()
+     torch.cuda.synchronize()
+     dist.barrier()
+     elapsed = torch.tensor([time.perf_counter() - start_t], dtype=torch.float64, device=run.device)
+diff --git a/train.py b/train.py
+index 43a0408..9653697 100644
+--- a/train.py
++++ b/train.py
+@@ -372,6 +372,9 @@ try:
+         raw_gpt_model.set_precision_phase("training")
+         for optimizer in optimizers.values():
+             optimizer.zero_grad()
++        # reuse detached quantized weights only while accumulating gradients at fixed parameters
++        if grad_accum_mini_steps > 1:
++            raw_gpt_model.prepare_fp8_weights()
+         train_loss = 0.0
+         checkpoint_val_loss = None
+         validation_improved = False
+@@ -479,6 +482,7 @@ try:
+             for param_group in optimizers["muon"].param_groups:
+                 param_group['lr'] = adamw_lr * raw_gpt_model.muon_lr_scale
+         # step present optimizers
++        raw_gpt_model.clear_fp8_weights()
+         for optimizer in optimizers.values():
+             optimizer.step()
+ 
+@@ -745,6 +749,7 @@ except Exception as e:
+     dist.barrier()
+     raise
+ finally:
++    raw_gpt_model.clear_fp8_weights()
+     flush_log(run)
+     dist.barrier()
+     destroy_process_group()
+

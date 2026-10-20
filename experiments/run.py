@@ -9,7 +9,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ORDER = ["012", "014", "017", "000", "001", "018", "002", "003", "005", "009", "013", "015", "016", "004", "010", "006", "011", "007", "008"]
+ORDER = ["baseline", "012", "014", "017", "000", "001", "018", "002", "003", "005", "019", "020", "021", "009", "013", "015", "016", "004", "010", "006", "011", "007", "008"]
 DEPENDENCIES = {
     "009": ["005"],
     "010": ["004"],
@@ -19,6 +19,9 @@ DEPENDENCIES = {
     "016": ["005", "009", "013", "015"],
     "017": ["012", "014"],
     "018": ["000"],
+    "019": ["005"],
+    "020": ["005"],
+    "021": ["005"],
 }
 
 
@@ -45,7 +48,7 @@ def stop(signum, frame):
 
 def main():
     parser = argparse.ArgumentParser(description="Apply experiments, train, upload to the Hub and reverse the patches")
-    parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs in execution order; omitted runs all experiments")
+    parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs in execution order; baseline always runs first; omitted runs all experiments")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="number of training GPUs (default: 1)")
     args = parser.parse_args()
     if any(experiment not in ORDER for experiment in args.experiments):
@@ -71,13 +74,15 @@ def main():
     with summary_path.open("x") as summary:
         summary.write("experiment\ttrain_exit\tupload_exit\ttimestamp\n")
         summary.flush()
-        for index, experiment in enumerate(args.experiments or ORDER, 1):
+        experiments = ["baseline"] + [experiment for experiment in (args.experiments or ORDER) if experiment != "baseline"]
+        for index, experiment in enumerate(experiments, 1):
             applied = []
             console_path = ROOT / f"experiment-{experiment}-{batch}-{index:02d}.log"
             print(f"experiment {experiment}; training output: {console_path}", flush=True)
             try:
                 with console_path.open("x") as console:
-                    for patch_id in DEPENDENCIES.get(experiment, []) + [experiment]:
+                    patch_ids = [] if experiment == "baseline" else DEPENDENCIES.get(experiment, []) + [experiment]
+                    for patch_id in patch_ids:
                         patch = patches[patch_id]
                         if run_command(["git", "apply", "--check", str(patch)], console):
                             break
@@ -112,7 +117,7 @@ def main():
                         with upload_path.open("x") as upload_log:
                             upload_exit = run_command([
                                 sys.executable, "push_to_hub.py", "--timestamp", timestamp,
-                                "--repo-prefix", f"nanogpt-exp{experiment}",
+                                "--repo-prefix", "nanogpt-baseline" if experiment == "baseline" else f"nanogpt-exp{experiment}",
                             ], upload_log)
                         summary.write(f"{experiment}\t{train_exit}\t{upload_exit}\t{timestamp}\n")
                         summary.flush()

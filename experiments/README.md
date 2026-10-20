@@ -68,6 +68,9 @@ Reversal requires that the patched files have not been edited further. Check `gi
 | `016-compact-scales-producer.patch` | Use compact scale bytes throughout the fused producer branch | 005 + 009 + 013 + 015; requires all four |
 | `017-double-native-workers.patch` | Double the persistent native FP8 worker pool | 012 + 014; requires both |
 | `018-double-bf16-workers.patch` | Double the ordinary BF16 grouped worker pool | 000; requires 000 for the BF16 control |
+| `019-fused-pack-quantization.patch` | Gather routed tokens while preparing the up projection's FP8 operands | 005; requires 005 |
+| `020-direct-expert-weight-quantization.patch` | Quantize expert parameters without stacking their FP32 weights | 005; requires 005 |
+| `021-reuse-quantized-expert-weights.patch` | Reuse detached FP8 expert weights across accumulation microsteps | 005; requires 005 |
 
 ### 000 and 001: BF16 expert projections
 
@@ -216,11 +219,29 @@ Apply 000, then 018. Use `python experiments/check_grouped.py` and reverse 018 b
 
 This doubles the worker pool for the ordinary grouped kernel used by the BF16 control. It changes the same scheduling choice as 017 without introducing FP8 or a different GEMM library. CPU tile-coverage checks include every existing tile configuration and multiple worker counts; each output is written exactly once. All four BF16 configurations compile for SM120. Speed still requires a complete training comparison.
 
+### 019–021: reduce input and weight preparation
+
+These are independent follow-ups to 005. Apply 005 and one of 019, 020 or 021; reverse the selected patch before reversing 005. They are not a series to apply together.
+
+019 gathers the original token activations directly in the up projection's quantizer, avoiding the intermediate packed FP32 input. It retains sorted expert order, the existing 128-element quantization blocks and both FP8 orientations. Backward accumulates the selected experts' contributions into each original token's gradient.
+
+020 reads the individual expert parameters and writes grouped FP8 weights and scales in one quantization launch, avoiding the FP32 weight stack. The separate parameters retain their gradients, Muon updates and checkpoint names.
+
+021 prepares detached FP8 expert weights and scales once per gradient-accumulation group and releases them before the optimizer update. Activations and their gradients are still prepared per microstep. The default model retains about 256 MiB of quantized weights and scales during accumulation; the original weight stack remains part of each forward. Accumulation count 1 and evaluation retain the uncached path.
+
+To run the unpatched baseline, the 005 control and these three experiments:
+
+```bash
+python experiments/run.py 005 019 020 021
+```
+
+The runner applies and reverses 005 automatically for each dependent experiment. Local checks cover patch application/reversal, Python syntax and CPU-adapted quantization/autograd comparisons. CUDA execution, full-graph compilation and performance of 019–021 remain untested.
+
 ## Validation and interpretation
 
 Each patch was applied and reversed against a clean baseline, and the resulting Python sources were parsed. CPU checks executed kernel bodies with tensor stand-ins or compared reference optimizer updates, including ragged and empty experts, noncontiguous tensors, low-precision boundaries, and tied gradients where applicable. These checks do not reproduce the GPU's accumulator behavior.
 
-Local offline compilation also generated SM120 cubins for the added Triton kernels and representative existing shapes/configurations. FakeTensor and full-graph capture checks exercised operator schemas and registered backward paths without GPU execution. These compiler checks used an existing local image with PyTorch 2.12 development and Triton 3.6; the intended training image uses PyTorch 2.16 development and Triton 3.9. They do not replace a CUDA correctness run on that image. The new DeepGEMM image has not been built, and no GPU timing or convergence result is claimed.
+For 000–018, local offline compilation also generated SM120 cubins for the added Triton kernels and representative existing shapes/configurations. FakeTensor and full-graph capture checks exercised operator schemas and registered backward paths without GPU execution. These compiler checks used an existing local image with PyTorch 2.12 development and Triton 3.6; the intended training image uses PyTorch 2.16 development and Triton 3.9. They do not replace a CUDA correctness run on that image. The new DeepGEMM image has not been built, and no GPU timing or convergence result is claimed.
 
 For 008, 012, 014, 016 and 017, scratch harnesses also reached Inductor's CUDA lowering/code generation and precompiled the Triton candidates into SM120 cubins. The FP8 checks used the actual batch-8 projection shapes and explicit backward operations, including fused ReLU² gradients. Device/driver setup was mocked and unrelated pattern initialization was disabled; generated kernels were not launched. This checks integration beyond isolated kernel compilation, rather than establishing a complete training run.
 

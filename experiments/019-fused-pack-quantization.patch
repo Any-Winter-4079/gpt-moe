@@ -1,0 +1,184 @@
+diff --git a/experiments/check_grouped.py b/experiments/check_grouped.py
+index db514cd..8d6590f 100644
+--- a/experiments/check_grouped.py
++++ b/experiments/check_grouped.py
+@@ -148,6 +148,21 @@ for width, output_width in ((128, 256), (256, 128)):
+                 actual_fused = run(operation(fused), preactivation, weight, offsets, grad)
+                 check(actual_fused, expected_fused, f"fused ReLU2 {wgrad_backend} {suffix}", .001)
+ 
++        if hasattr(grouped_fp8, "grouped_linear_fp8_packed"):
++            for top_k in (1, 2):
++                source = torch.randn(width, sum(counts) // top_k, device="cuda").t()
++                order = torch.randperm(sum(counts), device="cuda")
++                for wgrad_backend in wgrad_backends:
++                    def separate_pack(x, weight, offsets):
++                        return grouped_fp8.grouped_linear_fp8(x[order // top_k], weight, offsets, wgrad_backend)
++
++                    def fused_pack(x, weight, offsets):
++                        return grouped_fp8.grouped_linear_fp8_packed(x, weight, offsets, order, top_k, wgrad_backend)
++
++                    expected_packed = run(operation(separate_pack), source, weight, offsets, grad)
++                    actual_packed = run(operation(fused_pack), source, weight, offsets, grad)
++                    check(actual_packed, expected_packed, f"fused pack top-k={top_k} {wgrad_backend} {suffix}", .001)
++
+         if grouped_mlp_fp8_relu2 is not None:
+             down_weight = torch.randn(len(counts), width, output_width, device="cuda") * .03
+             mlp_grad = torch.randn(sum(counts), width, device="cuda", dtype=torch.bfloat16) * .01
+diff --git a/model/feedforward/moe.py b/model/feedforward/moe.py
+index 0ad2c8e..f002665 100644
+--- a/model/feedforward/moe.py
++++ b/model/feedforward/moe.py
+@@ -8,7 +8,7 @@ from torch import Tensor
+ from torch.nn import functional as F
+ 
+ from ..linear.grouped import grouped_linear
+-from ..linear.grouped_fp8 import grouped_linear_fp8, grouped_linear_fp8_relu2
++from ..linear.grouped_fp8 import grouped_linear_fp8, grouped_linear_fp8_packed, grouped_linear_fp8_relu2
+ from ..linear.linear import Linear
+ from .mlp import MLP
+ 
+@@ -88,13 +88,12 @@ class MoE(nn.Module):
+             0, expert_indices, torch.ones_like(expert_indices, dtype=torch.int32),
+         )
+         offsets = counts.cumsum(0, dtype=torch.int32)
+-        packed = hidden_states[order // self.top_k]
+-
+         # stack for computation while keeping each 2d parameter and its Muon update
+         up_weight = torch.stack([expert.up_proj.weight for expert in self.experts])
+         if self.experts[0].up_proj.precision == "fp8":
+-            packed = grouped_linear_fp8(packed, up_weight, offsets, self.fp8_wgrad_backend)
++            packed = grouped_linear_fp8_packed(hidden_states, up_weight, offsets, order, self.top_k, self.fp8_wgrad_backend)
+         else:
++            packed = hidden_states[order // self.top_k]
+             dtype = torch.get_autocast_dtype(hidden_states.device.type) if torch.is_autocast_enabled(hidden_states.device.type) else up_weight.dtype
+             packed = grouped_linear(packed.to(dtype), up_weight.to(dtype), offsets)
+         if self.experts[0].up_proj.bias is not None:
+diff --git a/model/linear/grouped_fp8.py b/model/linear/grouped_fp8.py
+index 636c243..376344f 100644
+--- a/model/linear/grouped_fp8.py
++++ b/model/linear/grouped_fp8.py
+@@ -20,11 +20,11 @@ def _inverse_scale(amax):
+ 
+ @triton.jit
+ def _quantize_activations_kernel(
+-    X, Row, Column, RowScale, ColumnScale, Offsets, PaddedOffsets,
++    X, Row, Column, RowScale, ColumnScale, Offsets, PaddedOffsets, Order,
+     M: tl.constexpr, K: tl.constexpr, NUM_EXPERTS: tl.constexpr,
+     stride_m: tl.constexpr, stride_k: tl.constexpr, SAVE_COLUMN: tl.constexpr,
+     DEEPGEMM: tl.constexpr, COLUMN_M: tl.constexpr, WRITE_OFFSETS: tl.constexpr,
+-    RELU2: tl.constexpr,
++    RELU2: tl.constexpr, PACK: tl.constexpr, TOP_K: tl.constexpr,
+ ):
+     tile = tl.program_id(0)
+     col = tl.program_id(1) * 128 + tl.arange(0, 128)
+@@ -37,8 +37,12 @@ def _quantize_activations_kernel(
+         if (tile >= first_tile) & (tile < last_tile):
+             row = (tile - first_tile) * 128 + tl.arange(0, 128)
+             mask = (start + row[:, None] < end) & (col[None, :] < K)
++            if PACK:
++                source_row = tl.load(Order + start + row, mask=start + row < end, other=0) // TOP_K
++            else:
++                source_row = start + row
+             values = tl.load(
+-                X + (start + row[:, None]) * stride_m + col[None, :] * stride_k,
++                X + source_row[:, None] * stride_m + col[None, :] * stride_k,
+                 mask=mask, other=0.0,
+             ).to(tl.float32)
+             if RELU2:
+@@ -200,8 +204,11 @@ def _grouped_fp8_mm_kernel(
+ def _quantize_activations(
+     x: Tensor, offsets: Tensor, save_column: bool, deepgemm: bool = False, write_offsets: bool = False,
+     relu2: bool = False,
++    order: Optional[Tensor] = None, top_k: int = 1,
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+     m, k = x.shape
++    if order is not None:
++        m = order.numel()
+     scale_rows = triton.cdiv(m, 128) + offsets.numel()
+     row = torch.empty((m, k), device=x.device, dtype=torch.float8_e4m3fn)
+     row_scale = torch.empty((m, triton.cdiv(k, 128)), device=x.device, dtype=torch.float32)
+@@ -214,8 +221,9 @@ def _quantize_activations(
+     )
+     padded_offsets = torch.empty(offsets.shape if write_offsets else (0,), device=x.device, dtype=torch.int32)
+     wrap_triton(_quantize_activations_kernel)[(scale_rows, triton.cdiv(k, 128))](
+-        x, row, column, row_scale, column_scale, offsets, padded_offsets,
+-        m, k, offsets.numel(), *x.stride(), save_column, deepgemm, column_m, write_offsets, relu2, num_warps=8,
++        x, row, column, row_scale, column_scale, offsets, padded_offsets, x if order is None else order,
++        m, k, offsets.numel(), *x.stride(), save_column, deepgemm, column_m, write_offsets,
++        relu2, order is not None, top_k, num_warps=8,
+     )
+     return row, row_scale, column, column_scale, padded_offsets
+ 
+@@ -242,8 +250,11 @@ def _grouped_fp8_mm(
+ 
+ def _forward_impl(
+     x: Tensor, weight: Tensor, offsets: Tensor, save_backward: bool, deepgemm: bool, relu2: bool,
++    order: Optional[Tensor] = None, top_k: int = 1,
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+-    row, row_scale, column, column_scale, _ = _quantize_activations(x, offsets, save_backward, deepgemm, relu2=relu2)
++    row, row_scale, column, column_scale, _ = _quantize_activations(
++        x, offsets, save_backward, deepgemm, relu2=relu2, order=order, top_k=top_k,
++    )
+     experts, n, k = weight.shape
+     weight_fp8 = torch.empty(weight.shape, device=weight.device, dtype=torch.float8_e4m3fn)
+     weight_scale = torch.empty((experts, triton.cdiv(n, 128), triton.cdiv(k, 128)), device=weight.device, dtype=torch.float32)
+@@ -270,6 +281,14 @@ def _relu2_forward(
+     return _forward_impl(x, weight, offsets, save_backward, deepgemm, True)
+ 
+ 
++@triton_op("gpt_moe::grouped_linear_fp8_packed_forward", mutates_args=())
++def _packed_forward(
++    x: Tensor, weight: Tensor, offsets: Tensor, order: Tensor, top_k: int,
++    save_backward: bool, deepgemm: bool,
++) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
++    return _forward_impl(x, weight, offsets, save_backward, deepgemm, False, order, top_k)
++
++
+ @triton_op("gpt_moe::grouped_linear_fp8_backward", mutates_args=())
+ def _backward_gemms(
+     grad: Tensor, x_column: Tensor, x_scale: Tensor, weight: Tensor, weight_scale: Tensor,
+@@ -327,6 +346,31 @@ def _relu2_backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
+ _relu2_forward.register_autograd(_relu2_backward, setup_context=_setup_relu2_context)
+ 
+ 
++def _setup_packed_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
++    x, weight, offsets, order, ctx.top_k, _, ctx.deepgemm = inputs
++    ctx.input_shape = x.shape
++    ctx.input_dtype = x.dtype
++    ctx.weight_dtype = weight.dtype
++    ctx.set_materialize_grads(False)
++    ctx.mark_non_differentiable(*output[1:])
++    ctx.save_for_backward(*output[1:], offsets, order)
++
++
++def _packed_backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
++    x_column, x_scale, weight, weight_scale, offsets, order = ctx.saved_tensors
++    grad_packed, grad_weight = _backward_gemms(
++        grad, x_column, x_scale, weight, weight_scale, offsets, ctx.input_dtype, ctx.weight_dtype, ctx.deepgemm,
++    )
++    # each original token receives the gradients from all of its selected experts
++    grad_x = torch.zeros(ctx.input_shape, device=grad.device, dtype=ctx.input_dtype).index_put(
++        (order // ctx.top_k,), grad_packed, accumulate=True,
++    )
++    return grad_x, grad_weight, None, None, None, None, None
++
++
++_packed_forward.register_autograd(_packed_backward, setup_context=_setup_packed_context)
++
++
+ def grouped_linear_fp8(x: Tensor, weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton") -> Tensor:
+     if wgrad_backend not in ("triton", "deepgemm"):
+         raise ValueError(f"unsupported grouped FP8 weight-gradient backend: {wgrad_backend}")
+@@ -341,3 +385,12 @@ def grouped_linear_fp8_relu2(x: Tensor, weight: Tensor, offsets: Tensor, wgrad_b
+         raise ValueError("fused grouped FP8 ReLU2 requires bfloat16 preactivations")
+     save_backward = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
+     return _relu2_forward(x, weight, offsets, save_backward, wgrad_backend == "deepgemm")[0]
++
++
++def grouped_linear_fp8_packed(
++    x: Tensor, weight: Tensor, offsets: Tensor, order: Tensor, top_k: int, wgrad_backend: str = "triton",
++) -> Tensor:
++    if wgrad_backend not in ("triton", "deepgemm"):
++        raise ValueError(f"unsupported grouped FP8 weight-gradient backend: {wgrad_backend}")
++    save_backward = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
++    return _packed_forward(x, weight, offsets, order, top_k, save_backward, wgrad_backend == "deepgemm")[0]
