@@ -233,7 +233,7 @@ These are independent follow-ups to 005. Apply 005 and one of 019, 020 or 021; r
 To run the unpatched baseline, the 005 control and these three experiments:
 
 ```bash
-python experiments/run.py 005 019 020 021
+python experiments/run.py baseline 005 019 020 021
 ```
 
 The runner applies and reverses 005 automatically for each dependent experiment. Local checks cover patch application/reversal, Python syntax and CPU-adapted quantization/autograd comparisons. CUDA execution, full-graph compilation and performance of 019–021 remain untested.
@@ -244,7 +244,7 @@ Apply 005 and 019, then 022. This incorporates 020's direct expert-weight quanti
 
 The up projection quantizes tokens directly in routed order and reads the individual expert parameters without stacking their FP32 weights. The down projection also quantizes individual weights and retains 005's fused ReLU² path. Backward accumulates each token's selected-expert contributions and returns gradients to the original expert parameters. The quantization blocks, scales, dtypes and configured weight-gradient backend remain unchanged.
 
-Run the unpatched baseline followed by the combined experiment:
+Run the combined experiment:
 
 ```bash
 python experiments/run.py 022

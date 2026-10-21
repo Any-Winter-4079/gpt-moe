@@ -1,7 +1,9 @@
 import argparse
 from datetime import datetime
+import math
 import os
 from pathlib import Path
+import re
 import shlex
 import signal
 import subprocess
@@ -25,6 +27,7 @@ DEPENDENCIES = {
     "022": ["005", "019"],
     "023": ["005"],
 }
+PREVIOUS_5_20_GAIN = 8.64
 
 
 def run_command(command, log):
@@ -48,11 +51,32 @@ def stop(signum, frame):
     raise SystemExit(128 + signum)
 
 
+def read_training_result(run_dir):
+    train_minutes = None
+    val_loss = None
+    with (run_dir / "console.log").open() as log:
+        for line in log:
+            train = re.search(r"^step:\s*[\d,]+\s*\|\s*train loss:.*\|\s*total train time:\s*([\d,.]+)\s*min", line)
+            validation = re.search(r"^step:\s*[\d,]+\s*\|\s*val loss:\s*(\S+)", line)
+            if train:
+                train_minutes = float(train.group(1).replace(",", ""))
+            if validation:
+                val_loss = float(validation.group(1))
+    if train_minutes is None or not math.isfinite(train_minutes) or train_minutes <= 0:
+        raise ValueError("missing or invalid total training time")
+    if val_loss is None or not math.isfinite(val_loss) or val_loss > 3.28:
+        raise ValueError("run did not reach validation loss 3.28")
+    return train_minutes, val_loss
+
+
 def main():
     parser = argparse.ArgumentParser(description="Apply experiments, train, upload to the Hub and reverse the patches")
-    parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs in execution order; baseline always runs first; omitted runs all experiments")
+    parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs in execution order; include baseline explicitly; omitted runs all experiments with baseline first")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="number of training GPUs (default: 1)")
+    parser.add_argument("--adaptive", action="store_true", help="run baseline and 3+5, select against 5+20's historical 8.64%% saving, then test fused RoPE and Polar Express fusion")
     args = parser.parse_args()
+    if args.adaptive and args.experiments:
+        parser.error("--adaptive selects its own experiments; do not supply IDs")
     if any(experiment not in ORDER for experiment in args.experiments):
         parser.error(f"experiment IDs must be one of: {', '.join(ORDER)}")
 
@@ -76,14 +100,16 @@ def main():
     with summary_path.open("x") as summary:
         summary.write("experiment\ttrain_exit\tupload_exit\ttimestamp\n")
         summary.flush()
-        experiments = ["baseline"] + [experiment for experiment in (args.experiments or ORDER) if experiment != "baseline"]
+        experiments = ["baseline", "023"] if args.adaptive else args.experiments or ORDER
+        combinations = {}
         for index, experiment in enumerate(experiments, 1):
             applied = []
+            label = "3+5" if args.adaptive and experiment == "023" else experiment
             console_path = ROOT / f"experiment-{experiment}-{batch}-{index:02d}.log"
-            print(f"experiment {experiment}; training output: {console_path}", flush=True)
+            print(f"experiment {label}; training output: {console_path}", flush=True)
             try:
                 with console_path.open("x") as console:
-                    patch_ids = [] if experiment == "baseline" else DEPENDENCIES.get(experiment, []) + [experiment]
+                    patch_ids = [] if experiment == "baseline" else combinations.get(experiment, DEPENDENCIES.get(experiment, []) + [experiment])
                     for patch_id in patch_ids:
                         patch = patches[patch_id]
                         if run_command(["git", "apply", "--check", str(patch)], console):
@@ -115,22 +141,61 @@ def main():
                         console_path.rename(run_dir / "console.log")
 
                         upload_path = ROOT / f"experiment-{experiment}-{batch}-{index:02d}-upload.log"
-                        print(f"experiment {experiment}: training exit {train_exit}; uploading {timestamp}", flush=True)
+                        print(f"experiment {label}: training exit {train_exit}; uploading {timestamp}", flush=True)
                         with upload_path.open("x") as upload_log:
                             upload_exit = run_command([
                                 sys.executable, "push_to_hub.py", "--timestamp", timestamp,
-                                "--repo-prefix", "nanogpt-baseline" if experiment == "baseline" else f"nanogpt-exp{experiment}",
+                                "--repo-prefix", "nanogpt-baseline" if experiment == "baseline" else f"nanogpt-exp{label.replace('+', '-')}",
                             ], upload_log)
-                        summary.write(f"{experiment}\t{train_exit}\t{upload_exit}\t{timestamp}\n")
+                        summary.write(f"{label}\t{train_exit}\t{upload_exit}\t{timestamp}\n")
                         summary.flush()
                         failed = failed or train_exit != 0 or upload_exit != 0
-                        print(f"experiment {experiment}: upload exit {upload_exit}; upload output: {upload_path}", flush=True)
+                        print(f"experiment {label}: upload exit {upload_exit}; upload output: {upload_path}", flush=True)
+                        if args.adaptive:
+                            if train_exit != 0:
+                                print(f"experiment {label}: adaptive sequence stopped after training failure", flush=True)
+                                return 1
+                            try:
+                                train_minutes, val_loss = read_training_result(run_dir)
+                            except (OSError, ValueError) as error:
+                                print(f"experiment {label}: adaptive sequence stopped: {error}", flush=True)
+                                return 1
+                            messages = [f"{label}: total train time {train_minutes:.2f} min; final validation loss {val_loss:.8f}"]
+                            if index == 1:
+                                baseline_minutes = train_minutes
+                            elif index == 2:
+                                gain = 100 * (1 - train_minutes / baseline_minutes)
+                                # normalize the historical result to this machine's baseline
+                                winner_minutes = baseline_minutes * (1 - PREVIOUS_5_20_GAIN / 100)
+                                if train_minutes < winner_minutes:
+                                    winner = "3+5"
+                                    winner_patches = ["005", "023"]
+                                    winner_minutes = train_minutes
+                                else:
+                                    winner = "5+20"
+                                    winner_patches = ["005", "020"]
+                                messages.append(f"3+5 saved {gain:.4f}% versus this baseline; 5+20 saved {PREVIOUS_5_20_GAIN:.2f}% versus its historical baseline; selected {winner}")
+                                messages.append(f"{winner}: reference time {winner_minutes:.4f} min; next add 8 (fused RoPE)")
+                                experiments.append(f"{winner}+8")
+                                combinations[experiments[-1]] = winner_patches + ["008"]
+                            elif index == 3:
+                                keep_rope = train_minutes < winner_minutes
+                                next_experiment = f"{winner}+8+11" if keep_rope else f"{winner}+11"
+                                combinations[next_experiment] = winner_patches + (["008"] if keep_rope else []) + ["011"]
+                                experiments.append(next_experiment)
+                                messages.append(f"8 (fused RoPE): {'retain' if keep_rope else 'omit'}; {train_minutes:.2f} min versus {winner_minutes:.4f} min; next {next_experiment} adds 11 (Polar Express fusion)")
+                            for message in messages:
+                                print(message, flush=True)
+                                summary.write(f"# {message}\n")
+                            summary.flush()
                         continue
 
                 failed = True
-                summary.write(f"{experiment}\tpatch_failed\tnot_attempted\t-\n")
+                summary.write(f"{label}\tpatch_failed\tnot_attempted\t-\n")
                 summary.flush()
-                print(f"experiment {experiment}: patch failed; see {console_path}", flush=True)
+                print(f"experiment {label}: patch failed; see {console_path}", flush=True)
+                if args.adaptive:
+                    return 1
             finally:
                 # keep cleanup running until the applied patch stack is fully reversed
                 previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
