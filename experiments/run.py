@@ -27,6 +27,7 @@ DEPENDENCIES = {
     "022": ["005", "019"],
     "023": ["005"],
 }
+COMBINATIONS = {"5+20+11": ["005", "020", "011"]}
 PREVIOUS_5_20_GAIN = 8.64
 
 
@@ -71,14 +72,14 @@ def read_training_result(run_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Apply experiments, train, upload to the Hub and reverse the patches")
-    parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs in execution order; include baseline explicitly; omitted runs all experiments with baseline first")
+    parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs or 5+20+11 in execution order; include baseline explicitly; omitted runs all experiments with baseline first")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="number of training GPUs (default: 1)")
     parser.add_argument("--adaptive", action="store_true", help="run baseline and 3+5, select against 5+20's historical 8.64%% saving, then test fused RoPE and Polar Express fusion")
     args = parser.parse_args()
     if args.adaptive and args.experiments:
         parser.error("--adaptive selects its own experiments; do not supply IDs")
-    if any(experiment not in ORDER for experiment in args.experiments):
-        parser.error(f"experiment IDs must be one of: {', '.join(ORDER)}")
+    if any(experiment not in ORDER and experiment not in COMBINATIONS for experiment in args.experiments):
+        parser.error(f"experiment IDs must be one of: {', '.join([*ORDER, *COMBINATIONS])}")
 
     os.chdir(ROOT)
     if not (os.environ.get("hf_user") or os.environ.get("HF_USER")):
@@ -101,7 +102,7 @@ def main():
         summary.write("experiment\ttrain_exit\tupload_exit\ttimestamp\n")
         summary.flush()
         experiments = ["baseline", "023"] if args.adaptive else args.experiments or ORDER
-        combinations = {}
+        combinations = COMBINATIONS.copy()
         for index, experiment in enumerate(experiments, 1):
             applied = []
             label = "3+5" if args.adaptive and experiment == "023" else experiment
