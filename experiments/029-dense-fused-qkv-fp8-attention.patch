@@ -150,9 +150,9 @@ new file mode 100644
 +    for block in range(tl.cdiv(K, 128)):
 +        k = block * 128 + inner
 +        a = tl.load(A + row[:, None] * a_stride_m + k[None, :] * a_stride_k,
-+                    (row[:, None] < M) & (k[None, :] < K), 0)
++                    (row[:, None] < M) & (k[None, :] < K), 0.0)
 +        b = tl.load(B + k[:, None] * b_stride_k + col[None, :] * b_stride_n,
-+                    (k[:, None] < K) & (col[None, :] < N), 0)
++                    (k[:, None] < K) & (col[None, :] < N), 0.0)
 +        a_scale = tl.load(AScale + row * as_stride_m + block * as_stride_k, row < M, 0)
 +        b_scale = tl.load(BScale + block * bs_stride_k + (col // 128) * bs_stride_n, col < N, 0)
 +        a_exponent = (a_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
