@@ -27,7 +27,10 @@ DEPENDENCIES = {
     "022": ["005", "019"],
     "023": ["005"],
 }
-COMBINATIONS = {"5+20+11": ["005", "020", "011"]}
+COMBINATIONS = {
+    "5+20+11": ["005", "020", "011"],
+    "5+20+11+6": ["005", "020", "011", "006"],
+}
 PREVIOUS_5_20_GAIN = 8.64
 
 
@@ -72,7 +75,7 @@ def read_training_result(run_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Apply experiments, train, upload to the Hub and reverse the patches")
-    parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs or 5+20+11 in execution order; include baseline explicitly; omitted runs all experiments with baseline first")
+    parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs or registered combinations in execution order; include baseline explicitly; omitted runs all experiments with baseline first")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="number of training GPUs (default: 1)")
     parser.add_argument("--adaptive", action="store_true", help="run baseline and 3+5, select against 5+20's historical 8.64%% saving, then test fused RoPE and Polar Express fusion")
     args = parser.parse_args()
