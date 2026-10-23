@@ -29,7 +29,7 @@ diff --git a/model/attention/qk_norm_rope.py b/model/attention/qk_norm_rope.py
 new file mode 100644
 --- /dev/null
 +++ b/model/attention/qk_norm_rope.py
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,228 @@
 +from __future__ import annotations
 +
 +from typing import Any, Tuple
@@ -59,8 +59,11 @@ new file mode 100644
 +    ct: tl.constexpr, cd: tl.constexpr, st: tl.constexpr, sd: tl.constexpr,
 +    EPS: tl.constexpr, RMS: tl.constexpr,
 +    SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
++    MIN_INF: tl.constexpr, MAX_INF: tl.constexpr,
 +    ROWS: tl.constexpr, BLOCK_D: tl.constexpr,
 +):
++    scale_min: tl.constexpr = SCALE_MIN if MIN_INF == 0 else (float("-inf") if MIN_INF < 0 else float("inf"))
++    scale_max: tl.constexpr = SCALE_MAX if MAX_INF == 0 else (float("-inf") if MAX_INF < 0 else float("inf"))
 +    batch_head = tl.program_id(0)
 +    batch = batch_head // (2 * H)
 +    head = batch_head % (2 * H)
@@ -90,7 +93,7 @@ new file mode 100644
 +    if RMS:
 +        statistic /= D
 +    gain = tl.rsqrt(statistic + EPS)
-+    scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, SCALE_MIN), SCALE_MAX)).to(dtype).to(tl.float32)
++    scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, scale_min), scale_max)).to(dtype).to(tl.float32)
 +    normalized = (rotated * gain.to(dtype).to(tl.float32)[:, None]).to(dtype).to(tl.float32)
 +    tl.store(out, normalized * scale, valid)
 +    tl.store(gain_out, gain, token < T)
@@ -106,8 +109,11 @@ new file mode 100644
 +    dkb: tl.constexpr, dkh: tl.constexpr, dkt: tl.constexpr, dkd: tl.constexpr,
 +    ct: tl.constexpr, cd: tl.constexpr, st: tl.constexpr, sd: tl.constexpr,
 +    RMS: tl.constexpr, SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
++    MIN_INF: tl.constexpr, MAX_INF: tl.constexpr,
 +    ROWS: tl.constexpr, BLOCK_D: tl.constexpr,
 +):
++    scale_min: tl.constexpr = SCALE_MIN if MIN_INF == 0 else (float("-inf") if MIN_INF < 0 else float("inf"))
++    scale_max: tl.constexpr = SCALE_MAX if MAX_INF == 0 else (float("-inf") if MAX_INF < 0 else float("inf"))
 +    batch_head = tl.program_id(0)
 +    batch = batch_head // (2 * H)
 +    head = batch_head % (2 * H)
@@ -139,7 +145,7 @@ new file mode 100644
 +    normalized = (rotated * rounded_gain[:, None]).to(dtype).to(tl.float32)
 +    scale_part = (grad * normalized).to(dtype).to(tl.float32)
 +    tl.store(DScalePart + batch_head * TILES + tl.program_id(1), tl.sum(tl.sum(scale_part, axis=1), axis=0))
-+    scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, SCALE_MIN), SCALE_MAX)).to(dtype).to(tl.float32)
++    scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, scale_min), scale_max)).to(dtype).to(tl.float32)
 +    grad = (grad * scale).to(dtype).to(tl.float32)
 +    grad_gain = tl.sum((grad * rotated).to(dtype).to(tl.float32), axis=1).to(dtype).to(tl.float32)
 +    # autocast keeps the norm branch in FP32 until its contribution returns to Q/K
@@ -158,19 +164,22 @@ new file mode 100644
 +def _scale_backward_kernel(
 +    Partials, QScale, KScale, DQScale, DKScale, Q,
 +    B: tl.constexpr, H: tl.constexpr, TILES: tl.constexpr,
-+    SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr, BLOCK: tl.constexpr,
++    SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
++    MIN_INF: tl.constexpr, MAX_INF: tl.constexpr, BLOCK: tl.constexpr,
 +):
++    scale_min: tl.constexpr = SCALE_MIN if MIN_INF == 0 else (float("-inf") if MIN_INF < 0 else float("inf"))
++    scale_max: tl.constexpr = SCALE_MAX if MAX_INF == 0 else (float("-inf") if MAX_INF < 0 else float("inf"))
 +    head = tl.program_id(0)
 +    index = tl.arange(0, BLOCK)
 +    partial = tl.load(Partials + (index // TILES) * (2 * H * TILES) + head * TILES + index % TILES, index < B * TILES, 0.0)
 +    grad = tl.sum(partial, axis=0).to(Q.dtype.element_ty).to(tl.float32)
 +    if head < H:
 +        raw_scale = tl.load(QScale + head).to(tl.float32)
-+        tl.store(DQScale + head, tl.where((raw_scale >= SCALE_MIN) & (raw_scale <= SCALE_MAX), grad, 0.0))
++        tl.store(DQScale + head, tl.where((raw_scale >= scale_min) & (raw_scale <= scale_max), grad, 0.0))
 +    else:
 +        head -= H
 +        raw_scale = tl.load(KScale + head).to(tl.float32)
-+        tl.store(DKScale + head, tl.where((raw_scale >= SCALE_MIN) & (raw_scale <= SCALE_MAX), grad, 0.0))
++        tl.store(DKScale + head, tl.where((raw_scale >= scale_min) & (raw_scale <= scale_max), grad, 0.0))
 +
 +
 +@triton_op("gpt_moe::qk_norm_rope_forward", mutates_args=())
@@ -184,10 +193,14 @@ new file mode 100644
 +    q_gain = torch.empty((batch, heads, seq_len), device=q.device, dtype=torch.float32)
 +    k_gain = torch.empty_like(q_gain)
 +    rows = 16 if head_size <= 64 else 8
++    # keep infinities out of Inductor's generated Python metadata
++    min_inf = (scale_min == float("inf")) - (scale_min == float("-inf"))
++    max_inf = (scale_max == float("inf")) - (scale_max == float("-inf"))
 +    wrap_triton(_forward_kernel)[(batch * 2 * heads, triton.cdiv(seq_len, rows))](
 +        q, k, q_scale, k_scale, cos, sin, q_out, k_out, q_gain, k_gain,
 +        seq_len, head_size, heads, *q.stride(), *k.stride(), *cos.stride()[-2:], *sin.stride()[-2:],
-+        eps, rms, scale_min, scale_max, rows, triton.next_power_of_2(head_size),
++        eps, rms, 0.0 if min_inf else scale_min, 0.0 if max_inf else scale_max,
++        min_inf, max_inf, rows, triton.next_power_of_2(head_size),
 +        num_warps=4, enable_fp_fusion=False,
 +    )
 +    return q_out, k_out, q_gain, k_gain
@@ -207,15 +220,19 @@ new file mode 100644
 +    dq_scale = torch.empty_like(q_scale)
 +    dk_scale = torch.empty_like(k_scale)
 +    partials = torch.empty((batch, 2 * heads, tiles), device=q.device, dtype=torch.float32)
++    min_inf = (scale_min == float("inf")) - (scale_min == float("-inf"))
++    max_inf = (scale_max == float("inf")) - (scale_max == float("-inf"))
 +    wrap_triton(_backward_kernel)[(batch * 2 * heads, tiles)](
 +        q, k, q_scale, k_scale, cos, sin, q_gain, k_gain, grad_q, grad_k, dq, dk, partials,
 +        seq_len, head_size, heads, tiles, *q.stride(), *k.stride(), *grad_q.stride(), *grad_k.stride(),
-+        *cos.stride()[-2:], *sin.stride()[-2:], rms, scale_min, scale_max,
++        *cos.stride()[-2:], *sin.stride()[-2:], rms,
++        0.0 if min_inf else scale_min, 0.0 if max_inf else scale_max, min_inf, max_inf,
 +        rows, triton.next_power_of_2(head_size), num_warps=4, enable_fp_fusion=False,
 +    )
 +    wrap_triton(_scale_backward_kernel)[(2 * heads,)](
 +        partials, q_scale, k_scale, dq_scale, dk_scale, q,
-+        batch, heads, tiles, scale_min, scale_max, triton.next_power_of_2(batch * tiles), num_warps=4,
++        batch, heads, tiles, 0.0 if min_inf else scale_min, 0.0 if max_inf else scale_max,
++        min_inf, max_inf, triton.next_power_of_2(batch * tiles), num_warps=4,
 +    )
 +    return dq, dk, dq_scale, dk_scale
 +
@@ -245,7 +262,7 @@ diff --git a/experiments/check_qk_norm_rope.py b/experiments/check_qk_norm_rope.
 new file mode 100644
 --- /dev/null
 +++ b/experiments/check_qk_norm_rope.py
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,105 @@
 +from pathlib import Path
 +import sys
 +
@@ -270,10 +287,10 @@ new file mode 100644
 +    return q, k
 +
 +
-+def run(operation, inputs, cos, sin, rms, gradients, selected=(0, 1), core=None):
++def run(operation, inputs, cos, sin, rms, gradients, selected=(0, 1), core=None, bounds=(-0.5, 1.5)):
 +    values = [value.detach().clone(memory_format=torch.preserve_format).requires_grad_(value.requires_grad) for value in inputs]
 +    with torch.autocast("cuda", dtype=torch.bfloat16):
-+        output = operation(*values, cos, sin, 1e-6, rms, -0.5, 1.5)
++        output = operation(*values, cos, sin, 1e-6, rms, *bounds)
 +        if core is not None:
 +            output = (core(*output),)
 +            selected = (0,)
@@ -316,6 +333,10 @@ new file mode 100644
 +        check(run(qk_norm_rope, inputs, cos, sin, rms, gradients), expected, label)
 +        if seq_len == 33:
 +            check(run(compiled, inputs, cos, sin, rms, gradients), run(compiled_reference, inputs, cos, sin, rms, gradients), label + " compiled")
++            for bounds in ((float("-inf"), 5.0), (float("-inf"), float("inf")), (-0.5, float("inf"))):
++                actual = run(compiled, inputs, cos, sin, rms, gradients, bounds=bounds)
++                expected = run(compiled_reference, inputs, cos, sin, rms, gradients, bounds=bounds)
++                check(actual, expected, label + f" compiled bounds={bounds}")
 +            for selected in ((0,), (1,)):
 +                selected_grads = [gradients[index] for index in selected]
 +                check(run(qk_norm_rope, inputs, cos, sin, rms, selected_grads, selected), run(reference, inputs, cos, sin, rms, selected_grads, selected), label + f" outputs={selected}")
