@@ -1,0 +1,68 @@
+diff --git a/flash_attn/cute/flash_fwd.py b/flash_attn/cute/flash_fwd.py
+--- a/flash_attn/cute/flash_fwd.py
++++ b/flash_attn/cute/flash_fwd.py
+@@ -957,6 +957,7 @@
+                 batch_idx=batch_size,
+                 head_idx=num_head,
+                 m_block=m_block,
++                n_block_min=n_block_min,
+                 aux_data=aux_data,
+                 fastdiv_mods=fastdiv_mods,
+             )
+@@ -991,11 +992,11 @@
+ 
+             for stage in cutlass.range_constexpr(self.num_stages):
+                 if const_expr(not self.Q_in_regs or stage > 0):
+-                    if stage == 0 or n_block - stage >= 0:
++                    if stage == 0 or n_block - stage >= n_block_min:
+                         load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
+                     cute.arch.cp_async_commit_group()
+                 if const_expr(stage < self.num_stages - 1):
+-                    if stage == 0 or n_block - stage >= 0:
++                    if stage == 0 or n_block - stage >= n_block_min:
+                         load_V(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
+                     cute.arch.cp_async_commit_group()
+             if const_expr(not self.Q_in_regs):
+@@ -1059,7 +1060,7 @@
+                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+             # The remaining iterations have no masking
+-            for n_tile in cutlass.range(n_block, unroll=1):
++            for n_tile in cutlass.range(cutlass.max(n_block - n_block_min, 0), unroll=1):
+                 compute_one_n_block(
+                     n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
+                     seqlen=seqlen, is_first_n_block=False,
+@@ -1067,7 +1068,6 @@
+                 )
+                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+-            # TODO: local
+ 
+             # normalize acc_O by row_sum and calculate the lse
+             row_scale = softmax.finalize()
+@@ -1110,6 +1110,7 @@
+         head_idx: cutlass.Int32,
+         m_block: cutlass.Int32,
+         seqlen: SeqlenInfoQK,
++        n_block_min: Int32,
+         aux_data: AuxData = AuxData(),
+         fastdiv_mods=None,
+         mask_fn: Optional[Callable] = None,
+@@ -1134,7 +1135,7 @@
+ 
+         # need predicates for the first tile
+         def load_V_next():
+-            if self.num_stages == 1 or n_block - self.num_stages + 1 >= 0:
++            if self.num_stages == 1 or n_block - self.num_stages + 1 >= n_block_min:
+                 load_V(
+                     n_block - self.num_stages + 1,
+                     smem_pipe_write,
+@@ -1174,7 +1175,7 @@
+         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+ 
+         def load_K_next():
+-            if n_block - self.num_stages >= 0:
++            if n_block - self.num_stages >= n_block_min:
+                 load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
+             cute.arch.cp_async_commit_group()
+ 

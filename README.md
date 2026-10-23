@@ -124,6 +124,26 @@ Use `anywinter4079/pytorch:2.16.0.dev20261009-cu134-deepgemm-experimental` in th
 
 The ordered code experiments and their application instructions are in [experiments/README.md](experiments/README.md).
 
+## Build and push the experimental CUDA 13.4 FlashAttention 4 image
+
+This extends the DeepGEMM image above with [FlashAttention 4 revision e7a6402](https://github.com/Dao-AILab/flash-attention/tree/e7a6402a9ff099de5eb628ce207a88a3f0aa5378/flash_attn/cute) (`4.0.0b36`), CUTLASS DSL 4.8.1, and CUTLASS 4.8.1 headers. It retains the existing Python 3.11, PyTorch nightly, CUDA toolkit, Transformer Engine and DeepGEMM installations. The build files are available directly; there is no need to apply experiment 043 first.
+
+The command below enables the experimental SM120 FlexAttention port, including its FA4 source changes and the corresponding PyTorch adapter changes. It also includes the native SM120 local-window correction. These are local patches to the pinned sources, rather than a claim of upstream support or validated GPU performance. The optional device-window variant is a separate build and cannot be combined with the Flex port.
+
+Run locally from the repository root with Docker Desktop running and the `amd64-builder` builder configured as above:
+
+```bash
+docker buildx build --builder amd64-builder --platform linux/amd64 \
+  -f docker_build/cu134-performance/Dockerfile \
+  --build-arg FA4_SM120_FLEX=1 \
+  -t anywinter4079/pytorch:2.16.0.dev20261009-cu134-fa4-experimental \
+  ./docker_build --push
+```
+
+Use `anywinter4079/pytorch:2.16.0.dev20261009-cu134-fa4-experimental` in the instance template. Its working directory is `/workspace` inside the container; the host repository can remain in its current location. The FA4 source checkout stays at `/opt/flash-attention` and CUTLASS headers at `/opt/cutlass`.
+
+The build checks the installed versions, imports and SM120 Flex marker without requiring a GPU. CUDA kernels compile on first use on the instance, where outputs and gradients still need validation before training. Installing this image does not select FA4 in the model: the exact-token SWA control can run with the existing Flex backend first, followed by the FA4 experiment with the same window semantics. Transformer Engine FP8 projection experiments can use this image too.
+
 ## Run
 
 ```
