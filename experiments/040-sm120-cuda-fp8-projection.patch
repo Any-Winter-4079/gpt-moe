@@ -1,0 +1,309 @@
+diff --git a/model/linear/attention_fp8.py b/model/linear/attention_fp8.py
+--- a/model/linear/attention_fp8.py
++++ b/model/linear/attention_fp8.py
+@@ -1,5 +1,8 @@
+ from __future__ import annotations
+ 
++from functools import lru_cache
++import os
++from pathlib import Path
+ from typing import List, Optional, Tuple
+ 
+ import torch
+@@ -43,15 +46,14 @@
+     tl.store(Transposed + col[None, :] * n + packed_row[:, None], quantized)
+     exponent = (scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+     k_block = tl.program_id(1)
+-    scale_ptr = Scale.to(tl.pointer_type(tl.uint8)) + ((k_block // 4) * n + packed_row) * 4
+-    transposed_ptr = TransposedScale.to(tl.pointer_type(tl.uint8)) + ((block // 4) * k + col) * 4
+-    tl.store(scale_ptr + k_block % 4, exponent)
+-    tl.store(transposed_ptr + block % 4, exponent)
+-    for padding in tl.static_range(1, 4):
+-        if k_block == k // 128 - 1:
+-            tl.store(scale_ptr + k_block % 4 + padding, 0, k_block % 4 + padding < 4)
+-        if block == n // 128 - 1:
+-            tl.store(transposed_ptr + block % 4 + padding, 0, block % 4 + padding < 4)
++    lane = tl.arange(0, 128)
++    swizzle = (lane % 32) * 16 + (lane // 32) * 4
++    scale_ptr = Scale + (block * (k // 128) + k_block) * 512 + swizzle
++    transposed_ptr = TransposedScale + (k_block * (n // 128) + block) * 512 + swizzle
++    # repeat each 128-element scale across the four hardware groups
++    for group in tl.static_range(4):
++        tl.store(scale_ptr + group, exponent)
++        tl.store(transposed_ptr + group, exponent)
+ 
+ 
+ @triton_op("gpt_moe::attention_quantize_weights", mutates_args=())
+@@ -63,9 +65,9 @@
+     padded_k = triton.cdiv(k, 128) * 128
+     quantized = torch.empty((n, padded_k), device=weights[0].device, dtype=torch.float8_e4m3fn)
+     transposed = torch.empty((padded_k, n), device=weights[0].device, dtype=quantized.dtype)
+-    # native dense GEMMs read MN-major scales with four UE8M0 bytes per int32
+-    scale = torch.empty((triton.cdiv(k, 512), n), device=weights[0].device, dtype=torch.int32).t()
+-    transposed_scale = torch.empty((triton.cdiv(n, 512), padded_k), device=weights[0].device, dtype=torch.int32).t()
++    # CUTLASS reads contiguous UE8M0 scales in its 128-by-4 tiled layout
++    scale = torch.empty((n * (padded_k // 32),), device=weights[0].device, dtype=torch.uint8)
++    transposed_scale = torch.empty((padded_k * (n // 32),), device=weights[0].device, dtype=torch.uint8)
+     w0, w1, w2 = weights if len(weights) == 3 else (weights[0], weights[0], weights[0])
+     n0, n1, n2 = widths if len(weights) == 3 else (widths[0], 0, 0)
+     wrap_triton(_quantize_weights_kernel)[(n // 128, triton.cdiv(k, 128))](
+@@ -102,13 +104,11 @@
+     packed_col = block * 128 + tl.arange(0, 128)
+     row_scale = _inverse_scale(tl.max(tl.abs(values), axis=1))
+     tl.store(Row + row[:, None] * K + packed_col[None, :], (values / row_scale[:, None]).to(tl.float8e4nv), row[:, None] < M)
+-    scale_m: tl.constexpr = tl.cdiv(M, 4) * 4
+-    row_scale_ptr = RowScale.to(tl.pointer_type(tl.uint8)) + ((block // 4) * scale_m + row) * 4
++    lane = tl.arange(0, 128)
++    row_scale_ptr = RowScale + (tile * (K // 128) + block) * 512 + (lane % 32) * 16 + (lane // 32) * 4
+     row_exponent = (row_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+-    tl.store(row_scale_ptr + block % 4, tl.where(row < M, row_exponent, 0), row < scale_m)
+-    if block == K // 128 - 1:
+-        for padding in tl.static_range(1, 4):
+-            tl.store(row_scale_ptr + block % 4 + padding, 0, (row < scale_m) & (block % 4 + padding < 4))
++    for group in tl.static_range(4):
++        tl.store(row_scale_ptr + group, tl.where(row < M, row_exponent, 0))
+     if SAVE_COLUMN:
+         column_scale = _inverse_scale(tl.max(tl.abs(values), axis=0))
+         column_m: tl.constexpr = tl.cdiv(M, 128) * 128
+@@ -121,13 +121,13 @@
+                 tl.store(scale_ptr + tile % 4 + padding, 0, tile % 4 + padding < 4)
+ 
+ 
+-@triton_op("gpt_moe::attention_dg_quantize_activations", mutates_args=())
++@triton_op("gpt_moe::attention_cutlass_quantize_activations", mutates_args=())
+ def _quantize_activations(inputs: List[Tensor], save_column: bool) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     m = inputs[0].shape[0]
+     widths = [value.shape[1] for value in inputs]
+     k = sum(triton.cdiv(width, 128) * 128 for width in widths)
+     row = torch.empty((m, k), device=inputs[0].device, dtype=torch.float8_e4m3fn)
+-    row_scale = torch.empty((triton.cdiv(k, 512), triton.cdiv(m, 4) * 4), device=row.device, dtype=torch.int32)[:, :m].t()
++    row_scale = torch.empty((triton.cdiv(m, 128) * 128 * (k // 32),), device=row.device, dtype=torch.uint8)
+     column = torch.empty((k, triton.cdiv(m, 128) * 128) if save_column else (0,), device=row.device, dtype=row.dtype)
+     column_scale = torch.empty((triton.cdiv(m, 512), k) if save_column else (0,), device=row.device, dtype=torch.int32)
+     x0, x1, x2 = inputs if len(inputs) == 3 else (inputs[0], inputs[0], inputs[0])
+@@ -139,14 +139,31 @@
+     return row, row_scale, column, column_scale
+ 
+ 
+-@custom_op("gpt_moe::attention_deepgemm_mm", mutates_args=())
++@lru_cache(maxsize=1)
++def _cuda_projection():
++    from torch.utils.cpp_extension import load
++
++    cutlass_path = Path(os.environ.get("CUTLASS_PATH", "/opt/cutlass"))
++    if not (cutlass_path / "include/cutlass/version.h").is_file():
++        raise RuntimeError("SM120 CUDA attention requires CUTLASS 4.8.1 headers at CUTLASS_PATH")
++    return load(
++        name="gpt_moe_attention_sm120",
++        sources=[str(Path(__file__).with_name("attention_sm120.cu"))],
++        extra_include_paths=[str(cutlass_path / "include")],
++        extra_cflags=["-O3", "-std=c++20"],
++        extra_cuda_cflags=[
++            "-O3", "-std=c++20", "--expt-relaxed-constexpr",
++            "-gencode=arch=compute_120a,code=sm_120a",
++        ],
++    )
++
++
++@custom_op("gpt_moe::attention_cutlass_sm120_mm", mutates_args=())
+ def _matmul(a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, dtype: torch.dtype) -> Tensor:
+-    import deep_gemm
+-
+     if torch.cuda.get_device_capability(a.device) != (12, 0):
+-        raise ValueError("DeepGEMM FP8 attention projections require SM120")
++        raise ValueError("CUDA FP8 attention projections require SM120")
+     out = torch.empty((a.shape[0], b.shape[0]), device=a.device, dtype=dtype)
+-    deep_gemm.fp8_gemm_nt((a, a_scale), (b, b_scale), out, recipe=(1, 1, 128), disable_ue8m0_cast=True)
++    _cuda_projection().matmul(a, b, a_scale, b_scale, out)
+     return out
+ 
+ 
+diff --git a/model/linear/attention_sm120.cu b/model/linear/attention_sm120.cu
+new file mode 100644
+--- /dev/null
++++ b/model/linear/attention_sm120.cu
+@@ -0,0 +1,165 @@
++/*
++ * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ * list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++// based on NVIDIA CUTLASS example 79c and the SM120 blockscaled collective builder
++// https://github.com/NVIDIA/cutlass/tree/2c85f497547eb441f0fe80bfb0fb2e6f9add1719/examples/79_blackwell_geforce_gemm
++
++#include <torch/extension.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAException.h>
++#include <climits>
++
++#include "cute/tensor.hpp"
++#include "cutlass/cutlass.h"
++#include "cutlass/version.h"
++#include "cutlass/detail/sm100_blockscaled_layout.hpp"
++#include "cutlass/epilogue/collective/collective_builder.hpp"
++#include "cutlass/gemm/collective/collective_builder.hpp"
++#include "cutlass/gemm/device/gemm_universal_adapter.h"
++#include "cutlass/gemm/kernel/gemm_universal.hpp"
++
++static_assert(CUTLASS_MAJOR == 4 && CUTLASS_MINOR == 8 && CUTLASS_PATCH == 1,
++              "this experiment requires CUTLASS 4.8.1");
++
++namespace {
++
++using namespace cute;
++using Element = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
++using Layout = cutlass::layout::RowMajor;
++using Tile = Shape<_128, _64, _128>;
++using Cluster = Shape<_1, _1, _1>;
++
++template <class Output>
++struct Projection {
++    static constexpr int Alignment = 128 / cutlass::sizeof_bits<Output>::value;
++    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
++        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
++        Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
++        float, float, void, Layout, Alignment, Output, Layout, Alignment,
++        cutlass::epilogue::collective::EpilogueScheduleAuto
++    >::CollectiveOp;
++    // one producer warpgroup feeds TMA buffers while two warpgroups consume them
++    // reserve epilogue space before selecting the number of shared-memory stages
++    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
++        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
++        Element, Layout, 16, Element, cutlass::layout::ColumnMajor, 16,
++        float, Tile, Cluster,
++        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
++        cutlass::gemm::KernelTmaWarpSpecializedCooperative
++    >::CollectiveOp;
++    using Kernel = cutlass::gemm::kernel::GemmUniversal<
++        Shape<int, int, int, int>, Mainloop, Epilogue
++    >;
++    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
++    static_assert(Mainloop::DispatchPolicy::Stages >= 2, "at least two TMA stages are required");
++    static_assert(Kernel::SharedStorageSize <= 101376, "SM120 shared-memory budget exceeded");
++};
++
++void check_status(cutlass::Status status, const char* operation) {
++    TORCH_CHECK(status == cutlass::Status::kSuccess, operation, ": ", cutlass::cutlassGetStatusString(status));
++}
++
++template <class Output>
++void run(const at::Tensor& a, const at::Tensor& b, const at::Tensor& a_scale,
++         const at::Tensor& b_scale, at::Tensor& out, cudaStream_t stream) {
++    using Config = Projection<Output>;
++    using Gemm = typename Config::Gemm;
++    using Kernel = typename Config::Kernel;
++    using ScaleConfig = typename Config::Mainloop::Sm1xxBlkScaledConfig;
++    int m = a.size(0), n = b.size(0), k = a.size(1);
++    typename Kernel::StrideA stride_a{};
++    typename Kernel::StrideB stride_b{};
++    typename Kernel::StrideC stride_c{};
++    typename Kernel::StrideD stride_d{};
++    get<0>(stride_a) = k;
++    get<0>(stride_b) = k;
++    get<0>(stride_c) = n;
++    get<0>(stride_d) = n;
++    auto shape = make_shape(m, n, k, 1);
++    auto layout_a = ScaleConfig::tile_atom_to_shape_SFA(shape);
++    auto layout_b = ScaleConfig::tile_atom_to_shape_SFB(shape);
++    TORCH_CHECK(a_scale.numel() == cosize(layout_a) && b_scale.numel() == cosize(layout_b),
++                "invalid CUTLASS scale storage size");
++    typename Gemm::Arguments arguments{
++        cutlass::gemm::GemmUniversalMode::kGemm, shape,
++        {
++            reinterpret_cast<const cutlass::float_e4m3_t*>(a.data_ptr()), stride_a,
++            reinterpret_cast<const cutlass::float_e4m3_t*>(b.data_ptr()), stride_b,
++            reinterpret_cast<const cutlass::float_ue8m0_t*>(a_scale.data_ptr()), layout_a,
++            reinterpret_cast<const cutlass::float_ue8m0_t*>(b_scale.data_ptr()), layout_b,
++        },
++        {{1.f, 0.f}, nullptr, stride_c, reinterpret_cast<Output*>(out.data_ptr()), stride_d},
++    };
++    arguments.hw_info.device_id = a.get_device();
++    arguments.hw_info.sm_count = at::cuda::getDeviceProperties(a.get_device())->multiProcessorCount;
++    Gemm gemm;
++    check_status(gemm.can_implement(arguments), "CUTLASS can_implement");
++    auto workspace = at::empty(
++        {static_cast<int64_t>(Gemm::get_workspace_size(arguments))}, a.options().dtype(at::kByte));
++    check_status(gemm.initialize(arguments, workspace.data_ptr(), stream), "CUTLASS initialize");
++    check_status(gemm.run(stream), "CUTLASS run");
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void matmul(const at::Tensor& a, const at::Tensor& b, const at::Tensor& a_scale,
++            const at::Tensor& b_scale, at::Tensor out) {
++    TORCH_CHECK(a.is_cuda() && b.device() == a.device() && out.device() == a.device()
++                && a_scale.device() == a.device() && b_scale.device() == a.device(),
++                "CUDA attention operands must be on the same GPU");
++    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && out.dim() == 2
++                && a.size(1) == b.size(1) && out.size(0) == a.size(0) && out.size(1) == b.size(0),
++                "invalid CUDA attention matrix shapes");
++    TORCH_CHECK(a.scalar_type() == at::kFloat8_e4m3fn && b.scalar_type() == at::kFloat8_e4m3fn
++                && a_scale.scalar_type() == at::kByte && b_scale.scalar_type() == at::kByte,
++                "CUDA attention expects E4M3 operands and UE8M0 scale bytes");
++    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && out.is_contiguous()
++                && a_scale.is_contiguous() && b_scale.is_contiguous(),
++                "CUDA attention operands must be contiguous");
++    TORCH_CHECK(a.size(0) > 0 && a.size(0) <= INT_MAX && b.size(0) <= INT_MAX
++                && a.size(1) <= INT_MAX && b.size(0) % 128 == 0 && a.size(1) % 128 == 0,
++                "CUDA attention requires nonempty matrices with padded N and K multiples of 128");
++    c10::cuda::CUDAGuard guard(a.device());
++    const auto* properties = at::cuda::getDeviceProperties(a.get_device());
++    TORCH_CHECK(properties->major == 12 && properties->minor == 0, "CUDA attention requires SM120");
++    auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
++    if (out.scalar_type() == at::kBFloat16) {
++        run<cutlass::bfloat16_t>(a, b, a_scale, b_scale, out, stream);
++    } else {
++        TORCH_CHECK(out.scalar_type() == at::kFloat, "CUDA attention output must be BF16 or FP32");
++        run<float>(a, b, a_scale, b_scale, out, stream);
++    }
++}
++
++}  // namespace
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
++    module.def("matmul", &matmul);
++}
+diff --git a/runtime/reporting.py b/runtime/reporting.py
+--- a/runtime/reporting.py
++++ b/runtime/reporting.py
+@@ -51,11 +51,13 @@
+         except OSError as error:
+             log_buffer.append(f"unavailable: {error}")
+ 
+-    # read only Python files in the source directories, without traversing datasets or environments
++    # read source files without traversing datasets or environments
+     source_dirs = ("", "checkpointing", "config", "data", "evaluation", "model", "optimizers", "runtime", "sampling", "schedules")
+     for directory in source_dirs:
+-        pattern = "**/*.py" if directory == "model" else "*.py"
++        pattern = "**/*" if directory == "model" else "*.py"
+         for path in sorted((source_root / directory).glob(pattern)):
++            if directory == "model" and path.suffix not in (".py", ".cu", ".cuh"):
++                continue
+             log_buffer.extend([
+                 "=" * 100,
+                 f"source: {path.relative_to(source_root).as_posix()}",

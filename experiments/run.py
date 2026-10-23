@@ -34,8 +34,28 @@ COMBINATIONS = {
     "5+20+11+6+12": ["025"],
     "5+20+11+12+19": ["026"],
     "5+20+11+12+19+21": ["027"],
+    "5+20+11+12+19+21+exact-swa": ["027", "036"],
+    "5+20+11+12+19+21+exact-swa+fa4": ["027", "036", "037"],
+    "5+20+11+12+19+21+fa4-device": ["027", "036", "037", "046"],
+    "5+20+11+12+19+21+mla": ["027", "038"],
+    "5+20+11+12+19+21+qk-rope": ["027", "039"],
+    "5+20+11+12+19+21+exact-swa+flex-fa4": ["027", "036", "041"],
     "5+20+11+12+19+21+attention": ["027", "028"],
     "5+20+11+12+19+21+attention-fused": ["027", "029"],
+    "5+20+11+12+19+21+attention-dg": ["027", "029", "030"],
+    "5+20+11+12+19+21+attention-mx": ["027", "029", "030", "035"],
+    "5+20+11+12+19+21+attention-cuda": ["027", "029", "030", "040"],
+    "5+20+11+12+19+21+attention-wide": ["027", "029", "030", "040", "050"],
+    "5+20+11+12+19+21+qkv-epilogue": ["027", "029", "030", "040", "045"],
+    "5+20+11+12+19+21+qkv-backquant": ["027", "029", "030", "044"],
+    "5+20+11+12+19+21+attention-dw": ["027", "029", "030", "047"],
+    "5+20+11+12+19+21+attention-dx16": ["027", "029", "030", "031"],
+    "5+20+11+12+19+21+attention-pipe": ["027", "029", "032"],
+    "5+20+11+12+19+21+attention-qkv": ["027", "029", "030", "033"],
+    "5+20+11+12+19+21+attention-out": ["027", "029", "030", "034"],
+    "5+20+11+12+19+21+inverse-route": ["027", "042"],
+    "5+20+11+12+19+21+polar-triangle": ["027", "048"],
+    "5+20+11+12+19+21+attention-te": ["027", "049"],
 }
 PREVIOUS_5_20_GAIN = 8.64
 
@@ -143,7 +163,7 @@ def main():
                         created = {path.name for path in runs_dir.iterdir() if path.is_dir()} - before
                         if len(created) > 1:
                             raise RuntimeError("multiple new run directories; cannot identify this experiment's results")
-                        timestamp = next(iter(created)) if created else f"{batch}_exp{experiment}_{index:02d}_failed"
+                        timestamp = next(iter(created)) if created else f"{batch}_exp{index:02d}_failed"
                         run_dir = runs_dir / timestamp
                         if not created:
                             run_dir.mkdir()

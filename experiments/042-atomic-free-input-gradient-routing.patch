@@ -1,0 +1,158 @@
+diff --git a/model/feedforward/moe.py b/model/feedforward/moe.py
+--- a/model/feedforward/moe.py
++++ b/model/feedforward/moe.py
+@@ -107,12 +107,14 @@
+             0, expert_indices, torch.ones_like(expert_indices, dtype=torch.int32),
+         )
+         offsets = counts.cumsum(0, dtype=torch.int32)
++        inverse_order = torch.empty_like(order).scatter_(0, order, torch.arange(order.numel(), device=order.device))
+         reuse_weights = self.training and torch.is_grad_enabled()
+         if self.experts[0].up_proj.precision == "fp8":
+             packed = grouped_linear_fp8_weights(
+                 hidden_states, [expert.up_proj.weight for expert in self.experts], offsets,
+                 self.fp8_wgrad_backend, order=order, top_k=self.top_k,
+                 prepared_weight=self.prepared_up_weight if reuse_weights else None,
++                inverse_order=inverse_order,
+             )
+         else:
+             packed = hidden_states[order // self.top_k]
+@@ -143,6 +145,5 @@
+             packed = packed + down_bias[expert_indices]
+ 
+         # restore token/top-k order before summing, avoiding atomic output accumulation
+-        inverse_order = torch.empty_like(order).scatter_(0, order, torch.arange(order.numel(), device=order.device))
+         expert_output = packed[inverse_order].view(hidden_states.shape[0], self.top_k, -1).to(hidden_states.dtype)
+         return (expert_output * top_k_weights[:, :, None].to(hidden_states.dtype)).sum(dim=1)
+diff --git a/model/linear/grouped_fp8.py b/model/linear/grouped_fp8.py
+--- a/model/linear/grouped_fp8.py
++++ b/model/linear/grouped_fp8.py
+@@ -347,7 +347,7 @@
+ @triton_op("gpt_moe::grouped_linear_fp8_weights_forward", mutates_args=())
+ def _weights_forward(
+     x: Tensor, weights: List[Tensor], offsets: Tensor, save_backward: bool, deepgemm: bool, relu2: bool,
+-    order: Optional[Tensor], top_k: int,
++    order: Optional[Tensor], top_k: int, inverse_order: Optional[Tensor],
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+     row, row_scale, column, column_scale, _ = _quantize_activations(
+         x, offsets, save_backward, deepgemm, relu2=relu2, order=order, top_k=top_k,
+@@ -362,7 +362,7 @@
+ @triton_op("gpt_moe::grouped_linear_fp8_cached_weights_forward", mutates_args=())
+ def _cached_weights_forward(
+     x: Tensor, weights: List[Tensor], weight_fp8: Tensor, weight_scale: Tensor, offsets: Tensor,
+-    save_backward: bool, deepgemm: bool, relu2: bool, order: Optional[Tensor], top_k: int,
++    save_backward: bool, deepgemm: bool, relu2: bool, order: Optional[Tensor], top_k: int, inverse_order: Optional[Tensor],
+ ) -> Tuple[Tensor, Tensor, Tensor]:
+     row, row_scale, column, column_scale, _ = _quantize_activations(
+         x, offsets, save_backward, deepgemm, relu2=relu2, order=order, top_k=top_k,
+@@ -389,6 +389,34 @@
+     return grad_x, grad_weight
+ 
+ 
++@triton.jit
++def _unpack_input_gradient_kernel(
++    Packed, InverseOrder, Output,
++    M: tl.constexpr, K: tl.constexpr, TOP_K: tl.constexpr,
++    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
++):
++    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
++    col = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
++    mask = (row[:, None] < M) & (col[None, :] < K)
++    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
++    for selected in tl.static_range(TOP_K):
++        packed_row = tl.load(InverseOrder + row * TOP_K + selected, mask=row < M, other=0)
++        values = tl.load(Packed + packed_row[:, None] * K + col[None, :], mask=mask, other=0.0)
++        # retain the destination dtype after each expert contribution
++        acc = (acc + values.to(tl.float32)).to(Output.dtype.element_ty).to(tl.float32)
++    tl.store(Output + row[:, None] * K + col[None, :], acc, mask=mask)
++
++
++@triton_op("gpt_moe::unpack_fp8_input_gradient", mutates_args=())
++def _unpack_input_gradient(packed: Tensor, inverse_order: Tensor, top_k: int) -> Tensor:
++    m, k = inverse_order.numel() // top_k, packed.shape[1]
++    output = packed.new_empty((m, k))
++    wrap_triton(_unpack_input_gradient_kernel)[(triton.cdiv(m, 16), triton.cdiv(k, 128))](
++        packed, inverse_order, output, m, k, top_k, 16, 128,
++    )
++    return output
++
++
+ def _setup_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
+     x, weight, offsets, _, ctx.deepgemm = inputs
+     ctx.input_dtype = x.dtype
+@@ -456,44 +484,42 @@
+ 
+ 
+ def _setup_weights_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
+-    x, weights, offsets, _, ctx.deepgemm, relu2, order, ctx.top_k = inputs
++    x, weights, offsets, _, ctx.deepgemm, relu2, _, ctx.top_k, inverse_order = inputs
+     ctx.input_shape = x.shape
+     ctx.input_dtype = x.dtype
+     ctx.weight_dtype = weights[0].dtype
+     ctx.set_materialize_grads(False)
+     ctx.mark_non_differentiable(*output[1:])
+-    ctx.save_for_backward(*output[1:], offsets, x if relu2 else None, order)
++    ctx.save_for_backward(*output[1:], offsets, x if relu2 else None, inverse_order)
+ 
+ 
+ def _weights_backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
+-    x_column, x_scale, weight, weight_scale, offsets, preactivation, order = ctx.saved_tensors
++    x_column, x_scale, weight, weight_scale, offsets, preactivation, inverse_order = ctx.saved_tensors
+     grad_x, grad_weight = _backward_gemms(
+         grad, x_column, x_scale, weight, weight_scale, offsets, ctx.input_dtype, ctx.weight_dtype,
+         ctx.deepgemm, preactivation,
+     )
+-    if order is not None:
+-        grad_x = torch.zeros(ctx.input_shape, device=grad.device, dtype=ctx.input_dtype).index_put(
+-            (order // ctx.top_k,), grad_x, accumulate=True,
+-        )
+-    return grad_x, list(grad_weight.unbind(0)), None, None, None, None, None, None
++    if inverse_order is not None:
++        grad_x = _unpack_input_gradient(grad_x, inverse_order, ctx.top_k)
++    return grad_x, list(grad_weight.unbind(0)), None, None, None, None, None, None, None
+ 
+ 
+ _weights_forward.register_autograd(_weights_backward, setup_context=_setup_weights_context)
+ 
+ 
+ def _setup_cached_weights_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
+-    x, weights, weight_fp8, weight_scale, offsets, _, ctx.deepgemm, relu2, order, ctx.top_k = inputs
++    x, weights, weight_fp8, weight_scale, offsets, _, ctx.deepgemm, relu2, _, ctx.top_k, inverse_order = inputs
+     ctx.input_shape = x.shape
+     ctx.input_dtype = x.dtype
+     ctx.weight_dtype = weights[0].dtype
+     ctx.set_materialize_grads(False)
+     ctx.mark_non_differentiable(*output[1:])
+-    ctx.save_for_backward(*output[1:], weight_fp8, weight_scale, offsets, x if relu2 else None, order)
++    ctx.save_for_backward(*output[1:], weight_fp8, weight_scale, offsets, x if relu2 else None, inverse_order)
+ 
+ 
+ def _cached_weights_backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
+     grad_x, grad_weights, *_ = _weights_backward(ctx, grad, *unused)
+-    return grad_x, grad_weights, None, None, None, None, None, None, None, None
++    return grad_x, grad_weights, None, None, None, None, None, None, None, None, None
+ 
+ 
+ _cached_weights_forward.register_autograd(_cached_weights_backward, setup_context=_setup_cached_weights_context)
+@@ -503,17 +529,20 @@
+     x: Tensor, weights: List[Tensor], offsets: Tensor, wgrad_backend: str = "triton", relu2: bool = False,
+     order: Optional[Tensor] = None, top_k: int = 1,
+     prepared_weight: Optional[Tuple[Tensor, Tensor]] = None,
++    inverse_order: Optional[Tensor] = None,
+ ) -> Tensor:
+     if wgrad_backend not in ("triton", "deepgemm"):
+         raise ValueError(f"unsupported grouped FP8 weight-gradient backend: {wgrad_backend}")
+     if relu2 and x.dtype != torch.bfloat16:
+         raise ValueError("fused grouped FP8 ReLU2 requires bfloat16 preactivations")
++    if order is not None and inverse_order is None:
++        inverse_order = torch.empty_like(order).scatter_(0, order, torch.arange(order.numel(), device=order.device))
+     save_backward = torch.is_grad_enabled() and (x.requires_grad or any(weight.requires_grad for weight in weights))
+     if prepared_weight is not None:
+         return _cached_weights_forward(
+-            x, weights, *prepared_weight, offsets, save_backward, wgrad_backend == "deepgemm", relu2, order, top_k,
++            x, weights, *prepared_weight, offsets, save_backward, wgrad_backend == "deepgemm", relu2, order, top_k, inverse_order,
+         )[0]
+-    return _weights_forward(x, weights, offsets, save_backward, wgrad_backend == "deepgemm", relu2, order, top_k)[0]
++    return _weights_forward(x, weights, offsets, save_backward, wgrad_backend == "deepgemm", relu2, order, top_k, inverse_order)[0]
+ 
+ 
+ def grouped_linear_fp8(x: Tensor, weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton") -> Tensor:

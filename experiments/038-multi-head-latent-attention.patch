@@ -1,0 +1,828 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -45,6 +45,15 @@
+     n_kv_heads: int = 16
+     attn_dim: int = 1024
+     use_flex_attention: bool = True # True for FlexAttention or False for SDPA
++    # MLA shares a compressed KV latent; dimensions are independent of the MHA head size
++    use_mla: bool = True
++    mla_q_rank: int = 0 # 0 uses a direct query projection
++    mla_kv_rank: int = 128
++    mla_qk_content_dim: int = 48
++    mla_qk_rope_dim: int = 16
++    mla_value_dim: int = 64
++    mla_norm_eps: float = 1e-6
++    mla_recompute_attention: bool = False
+     # NOTE: for performance reasons, SWA, attention logit soft capping and doc masking require FlexAttention
+     use_doc_masking: bool = False
+     use_attn_logit_softcapping: bool = False # True for tanh soft-capping of attention logits (Gemma2/Grok-1 style), applied via score_mod before softmax
+diff --git a/model/block.py b/model/block.py
+--- a/model/block.py
++++ b/model/block.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++from functools import partial
+ from typing import TYPE_CHECKING, Optional, Tuple
+ 
+ import torch
+@@ -8,6 +9,7 @@
+ from torch.nn.attention.flex_attention import BlockMask
+ 
+ from .attention.self_attention import SelfAttention
++from .attention.mla import MLACache, MultiHeadLatentAttention
+ from .feedforward.mlp import MLP
+ from .feedforward.moe import MoE
+ 
+@@ -41,7 +43,8 @@
+             self.ln_1 = nn.RMSNorm(gpt_config.d_model)
+         else:
+             self.ln_1 = nn.LayerNorm(gpt_config.d_model)
+-        self.attn = SelfAttention(gpt_config, training_config, layer_idx=layer_idx)
++        attention_class = MultiHeadLatentAttention if gpt_config.use_mla else SelfAttention
++        self.attn = attention_class(gpt_config, training_config, layer_idx=layer_idx)
+         if gpt_config.norm_type.lower() == "rms":
+             self.ln_2 = nn.RMSNorm(gpt_config.d_model)
+         else:
+@@ -56,8 +59,12 @@
+             x: Tensor,
+             flex_attn_block_mask: Optional[BlockMask] = None,
+             sdpa_attn_mask: Optional[Tensor] = None,
++            mla_cache: Optional[MLACache] = None,
++            cache_start_pos: int = 0,
++            cache_window_size: Optional[Tensor] = None,
+             ) -> Tuple[Tensor, Optional[Tensor]]:
+         balance_loss = None
++        attention = self.attn if mla_cache is None else partial(self.attn.forward_cached, cache=mla_cache, start_pos=cache_start_pos, window_size=cache_window_size)
+         # weighted path
+         if self.use_weighted_residual_path or self.use_weighted_main_path:
+             # match activation dtype to the receiving module's weight dtype when autocast is disabled
+@@ -68,13 +75,13 @@
+             # Attention
+             if self.use_weighted_residual_path and not self.use_weighted_main_path:
+                 # x = alpha_1 * x + Attn(norm(x))
+-                x = self.attn_residual_scale * x + self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
++                x = self.attn_residual_scale * x + attention(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+             elif not self.use_weighted_residual_path and self.use_weighted_main_path:
+                 # x = x + beta_1 * Attn(norm(x))
+-                x = x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
++                x = x + self.attn_main_scale * attention(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+             else:
+                 # x = alpha_1 * x + beta_1 * Attn(norm(x))
+-                x = self.attn_residual_scale * x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
++                x = self.attn_residual_scale * x + self.attn_main_scale * attention(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+ 
+             # match activation dtype to the receiving module's weight dtype when autocast is disabled
+             x_ln2 = x
+@@ -101,7 +108,7 @@
+             x_ln1 = x
+             if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln1.dtype != self.ln_1.weight.dtype:
+                 x_ln1 = x_ln1.to(dtype=self.ln_1.weight.dtype)
+-            x = x + self.residual_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
++            x = x + self.residual_scale * attention(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+             # match activation dtype to the receiving module's weight dtype when autocast is disabled
+             x_ln2 = x
+             if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -16,6 +16,7 @@
+ if TYPE_CHECKING:
+     from config.model import GPTConfig
+     from config.training import TrainingConfig
++    from .attention.mla import MLACache
+ 
+ 
+ class GPT(nn.Module):
+@@ -51,6 +52,7 @@
+         self.is_causal = gpt_config.is_causal
+ 
+         self.use_flex_attention = gpt_config.use_flex_attention
++        self.use_mla = gpt_config.use_mla
+         self.flex_block_size = training_config.flex_block_size
+ 
+         self.use_doc_masking = gpt_config.use_doc_masking
+@@ -680,6 +682,75 @@
+             allow_mask_4d = allow_mask_4d & allow_causal
+         return allow_mask_4d
+ 
++    def allocate_mla_cache(self, batch_size: int, max_seq_len: int, *, device: Union[str, torch.device], dtype: torch.dtype) -> List[MLACache]:
++        if not self.use_mla or self.stage_index is not None:
++            raise ValueError("MLA cache requires an MLA model without pipeline parallelism")
++        if not 0 < max_seq_len <= self.max_seq_len:
++            raise ValueError("MLA cache length must be between 1 and max_seq_len")
++        return [block.attn.allocate_cache(batch_size, max_seq_len, device=device, dtype=dtype) for block in self.transformer.h]
++
++    def _build_mla_cached_mask(self, attn_mask: Optional[Tensor], document_ids: Optional[Tensor], batch_size: int, seq_len: int, start_pos: int, device: Union[str, torch.device], apply_swa: bool) -> Optional[Union[Tensor, BlockMask]]:
++        if not self.use_flex_attention and start_pos == 0 and attn_mask is None and document_ids is None:
++            return None
++        window_size = self.sliding_window_size
++        end_pos = start_pos + seq_len
++
++        def mask_mod(batch_index, head_index, query_index, key_index):
++            query_position = query_index + start_pos
++            keep = (query_position < end_pos) & (key_index < end_pos) & (query_position >= key_index)
++            if apply_swa:
++                keep = keep & (query_position - key_index <= window_size)
++            if attn_mask is not None:
++                keep = keep & attn_mask[batch_index, query_position.clamp_max(end_pos - 1)] & attn_mask[batch_index, key_index.clamp_max(end_pos - 1)]
++            if document_ids is not None:
++                keep = keep & (document_ids[batch_index, query_position.clamp_max(end_pos - 1)] == document_ids[batch_index, key_index.clamp_max(end_pos - 1)])
++            return keep
++
++        if self.use_flex_attention and start_pos == 0:
++            return create_block_mask(mask_mod, B=batch_size, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device, BLOCK_SIZE=self.flex_block_size)
++        batch = torch.arange(batch_size, device=device)[:, None, None, None]
++        query = torch.arange(seq_len, device=device)[None, None, :, None]
++        key = torch.arange(start_pos + seq_len, device=device)[None, None, None, :]
++        return mask_mod(batch, 0, query, key).expand(batch_size, 1, seq_len, start_pos + seq_len).contiguous()
++
++    @torch.no_grad()
++    def forward_cached(self, indices: Tensor, caches: List[MLACache], start_pos: int, attn_mask: Optional[Tensor] = None, document_ids: Optional[Tensor] = None, ignore_doc_mask: bool = False) -> Tensor:
++        if self.training or not self.is_causal or not self.use_mla or self.stage_index is not None:
++            raise ValueError("MLA cached forward requires a causal MLA model in eval mode without pipeline parallelism")
++        batch_size, seq_len = indices.shape
++        end_pos = start_pos + seq_len
++        if len(caches) != len(self.transformer.h) or start_pos < 0 or seq_len == 0 or end_pos > self.max_seq_len:
++            raise ValueError("MLA cache count, position or sequence length mismatch")
++        for cache in caches:
++            if cache.length != start_pos or cache.latent.size(0) != batch_size or cache.latent.size(1) < end_pos:
++                raise ValueError("MLA cache position, capacity or batch size mismatch")
++        if attn_mask is not None:
++            if attn_mask.shape != (batch_size, end_pos):
++                raise ValueError("MLA cached attn_mask must cover the complete cached prefix")
++            attn_mask = attn_mask.to(device=indices.device, dtype=torch.bool)
++        if self.use_doc_masking and not ignore_doc_mask and document_ids is not None:
++            if document_ids.shape != (batch_size, end_pos):
++                raise ValueError("MLA cached document_ids must cover the complete cached prefix")
++            document_ids = document_ids.to(device=indices.device)
++        else:
++            document_ids = None
++        x = self.transformer.wte(indices)
++        if "wpe" in self.transformer:
++            x = x + self.transformer.wpe(torch.arange(start_pos, end_pos, device=indices.device))
++        local_mask = self._build_mla_cached_mask(attn_mask, document_ids, batch_size, seq_len, start_pos, indices.device, True)
++        full_mask = self._build_mla_cached_mask(attn_mask, document_ids, batch_size, seq_len, start_pos, indices.device, False) if self.has_full_attention_layers else None
++        for block, is_full, cache in zip(self.transformer.h, self.layer_is_full_attention, caches):
++            mask = full_mask if is_full else local_mask
++            flex_mask = mask if self.use_flex_attention and start_pos == 0 else None
++            dense_mask = None if flex_mask is not None else mask
++            window_size = self.sliding_window_size if self.use_flex_attention and not is_full else None
++            x, _ = block(x, flex_attn_block_mask=flex_mask, sdpa_attn_mask=dense_mask, mla_cache=cache, cache_start_pos=start_pos, cache_window_size=window_size)
++        # cached generation returns only the next-token logits, including during prefill
++        x = x[:, -1:]
++        x = self.transformer.ln_f(x.to(dtype=self.transformer.ln_f.weight.dtype) if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast else x)
++        x = x.to(dtype=self.lm_head.weight.dtype) if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast else x
++        return self.lm_head(x)
++
+     def forward(
+             self,
+             indices: Tensor,
+diff --git a/model/attention/mla.py b/model/attention/mla.py
+new file mode 100644
+--- /dev/null
++++ b/model/attention/mla.py
+@@ -0,0 +1,216 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Optional, Tuple, Union
++
++import torch
++import torch.nn as nn
++from torch import Tensor
++from torch.nn import functional as F
++from torch.nn.attention.flex_attention import BlockMask, flex_attention
++from torch.utils.checkpoint import checkpoint
++
++from ..linear.linear import Linear
++from ..position.rotary import Rotary, apply_rotation
++from .logit_softcapping import generate_tanh_softcap
++
++if TYPE_CHECKING:
++    from config.model import GPTConfig
++    from config.training import TrainingConfig
++
++
++@dataclass
++class MLACache:
++    latent: Tensor
++    rope: Tensor
++    key_gain: Tensor
++    length: int = 0
++    factors: Optional[Tuple[Tensor, Tensor, Tensor]] = None
++
++
++# joint KV compression and decoupled RoPE follow DeepSeek-V2/V3
++# https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
++class MultiHeadLatentAttention(nn.Module):
++    def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig, layer_idx: int = 0) -> None:
++        super().__init__()
++        self.n_heads = gpt_config.n_heads
++        is_full_attention = layer_idx in gpt_config.full_attention_layers
++        self.n_kv_heads = gpt_config.global_n_kv_heads if is_full_attention else gpt_config.n_kv_heads
++        assert 1 <= self.n_kv_heads <= self.n_heads, "n_kv_heads must be in [1, n_heads]"
++        assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads for GQA/MQA"
++        self.q_heads_per_kv_head = self.n_heads // self.n_kv_heads
++        self.q_rank = gpt_config.mla_q_rank
++        self.kv_rank = gpt_config.mla_kv_rank
++        self.content_dim = gpt_config.mla_qk_content_dim
++        self.rope_dim = gpt_config.mla_qk_rope_dim
++        self.value_dim = gpt_config.mla_value_dim
++        self.head_size = self.content_dim + self.rope_dim
++        self.attn_dim = self.n_heads * self.value_dim
++        if self.q_rank < 0 or min(self.kv_rank, self.content_dim, self.value_dim) <= 0 or self.rope_dim < 0 or self.rope_dim % 2:
++            raise ValueError("MLA requires non-negative query rank, positive KV/content/value dimensions and even non-negative RoPE dimension")
++        if gpt_config.pos_encoding_type.lower() == "rope" and self.rope_dim == 0:
++            raise ValueError("MLA with RoPE requires mla_qk_rope_dim > 0")
++        if gpt_config.pos_encoding_type.lower() != "rope" and self.rope_dim:
++            raise ValueError("MLA without RoPE requires mla_qk_rope_dim=0")
++        for phase, policy in training_config.linear_precision.items():
++            if policy["k_proj"] != policy["v_proj"]:
++                raise ValueError(f"MLA joint KV projections require matching k_proj and v_proj precision for {phase}")
++
++        if self.q_rank:
++            self.q_down_proj = Linear(gpt_config.d_model, self.q_rank, role="q_proj", bias=gpt_config.use_bias)
++            self.q_norm = nn.RMSNorm(self.q_rank, eps=gpt_config.mla_norm_eps)
++        self.q_proj = Linear(self.q_rank or gpt_config.d_model, self.n_heads * self.head_size, role="q_proj", bias=gpt_config.use_bias)
++        self.kv_down_proj = Linear(gpt_config.d_model, self.kv_rank + self.rope_dim, role="k_proj", bias=gpt_config.use_bias)
++        self.kv_norm = nn.RMSNorm(self.kv_rank, eps=gpt_config.mla_norm_eps)
++        self.kv_up_proj = Linear(self.kv_rank, self.n_kv_heads * (self.content_dim + self.value_dim), role="k_proj", bias=gpt_config.use_bias)
++        self.out_proj = Linear(self.attn_dim, gpt_config.d_model, role="out_proj", bias=gpt_config.use_bias)
++        rope_theta = gpt_config.global_rope_theta if is_full_attention else gpt_config.rope_base_theta
++        self.rotary = Rotary(self.rope_dim, rope_theta, training_config.max_seq_len) if self.rope_dim else None
++
++        self.use_qk_norm = gpt_config.use_qk_norm
++        self.qk_norm_type = gpt_config.qk_norm_type
++        self.qk_scale_min = gpt_config.qk_scale_min
++        self.qk_scale_max = gpt_config.qk_scale_max
++        self.qk_eps = gpt_config.qk_eps
++        if self.use_qk_norm:
++            self.q_scale = nn.Parameter(torch.full((1, self.n_heads, 1, 1), gpt_config.qk_scale_init))
++            self.k_scale = nn.Parameter(torch.full((1, self.n_kv_heads, 1, 1), gpt_config.qk_scale_init))
++        self.use_bf16_autocast = training_config.use_bf16_autocast
++        self.cast_activations_to_weight_dtype_if_no_autocast = training_config.cast_activations_to_weight_dtype_if_no_autocast
++        self.use_flex_attention = gpt_config.use_flex_attention
++        self.is_causal = gpt_config.is_causal
++        self.recompute_attention = gpt_config.mla_recompute_attention
++        self.softmax_scale = self.head_size ** -0.5
++        self.attn_logit_softcap = gpt_config.attn_logit_softcap if gpt_config.use_attn_logit_softcapping else 0.0
++        self.tanh_backend = gpt_config.tanh_backend
++        self._score_mod = generate_tanh_softcap(self.attn_logit_softcap, backend=self.tanh_backend) if self.attn_logit_softcap else None
++
++    def _cast(self, x: Tensor, module: nn.Module) -> Tensor:
++        if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x.dtype != module.weight.dtype:
++            x = x.to(dtype=module.weight.dtype)
++        return x
++
++    def _project(self, x: Tensor, start_pos: int = 0) -> Tuple[Tensor, Tensor, Tensor]:
++        batch_size, seq_len, _ = x.shape
++        query = x
++        if self.q_rank:
++            query = self.q_down_proj(self._cast(query, self.q_down_proj))
++            query = self.q_norm(self._cast(query, self.q_norm))
++        query = self.q_proj(self._cast(query, self.q_proj)).view(batch_size, seq_len, self.n_heads, self.head_size).transpose(1, 2)
++        compressed = self.kv_down_proj(self._cast(x, self.kv_down_proj))
++        latent, rope = compressed.split((self.kv_rank, self.rope_dim), dim=-1)
++        latent = self.kv_norm(self._cast(latent, self.kv_norm))
++        latent = self._cast(latent.to(dtype=compressed.dtype), self.kv_up_proj)
++        rope = rope.unsqueeze(1)
++        if self.rotary is not None:
++            # cached chunks rotate at their absolute positions
++            cos = self.rotary.cos_cached[..., start_pos:start_pos + seq_len, :].to(device=query.device, dtype=query.dtype)
++            sin = self.rotary.sin_cached[..., start_pos:start_pos + seq_len, :].to(device=query.device, dtype=query.dtype)
++            query_content, query_rope = query.split((self.content_dim, self.rope_dim), dim=-1)
++            query_rope, rope = apply_rotation(query_rope, rope, cos, sin)
++            query = torch.cat((query_content, query_rope), dim=-1)
++        return query, latent, rope
++
++    def _gain(self, x: Tensor, scale: Tensor) -> Tensor:
++        square = x.pow(2)
++        norm = square.mean(dim=-1, keepdim=True) if self.qk_norm_type == "rms" else square.sum(dim=-1, keepdim=True)
++        gain = torch.rsqrt(norm + self.qk_eps).to(dtype=x.dtype)
++        return gain * torch.clamp(scale, min=self.qk_scale_min, max=self.qk_scale_max).to(dtype=x.dtype)
++
++    def _expanded(self, query: Tensor, latent: Tensor, rope: Tensor, flex_attn_block_mask: Optional[BlockMask], sdpa_attn_mask: Optional[Tensor]) -> Tuple[Tensor, Tensor]:
++        batch_size, _, seq_len, _ = query.shape
++        key_value = self.kv_up_proj(self._cast(latent, self.kv_up_proj)).view(batch_size, seq_len, self.n_kv_heads, self.content_dim + self.value_dim).transpose(1, 2)
++        key_content, value = key_value.split((self.content_dim, self.value_dim), dim=-1)
++        key = torch.cat((key_content, rope.expand(-1, self.n_kv_heads, -1, -1)), dim=-1)
++        if self.use_qk_norm:
++            query = query * self._gain(query, self.q_scale)
++            key_gain = self._gain(key, self.k_scale)
++            key = key * key_gain
++        else:
++            key_gain = torch.ones_like(key[..., :1])
++        if self.use_flex_attention:
++            output = flex_attention(query, key, value, score_mod=self._score_mod, block_mask=flex_attn_block_mask, scale=self.softmax_scale, enable_gqa=self.n_kv_heads != self.n_heads)
++        else:
++            # equal physical widths keep SDPA eligible for its fused flash backend
++            width = max(self.head_size, self.value_dim)
++            if width != self.head_size:
++                query = F.pad(query, (0, width - self.head_size))
++                key = F.pad(key, (0, width - self.head_size))
++            if width != self.value_dim:
++                value = F.pad(value, (0, width - self.value_dim))
++            output = F.scaled_dot_product_attention(query, key, value, attn_mask=sdpa_attn_mask, is_causal=self.is_causal and sdpa_attn_mask is None, scale=self.softmax_scale, enable_gqa=self.n_kv_heads != self.n_heads)
++            output = output[..., :self.value_dim]
++        return output, key_gain
++
++    def forward(self, x: Tensor, flex_attn_block_mask: Optional[BlockMask] = None, sdpa_attn_mask: Optional[Tensor] = None) -> Tensor:
++        query, latent, rope = self._project(x)
++        if self.recompute_attention and self.training and torch.is_grad_enabled():
++            output, _ = checkpoint(self._expanded, query, latent, rope, flex_attn_block_mask, sdpa_attn_mask, use_reentrant=False)
++        else:
++            output, _ = self._expanded(query, latent, rope, flex_attn_block_mask, sdpa_attn_mask)
++        output = output.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.attn_dim)
++        return self.out_proj(self._cast(output, self.out_proj))
++
++    def allocate_cache(self, batch_size: int, max_seq_len: int, *, device: Union[str, torch.device], dtype: torch.dtype) -> MLACache:
++        return MLACache(
++            torch.empty(batch_size, max_seq_len, self.kv_rank, device=device, dtype=dtype),
++            torch.empty(batch_size, max_seq_len, self.rope_dim, device=device, dtype=dtype),
++            torch.empty(batch_size, max_seq_len, self.n_kv_heads, device=device, dtype=dtype),
++        )
++
++    @torch.no_grad()
++    def forward_cached(self, x: Tensor, *, cache: MLACache, start_pos: int, flex_attn_block_mask: Optional[BlockMask] = None, sdpa_attn_mask: Optional[Tensor] = None, window_size: Optional[Tensor] = None) -> Tensor:
++        if self.training or not self.is_causal:
++            raise ValueError("MLA cached forward requires causal attention in eval mode")
++        if start_pos != cache.length or start_pos + x.size(1) > cache.latent.size(1) or x.size(0) != cache.latent.size(0):
++            raise ValueError("MLA cache position, capacity or batch size mismatch")
++        if start_pos == 0 and self.use_flex_attention and flex_attn_block_mask is None:
++            raise ValueError("MLA cached FlexAttention prefill requires a block mask")
++        if start_pos > 0 and sdpa_attn_mask is None:
++            raise ValueError("MLA cached decoding requires an explicit rectangular attention mask")
++        # absorbed decoding uses the original KV weights, so its projections must use default precision
++        if self.q_proj.precision != "default" or self.kv_down_proj.precision != "default" or self.kv_up_proj.precision != "default":
++            raise ValueError("MLA cached forward requires default query and KV projection precision")
++        query, latent, rope = self._project(x, start_pos)
++        if latent.dtype != cache.latent.dtype or rope.dtype != cache.rope.dtype:
++            raise ValueError("MLA cache dtype must match projected activations")
++        end_pos = start_pos + x.size(1)
++        cache.latent[:, start_pos:end_pos] = latent
++        cache.rope[:, start_pos:end_pos] = rope[:, 0]
++        if start_pos == 0:
++            # cache factors follow prefill weights and preserve the projection dtype rounding
++            weight = self.kv_up_proj.weight.detach().view(self.n_kv_heads, self.content_dim + self.value_dim, self.kv_rank)
++            key_weight = weight[:, :self.content_dim].to(dtype=latent.dtype).contiguous()
++            value_weight = weight[:, self.content_dim:].to(dtype=latent.dtype).contiguous()
++            cache.factors = (key_weight, key_weight.float(), value_weight)
++            # prefill uses the same fused attention backend as training
++            output, key_gain = self._expanded(query, latent, rope, flex_attn_block_mask, sdpa_attn_mask)
++        else:
++            key_weight, query_weight, value_weight = cache.factors
++            key_content = F.linear(self._cast(latent, self.kv_up_proj), key_weight.view(-1, self.kv_rank), None if self.kv_up_proj.bias is None else self.kv_up_proj.bias.view(self.n_kv_heads, -1)[:, :self.content_dim].reshape(-1))
++            key = torch.cat((key_content.view(x.size(0), x.size(1), self.n_kv_heads, self.content_dim).transpose(1, 2), rope.expand(-1, self.n_kv_heads, -1, -1)), dim=-1)
++            key_gain = self._gain(key, self.k_scale) if self.use_qk_norm else torch.ones_like(key[..., :1])
++            cache.key_gain[:, start_pos:end_pos] = key_gain[..., 0].transpose(1, 2)
++            if self.use_qk_norm:
++                query = query * self._gain(query, self.q_scale)
++            query_content, query_rope = query.split((self.content_dim, self.rope_dim), dim=-1)
++            query_content = query_content.transpose(1, 2).reshape(x.size(0), x.size(1), self.n_kv_heads, self.q_heads_per_kv_head, self.content_dim)
++            # keep the absorbed query in fp32 rather than rounding it back to bf16
++            with torch.autocast(device_type=x.device.type, enabled=False):
++                query_latent = torch.einsum("bqhgd,hdr->bqhgr", query_content.float(), query_weight).reshape(x.size(0), x.size(1), self.n_heads, self.kv_rank).transpose(1, 2)
++                query_bias = torch.zeros(query.shape[:-1], device=query.device, dtype=torch.float32)
++                if self.kv_up_proj.bias is not None:
++                    key_bias = self.kv_up_proj.bias.view(self.n_kv_heads, -1)[:, :self.content_dim].to(dtype=query.dtype).float()
++                    query_bias = torch.einsum("bqhgd,hd->bqhg", query_content.float(), key_bias).reshape(x.size(0), x.size(1), self.n_heads).transpose(1, 2)
++            from .mla_decode import mla_decode
++
++            context, row_mass = mla_decode(query_latent, query_rope, query_bias, cache.latent[:, :end_pos], cache.rope[:, :end_pos], cache.key_gain[:, :end_pos], sdpa_attn_mask, self.softmax_scale, self.attn_logit_softcap, self.tanh_backend, window_size)
++            context = context.to(dtype=query.dtype).transpose(1, 2).reshape(x.size(0), x.size(1), self.n_kv_heads, self.q_heads_per_kv_head, self.kv_rank)
++            output = torch.einsum("bqhgr,hdr->bqhgd", context, value_weight).reshape(x.size(0), x.size(1), self.n_heads, self.value_dim).transpose(1, 2)
++            if self.kv_up_proj.bias is not None:
++                value_bias = self.kv_up_proj.bias.view(self.n_kv_heads, -1)[:, self.content_dim:].repeat_interleave(self.q_heads_per_kv_head, dim=0).to(dtype=output.dtype)
++                output = output + row_mass.to(dtype=output.dtype)[..., None] * value_bias[None, :, None]
++        cache.key_gain[:, start_pos:end_pos] = key_gain[..., 0].transpose(1, 2)
++        cache.length = end_pos
++        output = output.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.attn_dim)
++        return self.out_proj(self._cast(output, self.out_proj))
+diff --git a/model/attention/mla_decode.py b/model/attention/mla_decode.py
+new file mode 100644
+--- /dev/null
++++ b/model/attention/mla_decode.py
+@@ -0,0 +1,213 @@
++from __future__ import annotations
++
++from typing import Optional, Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import triton_op, wrap_triton
++from triton.language.extra.cuda import libdevice
++
++
++@triton.jit
++def _mla_decode_kernel(
++    QLatent, QRope, QueryBias, Latent, Rope, KeyGain, Mask, Window, Out, Lse, Mass,
++    K, latent_stride_b, rope_stride_b, gain_stride_b,
++    H: tl.constexpr, Q: tl.constexpr, R: tl.constexpr, P: tl.constexpr,
++    KV_HEADS: tl.constexpr, SPLITS: tl.constexpr, HAS_WINDOW: tl.constexpr,
++    ql_stride_b: tl.constexpr, ql_stride_h: tl.constexpr, ql_stride_q: tl.constexpr,
++    qr_stride_b: tl.constexpr, qr_stride_h: tl.constexpr, qr_stride_q: tl.constexpr,
++    bias_stride_b: tl.constexpr, bias_stride_h: tl.constexpr, bias_stride_q: tl.constexpr,
++    SCALE: tl.constexpr, SOFTCAP: tl.constexpr, BACKEND: tl.constexpr,
++    BLOCK_K: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_P: tl.constexpr,
++):
++    row = tl.program_id(0)
++    split = tl.program_id(1)
++    query = row % Q
++    head = (row // Q) % H
++    batch = row // (H * Q)
++    kv_head = head // (H // KV_HEADS)
++    r = tl.arange(0, BLOCK_R)
++    q_latent = tl.load(
++        QLatent + batch * ql_stride_b + head * ql_stride_h + query * ql_stride_q + r,
++        mask=r < R, other=0.0,
++    ).to(tl.float32)
++    query_bias = tl.load(
++        QueryBias + batch * bias_stride_b + head * bias_stride_h + query * bias_stride_q,
++    ).to(tl.float32)
++    if P:
++        p = tl.arange(0, BLOCK_P)
++        q_rope = tl.load(
++            QRope + batch * qr_stride_b + head * qr_stride_h + query * qr_stride_q + p,
++            mask=p < P, other=0.0,
++        ).to(tl.float32)
++
++    maximum = tl.full((), float("-inf"), tl.float32)
++    denominator = tl.full((), 0.0, tl.float32)
++    acc = tl.zeros((BLOCK_R,), tl.float32)
++    first_key = 0
++    if HAS_WINDOW:
++        # the earliest query bounds the union; the exact mask still filters each row
++        window = tl.maximum(tl.load(Window), 0)
++        first_key = tl.maximum(0, K - Q - window)
++    keys_in_range = K - first_key
++    start = first_key + keys_in_range * split // SPLITS
++    end = first_key + keys_in_range * (split + 1) // SPLITS
++    for tile in range(tl.cdiv(end - start, BLOCK_K)):
++        key = start + tile * BLOCK_K + tl.arange(0, BLOCK_K)
++        valid = tl.load(
++            Mask + (batch * Q + query) * K + key,
++            mask=key < end, other=False,
++        )
++        # skip masked cache rows before loading the latent and positional operands
++        if tl.sum(valid.to(tl.int32), axis=0) > 0:
++            latent = tl.load(
++                Latent + batch * latent_stride_b + key[:, None] * R + r[None, :],
++                mask=valid[:, None] & (r[None, :] < R), other=0.0,
++            ).to(tl.float32)
++            score = tl.sum(latent * q_latent[None, :], axis=1) + query_bias
++            if P:
++                rope = tl.load(
++                    Rope + batch * rope_stride_b + key[:, None] * P + p[None, :],
++                    mask=valid[:, None] & (p[None, :] < P), other=0.0,
++                ).to(tl.float32)
++                score += tl.sum(rope * q_rope[None, :], axis=1)
++            gain = tl.load(
++                KeyGain + batch * gain_stride_b + key * KV_HEADS + kv_head,
++                mask=valid, other=0.0,
++            ).to(tl.float32)
++            score = score * gain * SCALE
++            if SOFTCAP > 0.0:
++                if BACKEND == "clamp":
++                    score = tl.where(score != score, score, tl.minimum(tl.maximum(score, -SOFTCAP), SOFTCAP))
++                elif BACKEND == "rational":
++                    z = score / SOFTCAP
++                    z = tl.where(z != z, z, tl.minimum(tl.maximum(z, -3.0), 3.0))
++                    square = z * z
++                    score = SOFTCAP * z * (27.0 + square) / (27.0 + 9.0 * square)
++                elif BACKEND == "ptx":
++                    score = SOFTCAP * tl.inline_asm_elementwise(
++                        "tanh.approx.f32 $0, $1;", constraints="=f,f",
++                        args=[score / SOFTCAP], dtype=tl.float32, is_pure=True, pack=1,
++                    )
++                else:
++                    score = SOFTCAP * libdevice.tanh(score / SOFTCAP)
++            score = tl.where(valid, score * 1.4426950408889634, float("-inf"))
++            next_maximum = tl.maximum(maximum, tl.max(score, axis=0))
++            # retain -inf for empty splits so later negative logits remain stable
++            safe_maximum = tl.where(next_maximum == float("-inf"), 0.0, next_maximum)
++            correction = tl.exp2(maximum - safe_maximum)
++            probability = tl.exp2(score - safe_maximum)
++            denominator = denominator * correction + tl.sum(probability, axis=0)
++            acc = acc * correction + tl.sum(probability[:, None] * latent, axis=0)
++            maximum = next_maximum
++
++    normalizer = tl.where(denominator > 0.0, denominator, 1.0)
++    tl.store(Out + (row * SPLITS + split) * R + r, acc / normalizer, mask=r < R)
++    if SPLITS > 1:
++        tl.store(
++            Lse + row * SPLITS + split,
++            tl.where(denominator > 0.0, maximum + tl.log2(normalizer), float("-inf")),
++        )
++    else:
++        tl.store(Mass + row, (denominator > 0.0).to(tl.float32))
++
++
++@triton.jit
++def _mla_decode_merge_kernel(
++    Partial, Lse, Out, Mass,
++    R: tl.constexpr, SPLITS: tl.constexpr,
++    BLOCK_R: tl.constexpr, BLOCK_S: tl.constexpr,
++):
++    row = tl.program_id(0)
++    split = tl.arange(0, BLOCK_S)
++    r = tl.arange(0, BLOCK_R)
++    lse = tl.load(Lse + row * SPLITS + split, mask=split < SPLITS, other=float("-inf"))
++    maximum = tl.max(lse, axis=0)
++    safe_maximum = tl.where(maximum == float("-inf"), 0.0, maximum)
++    weights = tl.exp2(lse - safe_maximum)
++    denominator = tl.sum(weights, axis=0)
++    partial = tl.load(
++        Partial + (row * SPLITS + split[:, None]) * R + r[None, :],
++        mask=(split[:, None] < SPLITS) & (r[None, :] < R), other=0.0,
++    )
++    acc = tl.sum(weights[:, None] * partial, axis=0)
++    tl.store(Out + row * R + r, acc / tl.where(denominator > 0.0, denominator, 1.0), mask=r < R)
++    tl.store(Mass + row, (denominator > 0.0).to(tl.float32))
++
++
++@triton_op("gpt_moe::mla_decode", mutates_args=())
++def mla_decode(
++    q_latent: Tensor, q_rope: Tensor, query_bias: Tensor,
++    latent: Tensor, rope: Tensor, key_gain: Tensor, mask: Tensor,
++    scale: float, softcap: float, backend: str, window_size: Optional[Tensor] = None,
++) -> Tuple[Tensor, Tensor]:
++    if q_latent.ndim != 4 or latent.ndim != 3 or key_gain.ndim != 3 or q_rope.ndim != 4:
++        raise ValueError("MLA decode expects [batch, heads, queries, rank] queries and [batch, keys, rank] cache")
++    batch, heads, queries, rank = q_latent.shape
++    keys = latent.shape[1]
++    positional = q_rope.shape[-1]
++    kv_heads = key_gain.shape[-1]
++    if batch < 1 or heads < 1 or queries < 1 or keys < 1 or rank < 1 or rank > 1024:
++        raise ValueError("MLA decode requires nonempty inputs and a latent rank in [1, 1024]")
++    if positional > 1024 or kv_heads < 1 or heads % kv_heads:
++        raise ValueError("MLA decode requires a positional width at most 1024 and query heads divisible by KV heads")
++    if (
++        latent.shape != (batch, keys, rank)
++        or q_rope.shape != (batch, heads, queries, positional)
++        or rope.shape != (batch, keys, positional)
++        or key_gain.shape != (batch, keys, kv_heads)
++        or query_bias.shape != (batch, heads, queries)
++        or mask.shape != (batch, 1, queries, keys)
++    ):
++        raise ValueError("MLA decode input shapes do not match")
++    if not q_latent.is_cuda or any(
++        tensor.device != q_latent.device
++        for tensor in (q_rope, query_bias, latent, rope, key_gain, mask)
++    ):
++        raise ValueError("MLA decode inputs must be on the same CUDA device")
++    if any(
++        tensor.dtype not in (torch.float32, torch.bfloat16)
++        for tensor in (q_latent, q_rope, query_bias, latent, rope, key_gain)
++    ) or mask.dtype != torch.bool:
++        raise ValueError("MLA decode requires float32 or bfloat16 inputs and a boolean mask")
++    if (
++        q_latent.stride(-1) != 1
++        or latent.stride(-1) != 1 or latent.stride(-2) != rank
++        or (positional > 0 and (q_rope.stride(-1) != 1 or rope.stride(-1) != 1 or rope.stride(-2) != positional))
++        or key_gain.stride(-1) != 1 or key_gain.stride(-2) != kv_heads
++        or not mask.is_contiguous()
++    ):
++        raise ValueError("MLA decode requires contiguous feature rows and a contiguous attention mask")
++    if softcap < 0.0 or backend not in ("clamp", "rational", "ptx", "exact"):
++        raise ValueError("MLA decode requires a nonnegative softcap and a supported tanh backend")
++    if window_size is not None and (window_size.ndim != 0 or window_size.dtype != torch.int32 or window_size.device != q_latent.device):
++        raise ValueError("MLA decode window_size must be a scalar int32 tensor on the query device")
++
++    # parallelize the cache scan when a small decode batch cannot fill the GPU
++    rows = batch * heads * queries
++    sm_count = torch.cuda.get_device_properties(q_latent.device).multi_processor_count
++    splits = min(16, triton.cdiv(sm_count * 2, rows), triton.cdiv(keys, 256))
++    context = torch.empty(q_latent.shape, device=q_latent.device, dtype=torch.float32)
++    mass = torch.empty((batch, heads, queries), device=q_latent.device, dtype=torch.float32)
++    partial = torch.empty((rows, splits, rank), device=q_latent.device, dtype=torch.float32) if splits > 1 else context
++    lse = torch.empty((rows, splits), device=q_latent.device, dtype=torch.float32) if splits > 1 else mass
++    block_r = triton.next_power_of_2(rank)
++    block_p = triton.next_power_of_2(positional) if positional else 1
++    block_k = 16 if block_r + block_p > 512 else 32
++    warps = 8 if block_r + block_p > 256 else 4
++    wrap_triton(_mla_decode_kernel)[(rows, splits)](
++        q_latent, q_rope, query_bias, latent, rope, key_gain, mask, mask if window_size is None else window_size, partial, lse, mass,
++        keys, latent.stride(0), rope.stride(0), key_gain.stride(0),
++        heads, queries, rank, positional, kv_heads, splits, window_size is not None,
++        *q_latent.stride()[:3], *q_rope.stride()[:3], *query_bias.stride(),
++        scale, softcap, backend, block_k, block_r, block_p,
++        num_warps=warps,
++    )
++    if splits > 1:
++        wrap_triton(_mla_decode_merge_kernel)[(rows,)](
++            partial, lse, context, mass, rank, splits, block_r, triton.next_power_of_2(splits),
++            num_warps=4,
++        )
++    return context, mass
+diff --git a/experiments/check_mla.py b/experiments/check_mla.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/check_mla.py
+@@ -0,0 +1,152 @@
++from pathlib import Path
++import argparse
++import copy
++import sys
++
++import torch
++from torch.nn import functional as F
++from torch.nn.attention import SDPBackend, sdpa_kernel
++from torch.nn.attention.flex_attention import create_block_mask
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from config.model import GPTConfig
++from config.training import TrainingConfig
++from model.attention.mla import MultiHeadLatentAttention
++from model.attention.mla_decode import mla_decode
++
++
++def block_mask(mask):
++    queries, keys = mask.shape[-2:]
++
++    def mask_mod(batch, head, query, key):
++        return (query < queries) & (key < keys) & mask[batch, 0, query.clamp_max(queries - 1), key.clamp_max(keys - 1)]
++
++    return create_block_mask(mask_mod, B=mask.size(0), H=None, Q_LEN=queries, KV_LEN=keys, device=mask.device, BLOCK_SIZE=128)
++
++
++def reference(module, x, mask):
++    query, latent, rope = module._project(x)
++    kv = module.kv_up_proj(module._cast(latent, module.kv_up_proj)).view(x.size(0), x.size(1), module.n_kv_heads, module.content_dim + module.value_dim).transpose(1, 2)
++    key, value = kv.split((module.content_dim, module.value_dim), dim=-1)
++    key = torch.cat((key, rope.expand(-1, module.n_kv_heads, -1, -1)), dim=-1)
++    if module.use_qk_norm:
++        query = query * module._gain(query, module.q_scale)
++        key = key * module._gain(key, module.k_scale)
++    with sdpa_kernel(SDPBackend.MATH):
++        output = F.scaled_dot_product_attention(query, key, value, attn_mask=mask, scale=module.softmax_scale, enable_gqa=True)
++    output = output.transpose(1, 2).reshape(x.size(0), x.size(1), module.attn_dim)
++    return module.out_proj(module._cast(output, module.out_proj))
++
++
++def check(actual, expected, label, tolerance):
++    assert actual.shape == expected.shape and torch.isfinite(actual).all(), label
++    relative = (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-12)
++    print(f"{label}: relative L2={relative.item():.8f}")
++    assert relative < tolerance, (label, relative.item())
++
++
++def check_module(use_flex, q_rank, compiled):
++    config = GPTConfig(d_model=128, n_heads=4, n_kv_heads=2, mla_q_rank=q_rank, mla_kv_rank=32,
++                       mla_qk_content_dim=48, mla_qk_rope_dim=16, mla_value_dim=64,
++                       use_flex_attention=use_flex, use_bias=True, use_qk_norm=True)
++    training = TrainingConfig()
++    module = MultiHeadLatentAttention(config, training).cuda()
++    expected = copy.deepcopy(module)
++    sequence = 256
++    position = torch.arange(sequence, device="cuda")
++    mask = ((position[:, None] >= position) & (position[:, None] - position <= 128))[None, None].expand(2, 1, -1, -1).clone()
++    mask[0, :, :64, 64:] = False
++    mask[0, :, 64:, :64] = False
++    mask[1, :, :2] = False
++    mask[1, :, :, :2] = False
++    source = torch.randn(2, sequence, 256, device="cuda")[..., ::2]
++    x = source.detach().requires_grad_()
++    reference_x = source.detach().clone().requires_grad_()
++    operation = torch.compile(module, fullgraph=True) if compiled else module
++    kwargs = {"flex_attn_block_mask": block_mask(mask)} if use_flex else {"sdpa_attn_mask": mask}
++    with torch.autocast("cuda", dtype=torch.bfloat16):
++        output = operation(x, **kwargs)
++        target = reference(expected, reference_x, mask)
++    gradient = torch.randn_like(output) * .01
++    output.backward(gradient)
++    target.backward(gradient)
++    label = f"{'Flex' if use_flex else 'SDPA'} q_rank={q_rank} {'compiled' if compiled else 'eager'}"
++    check(output, target, label + " output", .025)
++    check(x.grad, reference_x.grad, label + " input gradient", .04)
++    for (name, parameter), (_, reference_parameter) in zip(module.named_parameters(), expected.named_parameters()):
++        assert parameter.grad is not None and reference_parameter.grad is not None, name
++        check(parameter.grad, reference_parameter.grad, label + " " + name, .05)
++
++    module.eval()
++    cache = module.allocate_cache(2, 256, device="cuda", dtype=torch.bfloat16)
++    window_size = torch.tensor(128, device="cuda", dtype=torch.int32) if use_flex else None
++    start = 0
++    factor_pointers = None
++    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
++        for length in (64, 1, 2):
++            end = start + length
++            local = mask[:, :, start:end, :end].contiguous()
++            kwargs = {"flex_attn_block_mask": block_mask(local)} if use_flex and start == 0 else {"sdpa_attn_mask": local}
++            output = module.forward_cached(source[:, start:end], cache=cache, start_pos=start, window_size=window_size, **kwargs)
++            target = reference(module, source[:, :end], mask[:, :, :end, :end])[:, start:end]
++            check(output, target, label + f" compressed cache {start}:{end}", .04)
++            assert cache.length == end
++            assert all(factor.is_contiguous() for factor in cache.factors)
++            assert tuple(factor.dtype for factor in cache.factors) == (torch.bfloat16, torch.float32, torch.bfloat16)
++            pointers = tuple(factor.data_ptr() for factor in cache.factors)
++            assert factor_pointers is None or factor_pointers == pointers
++            factor_pointers = pointers
++            start = end
++
++
++def check_decode():
++    batch, heads, queries, keys, capacity, rank, positional, kv_heads = 2, 4, 3, 677, 1031, 128, 16, 2
++    latent = torch.randn(batch, capacity, rank, device="cuda", dtype=torch.bfloat16)[:, :keys]
++    rope = torch.randn(batch, capacity, positional, device="cuda", dtype=torch.bfloat16)[:, :keys]
++    gain = torch.rand(batch, capacity, kv_heads, device="cuda", dtype=torch.bfloat16)[:, :keys]
++    query_latent = torch.randn(batch, heads, queries, rank, device="cuda")
++    query_rope = torch.randn(batch, heads, queries, positional, device="cuda", dtype=torch.bfloat16)
++    query_bias = torch.randn(batch, heads, queries, device="cuda")
++    mask = torch.rand(batch, 1, queries, keys, device="cuda") > .2
++    mask[0, :, 0] = False
++    scale = 64 ** -.5
++    score = (query_latent @ latent[:, None].float().transpose(-1, -2) + query_rope.float() @ rope[:, None].float().transpose(-1, -2) + query_bias[..., None])
++    score = score * gain.transpose(1, 2).repeat_interleave(heads // kv_heads, 1)[:, :, None].float() * scale
++    for backend in ("clamp", "rational", "ptx", "exact"):
++        cap = 3.0
++        if backend == "clamp":
++            capped = score.clamp(-cap, cap)
++        elif backend == "rational":
++            z = (score / cap).clamp(-3, 3)
++            capped = cap * z * (27 + z * z) / (27 + 9 * z * z)
++        else:
++            capped = cap * torch.tanh(score / cap)
++        window_size = torch.tensor(0, device="cuda", dtype=torch.int32)
++        positions = torch.arange(keys, device="cuda")
++        query_positions = positions[-queries:, None]
++        for window in (None, 0, 1, 127, 128, 1408, keys + 10):
++            local_mask = mask
++            if window is not None:
++                window_size.fill_(window)
++                local_mask = (mask & (query_positions >= positions) & (query_positions - positions <= window_size)).contiguous()
++            logits = capped.masked_fill(~local_mask, float("-inf"))
++            valid = local_mask.any(-1, keepdim=True)
++            probability = torch.where(valid, logits, 0).softmax(-1) * valid
++            target = probability @ latent[:, None].float()
++            output, mass = mla_decode(query_latent, query_rope, query_bias, latent, rope, gain, local_mask, scale, cap, backend, None if window is None else window_size)
++            torch.testing.assert_close(output, target, atol=3e-5, rtol=3e-4)
++            torch.testing.assert_close(mass, valid[..., 0].expand(batch, heads, queries).float(), atol=0, rtol=0)
++        print(f"PASS: absorbed streaming decode {backend}, changing windows, ragged capacity-strided cache and empty rows")
++
++
++parser = argparse.ArgumentParser()
++parser.add_argument("--compile", action="store_true")
++args = parser.parse_args()
++torch.manual_seed(2026)
++torch.set_float32_matmul_precision("highest")
++assert torch.cuda.is_available(), "this correctness check requires CUDA"
++check_decode()
++for use_flex in (False, True):
++    for q_rank in (0, 32):
++        check_module(use_flex, q_rank, args.compile)
++print("PASS: MLA projections, both attention routes, gradients and compressed decoding")
+diff --git a/sampling/sample.py b/sampling/sample.py
+--- a/sampling/sample.py
++++ b/sampling/sample.py
+@@ -70,7 +70,19 @@
+         # track actual (non-padding) sequence lengths
+         actual_sequence_lengths = torch.tensor([len(seq) for seq in initial_input_ids_list], dtype=torch.long, device=device)
+ 
+-        for _ in range(max_new_tokens):
++        eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
++        mla_groups = []
++        if eager_gpt_model.use_mla and eager_gpt_model.is_causal and run.parallel_mode == "ddp" and all(initial_input_ids_list) and max_new_tokens > 0 and all(eager_gpt_model.linear_precision["sampling"][role] == "default" for role in ("q_proj", "k_proj", "v_proj")):
++            # equal-length prompts share a cache without changing absolute positions or sampling order
++            grouped_rows = {}
++            for row, tokens in enumerate(initial_input_ids_list):
++                grouped_rows.setdefault(len(tokens), []).append(row)
++            cache_dtype = torch.bfloat16 if eager_gpt_model.use_bf16_autocast else eager_gpt_model.transformer.h[0].attn.kv_up_proj.weight.dtype
++            for length, rows in grouped_rows.items():
++                caches = eager_gpt_model.allocate_mla_cache(len(rows), length + max_new_tokens, device=device, dtype=cache_dtype)
++                mla_groups.append((torch.tensor(rows, device=device), length, caches))
++
++        for new_token_index in range(max_new_tokens):
+             # an optional padding mask would compare positions 0, ..., alloc_len - 1 with each non-padded sequence length.
+             # Broadcasting (1, alloc_len) against (len(sample_sequences), 1) gives (len(sample_sequences), alloc_len)
+             # attn_mask = torch.arange(alloc_len, device=device).unsqueeze(0) < actual_sequence_lengths.unsqueeze(1)
+@@ -78,13 +90,23 @@
+             with ctx:
+                 # and predict, resulting in (len(sample_sequences), seq_len, vocab_size)
+                 # with causal attention, real tokens cannot attend to right padding, so no padding mask is needed
+-                eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+-                logits = run.forward(eager_gpt_model, generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
++                if mla_groups:
++                    last_logits = None
++                    for rows, prompt_length, caches in mla_groups:
++                        start_pos = 0 if new_token_index == 0 else prompt_length + new_token_index - 1
++                        end_pos = prompt_length if new_token_index == 0 else start_pos + 1
++                        group_logits = eager_gpt_model.forward_cached(generated_sequences[rows, start_pos:end_pos], caches, start_pos, ignore_doc_mask=True)
++                        if last_logits is None:
++                            last_logits = group_logits.new_empty((len(sample_sequences), group_logits.size(-1)))
++                        last_logits[rows] = group_logits[:, -1]
++                else:
++                    logits = run.forward(eager_gpt_model, generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
+             
+             if run.parallel_mode == "ddp" or rank == world_size - 1:
+                 # of which we take the vocab_size values for each sequence's continuation to the last non-pad token,
+                 # resulting in len(sample_sequences), vocab_size
+-                last_logits = logits[torch.arange(len(sample_sequences), device=device), actual_sequence_lengths - 1, :]
++                if not mla_groups:
++                    last_logits = logits[torch.arange(len(sample_sequences), device=device), actual_sequence_lengths - 1, :]
+ 
+                 if temperature == 0.0:
+                     # then if temperature is 0, we cannot divide by 0, so take the max logit from vocab_size

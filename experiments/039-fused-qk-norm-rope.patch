@@ -1,0 +1,349 @@
+diff --git a/model/attention/self_attention.py b/model/attention/self_attention.py
+--- a/model/attention/self_attention.py
++++ b/model/attention/self_attention.py
+@@ -127,3 +127,17 @@
+ 
+-        if self.rotary is not None:
++        fused_qk = (
++            self.training and q.is_cuda and q.dtype == torch.bfloat16
++            and torch.is_autocast_enabled("cuda")
++            and k.dtype == q.dtype and self.rotary is not None and self.use_qk_norm
++            and self.n_kv_heads == self.n_heads and self.head_size <= 256
++        )
++        if fused_qk:
++            from .qk_norm_rope import qk_norm_rope
++            cos = self.rotary.cos_cached[..., :seq_len, :]
++            sin = self.rotary.sin_cached[..., :seq_len, :]
++            q, k = qk_norm_rope(
++                q, k, self.q_scale, self.k_scale, cos, sin, self.qk_eps,
++                self.qk_norm_type == "rms", self.qk_scale_min, self.qk_scale_max,
++            )
++        elif self.rotary is not None:
+             # apply RoPE
+@@ -137,3 +151,3 @@
+ 
+-        if self.use_qk_norm:
++        if self.use_qk_norm and not fused_qk:
+             if self.qk_norm_type == "rms":
+diff --git a/model/attention/qk_norm_rope.py b/model/attention/qk_norm_rope.py
+new file mode 100644
+--- /dev/null
++++ b/model/attention/qk_norm_rope.py
+@@ -0,0 +1,211 @@
++from __future__ import annotations
++
++from typing import Any, Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import triton_op, wrap_triton
++
++
++@triton.jit
++def _rotate(x, paired, cos, sin, feature, dtype: tl.constexpr, inverse: tl.constexpr):
++    # retain the existing product rounding before adding each RoPE pair
++    first = (x * cos).to(dtype).to(tl.float32)
++    second = (paired * sin).to(dtype).to(tl.float32)
++    subtract = (feature % 2 == 1) if inverse else (feature % 2 == 0)
++    return (first + tl.where(subtract, -second, second)).to(dtype).to(tl.float32)
++
++
++@triton.jit
++def _forward_kernel(
++    Q, K, QScale, KScale, Cos, Sin, QOut, KOut, QGain, KGain,
++    T: tl.constexpr, D: tl.constexpr, H: tl.constexpr,
++    qb: tl.constexpr, qh: tl.constexpr, qt: tl.constexpr, qd: tl.constexpr,
++    kb: tl.constexpr, kh: tl.constexpr, kt: tl.constexpr, kd: tl.constexpr,
++    ct: tl.constexpr, cd: tl.constexpr, st: tl.constexpr, sd: tl.constexpr,
++    EPS: tl.constexpr, RMS: tl.constexpr,
++    SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
++    ROWS: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    batch_head = tl.program_id(0)
++    batch = batch_head // (2 * H)
++    head = batch_head % (2 * H)
++    token = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
++    feature = tl.arange(0, BLOCK_D)
++    valid = (token[:, None] < T) & (feature[None, :] < D)
++    if head < H:
++        source = Q + batch * qb + head * qh + token[:, None] * qt
++        x = tl.load(source + feature[None, :] * qd, valid, 0.0).to(tl.float32)
++        scale = tl.load(QScale + head).to(tl.float32)
++        out = QOut + ((batch * H + head) * T + token[:, None]) * D + feature[None, :]
++        gain_out = QGain + (batch * H + head) * T + token
++    else:
++        head -= H
++        source = K + batch * kb + head * kh + token[:, None] * kt
++        x = tl.load(source + feature[None, :] * kd, valid, 0.0).to(tl.float32)
++        scale = tl.load(KScale + head).to(tl.float32)
++        out = KOut + ((batch * H + head) * T + token[:, None]) * D + feature[None, :]
++        gain_out = KGain + (batch * H + head) * T + token
++    dtype: tl.constexpr = Q.dtype.element_ty
++    pair_index = tl.broadcast_to((feature[None, :] ^ 1), (ROWS, BLOCK_D))
++    paired = tl.gather(x, pair_index, axis=1)
++    cos = tl.load(Cos + token[:, None] * ct + (feature[None, :] // 2) * cd, valid, 0.0).to(dtype).to(tl.float32)
++    sin = tl.load(Sin + token[:, None] * st + (feature[None, :] // 2) * sd, valid, 0.0).to(dtype).to(tl.float32)
++    rotated = _rotate(x, paired, cos, sin, feature[None, :], dtype, False)
++    statistic = tl.sum(rotated * rotated, axis=1)
++    if RMS:
++        statistic /= D
++    gain = tl.rsqrt(statistic + EPS)
++    scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, SCALE_MIN), SCALE_MAX)).to(dtype).to(tl.float32)
++    normalized = (rotated * gain.to(dtype).to(tl.float32)[:, None]).to(dtype).to(tl.float32)
++    tl.store(out, normalized * scale, valid)
++    tl.store(gain_out, gain, token < T)
++
++
++@triton.jit
++def _backward_kernel(
++    Q, K, QScale, KScale, Cos, Sin, QGain, KGain, DQOut, DKOut, DQ, DK, DScalePart,
++    T: tl.constexpr, D: tl.constexpr, H: tl.constexpr, TILES: tl.constexpr,
++    qb: tl.constexpr, qh: tl.constexpr, qt: tl.constexpr, qd: tl.constexpr,
++    kb: tl.constexpr, kh: tl.constexpr, kt: tl.constexpr, kd: tl.constexpr,
++    dqb: tl.constexpr, dqh: tl.constexpr, dqt: tl.constexpr, dqd: tl.constexpr,
++    dkb: tl.constexpr, dkh: tl.constexpr, dkt: tl.constexpr, dkd: tl.constexpr,
++    ct: tl.constexpr, cd: tl.constexpr, st: tl.constexpr, sd: tl.constexpr,
++    RMS: tl.constexpr, SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
++    ROWS: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    batch_head = tl.program_id(0)
++    batch = batch_head // (2 * H)
++    head = batch_head % (2 * H)
++    token = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
++    feature = tl.arange(0, BLOCK_D)
++    valid = (token[:, None] < T) & (feature[None, :] < D)
++    if head < H:
++        source = Q + batch * qb + head * qh + token[:, None] * qt
++        x = tl.load(source + feature[None, :] * qd, valid, 0.0).to(tl.float32)
++        scale = tl.load(QScale + head).to(tl.float32)
++        gain = tl.load(QGain + (batch * H + head) * T + token, token < T, 0.0).to(tl.float32)
++        grad = tl.load(DQOut + batch * dqb + head * dqh + token[:, None] * dqt + feature[None, :] * dqd, valid, 0.0).to(tl.float32)
++        out = DQ + ((batch * H + head) * T + token[:, None]) * D + feature[None, :]
++    else:
++        head -= H
++        source = K + batch * kb + head * kh + token[:, None] * kt
++        x = tl.load(source + feature[None, :] * kd, valid, 0.0).to(tl.float32)
++        scale = tl.load(KScale + head).to(tl.float32)
++        gain = tl.load(KGain + (batch * H + head) * T + token, token < T, 0.0).to(tl.float32)
++        grad = tl.load(DKOut + batch * dkb + head * dkh + token[:, None] * dkt + feature[None, :] * dkd, valid, 0.0).to(tl.float32)
++        out = DK + ((batch * H + head) * T + token[:, None]) * D + feature[None, :]
++    dtype: tl.constexpr = Q.dtype.element_ty
++    pair_index = tl.broadcast_to((feature[None, :] ^ 1), (ROWS, BLOCK_D))
++    paired = tl.gather(x, pair_index, axis=1)
++    cos = tl.load(Cos + token[:, None] * ct + (feature[None, :] // 2) * cd, valid, 0.0).to(dtype).to(tl.float32)
++    sin = tl.load(Sin + token[:, None] * st + (feature[None, :] // 2) * sd, valid, 0.0).to(dtype).to(tl.float32)
++    rotated = _rotate(x, paired, cos, sin, feature[None, :], dtype, False)
++    rounded_gain = gain.to(dtype).to(tl.float32)
++    normalized = (rotated * rounded_gain[:, None]).to(dtype).to(tl.float32)
++    scale_part = (grad * normalized).to(dtype).to(tl.float32)
++    tl.store(DScalePart + batch_head * TILES + tl.program_id(1), tl.sum(tl.sum(scale_part, axis=1), axis=0))
++    scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, SCALE_MIN), SCALE_MAX)).to(dtype).to(tl.float32)
++    grad = (grad * scale).to(dtype).to(tl.float32)
++    grad_gain = tl.sum((grad * rotated).to(dtype).to(tl.float32), axis=1).to(dtype).to(tl.float32)
++    # autocast keeps the norm branch in FP32 until its contribution returns to Q/K
++    grad_statistic = (grad_gain * -0.5) * (gain * gain * gain)
++    if RMS:
++        grad_statistic /= D
++    direct = (grad * rounded_gain[:, None]).to(dtype).to(tl.float32)
++    indirect = (grad_statistic[:, None] * (2.0 * rotated)).to(dtype).to(tl.float32)
++    grad_rotated = (direct + indirect).to(dtype).to(tl.float32)
++    paired_grad = tl.gather(grad_rotated, pair_index, axis=1)
++    grad_x = _rotate(grad_rotated, paired_grad, cos, sin, feature[None, :], dtype, True)
++    tl.store(out, grad_x, valid)
++
++
++@triton.jit
++def _scale_backward_kernel(
++    Partials, QScale, KScale, DQScale, DKScale, Q,
++    B: tl.constexpr, H: tl.constexpr, TILES: tl.constexpr,
++    SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr, BLOCK: tl.constexpr,
++):
++    head = tl.program_id(0)
++    index = tl.arange(0, BLOCK)
++    partial = tl.load(Partials + (index // TILES) * (2 * H * TILES) + head * TILES + index % TILES, index < B * TILES, 0.0)
++    grad = tl.sum(partial, axis=0).to(Q.dtype.element_ty).to(tl.float32)
++    if head < H:
++        raw_scale = tl.load(QScale + head).to(tl.float32)
++        tl.store(DQScale + head, tl.where((raw_scale >= SCALE_MIN) & (raw_scale <= SCALE_MAX), grad, 0.0))
++    else:
++        head -= H
++        raw_scale = tl.load(KScale + head).to(tl.float32)
++        tl.store(DKScale + head, tl.where((raw_scale >= SCALE_MIN) & (raw_scale <= SCALE_MAX), grad, 0.0))
++
++
++@triton_op("gpt_moe::qk_norm_rope_forward", mutates_args=())
++def _forward(
++    q: Tensor, k: Tensor, q_scale: Tensor, k_scale: Tensor, cos: Tensor, sin: Tensor,
++    eps: float, rms: bool, scale_min: float, scale_max: float,
++) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
++    batch, heads, seq_len, head_size = q.shape
++    q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
++    k_out = torch.empty(k.shape, device=k.device, dtype=k.dtype)
++    q_gain = torch.empty((batch, heads, seq_len), device=q.device, dtype=torch.float32)
++    k_gain = torch.empty_like(q_gain)
++    rows = 16 if head_size <= 64 else 8
++    wrap_triton(_forward_kernel)[(batch * 2 * heads, triton.cdiv(seq_len, rows))](
++        q, k, q_scale, k_scale, cos, sin, q_out, k_out, q_gain, k_gain,
++        seq_len, head_size, heads, *q.stride(), *k.stride(), *cos.stride()[-2:], *sin.stride()[-2:],
++        eps, rms, scale_min, scale_max, rows, triton.next_power_of_2(head_size),
++        num_warps=4, enable_fp_fusion=False,
++    )
++    return q_out, k_out, q_gain, k_gain
++
++
++@triton_op("gpt_moe::qk_norm_rope_backward", mutates_args=())
++def _backward_kernel_call(
++    q: Tensor, k: Tensor, q_scale: Tensor, k_scale: Tensor, cos: Tensor, sin: Tensor,
++    q_gain: Tensor, k_gain: Tensor, grad_q: Tensor, grad_k: Tensor,
++    rms: bool, scale_min: float, scale_max: float,
++) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
++    batch, heads, seq_len, head_size = q.shape
++    rows = 16 if head_size <= 64 else 8
++    tiles = triton.cdiv(seq_len, rows)
++    dq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
++    dk = torch.empty(k.shape, device=k.device, dtype=k.dtype)
++    dq_scale = torch.empty_like(q_scale)
++    dk_scale = torch.empty_like(k_scale)
++    partials = torch.empty((batch, 2 * heads, tiles), device=q.device, dtype=torch.float32)
++    wrap_triton(_backward_kernel)[(batch * 2 * heads, tiles)](
++        q, k, q_scale, k_scale, cos, sin, q_gain, k_gain, grad_q, grad_k, dq, dk, partials,
++        seq_len, head_size, heads, tiles, *q.stride(), *k.stride(), *grad_q.stride(), *grad_k.stride(),
++        *cos.stride()[-2:], *sin.stride()[-2:], rms, scale_min, scale_max,
++        rows, triton.next_power_of_2(head_size), num_warps=4, enable_fp_fusion=False,
++    )
++    wrap_triton(_scale_backward_kernel)[(2 * heads,)](
++        partials, q_scale, k_scale, dq_scale, dk_scale, q,
++        batch, heads, tiles, scale_min, scale_max, triton.next_power_of_2(batch * tiles), num_warps=4,
++    )
++    return dq, dk, dq_scale, dk_scale
++
++
++def _setup_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
++    q, k, q_scale, k_scale, cos, sin, _, ctx.rms, ctx.scale_min, ctx.scale_max = inputs
++    ctx.mark_non_differentiable(*output[2:])
++    ctx.save_for_backward(q, k, q_scale, k_scale, cos, sin, *output[2:])
++
++
++def _backward(ctx: Any, grad_q: Tensor, grad_k: Tensor, *unused: Tensor) -> Tuple:
++    dq, dk, dq_scale, dk_scale = _backward_kernel_call(
++        *ctx.saved_tensors, grad_q, grad_k, ctx.rms, ctx.scale_min, ctx.scale_max,
++    )
++    return dq, dk, dq_scale, dk_scale, None, None, None, None, None, None
++
++
++_forward.register_autograd(_backward, setup_context=_setup_context)
++
++
++def qk_norm_rope(
++    q: Tensor, k: Tensor, q_scale: Tensor, k_scale: Tensor, cos: Tensor, sin: Tensor,
++    eps: float, rms: bool, scale_min: float, scale_max: float,
++) -> Tuple[Tensor, Tensor]:
++    return _forward(q, k, q_scale, k_scale, cos, sin, eps, rms, scale_min, scale_max)[:2]
+diff --git a/experiments/check_qk_norm_rope.py b/experiments/check_qk_norm_rope.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/check_qk_norm_rope.py
+@@ -0,0 +1,101 @@
++from pathlib import Path
++import sys
++
++import torch
++from torch.nn import functional as F
++from torch.nn.attention.flex_attention import create_block_mask, flex_attention
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from model.attention.qk_norm_rope import qk_norm_rope
++from model.position.rotary import Rotary, apply_rotation
++
++
++def reference(q, k, q_scale, k_scale, cos, sin, eps, rms, scale_min, scale_max):
++    cos, sin = cos.to(q.dtype), sin.to(q.dtype)
++    q, k = apply_rotation(q, k, cos, sin)
++    q_statistic = q.pow(2).mean(-1, keepdim=True) if rms else q.pow(2).sum(-1, keepdim=True)
++    k_statistic = k.pow(2).mean(-1, keepdim=True) if rms else k.pow(2).sum(-1, keepdim=True)
++    q_gain = torch.rsqrt(q_statistic + eps).to(q.dtype)
++    k_gain = torch.rsqrt(k_statistic + eps).to(k.dtype)
++    q = q * q_gain * q_scale.clamp(scale_min, scale_max).to(q.dtype)
++    k = k * k_gain * k_scale.clamp(scale_min, scale_max).to(k.dtype)
++    return q, k
++
++
++def run(operation, inputs, cos, sin, rms, gradients, selected=(0, 1), core=None):
++    values = [value.detach().clone(memory_format=torch.preserve_format).requires_grad_(value.requires_grad) for value in inputs]
++    with torch.autocast("cuda", dtype=torch.bfloat16):
++        output = operation(*values, cos, sin, 1e-6, rms, -0.5, 1.5)
++        if core is not None:
++            output = (core(*output),)
++            selected = (0,)
++    needed = [value for value in values if value.requires_grad]
++    grads = torch.autograd.grad(tuple(output[index] for index in selected), needed, gradients, allow_unused=True)
++    grads = [torch.zeros_like(value) if grad is None else grad for value, grad in zip(needed, grads)]
++    return (*[value.detach() for value in output], *[grad.detach() for grad in grads])
++
++
++def check(actual, expected, label):
++    for index, (value, ref) in enumerate(zip(actual, expected)):
++        assert value.shape == ref.shape and torch.isfinite(value).all(), (label, index)
++        relative = (value.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)
++        print(f"{label} tensor {index}: relative L2={relative.item():.8f}")
++        assert relative < 0.03, (label, index, relative.item())
++
++
++torch.manual_seed(2026)
++assert torch.cuda.is_available(), "this correctness check requires CUDA"
++compiled = torch.compile(qk_norm_rope, fullgraph=True)
++compiled_reference = torch.compile(reference, fullgraph=True)
++
++for batch, heads, seq_len, head_size in ((2, 4, 33, 64), (1, 3, 17, 128), (1, 2, 9, 96), (1, 2, 3, 256), (2, 4, 513, 64)):
++    q = torch.randn(batch, seq_len, heads, head_size, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
++    k = torch.randn_like(q)
++    q[:, :, 0] = 0
++    k[:, :, 0] *= 1e-4
++    q.requires_grad_()
++    k.requires_grad_()
++    q_scale = torch.tensor([-1.0, -0.5, 1.5, 2.0], device="cuda")[:heads].reshape(1, heads, 1, 1).requires_grad_()
++    k_scale = q_scale.detach().flip(1).clone().requires_grad_()
++    rotary = Rotary(head_size, 500_000, seq_len + 7).cuda()
++    cos = rotary.cos_cached[..., 7:seq_len + 7, :]
++    sin = rotary.sin_cached[..., 7:seq_len + 7, :]
++    gradients = [torch.randn(batch, seq_len, heads, head_size, device="cuda", dtype=torch.bfloat16).transpose(1, 2) for _ in range(2)]
++    inputs = (q, k, q_scale, k_scale)
++    for rms in (False, True):
++        label = f"shape={tuple(q.shape)} rms={rms}"
++        expected = run(reference, inputs, cos, sin, rms, gradients)
++        check(run(qk_norm_rope, inputs, cos, sin, rms, gradients), expected, label)
++        if seq_len == 33:
++            check(run(compiled, inputs, cos, sin, rms, gradients), run(compiled_reference, inputs, cos, sin, rms, gradients), label + " compiled")
++            for selected in ((0,), (1,)):
++                selected_grads = [gradients[index] for index in selected]
++                check(run(qk_norm_rope, inputs, cos, sin, rms, selected_grads, selected), run(reference, inputs, cos, sin, rms, selected_grads, selected), label + f" outputs={selected}")
++            for requires_qk in (False, True):
++                values = tuple(value.detach().requires_grad_(requires_qk if index < 2 else not requires_qk) for index, value in enumerate(inputs))
++                check(run(qk_norm_rope, values, cos, sin, rms, gradients), run(reference, values, cos, sin, rms, gradients), label + f" requires_qk={requires_qk}")
++
++batch, heads, seq_len, head_size = 2, 4, 33, 64
++q = torch.randn(batch, seq_len, heads, head_size, device="cuda", dtype=torch.bfloat16).transpose(1, 2).requires_grad_()
++k = torch.randn_like(q).requires_grad_()
++v = torch.randn_like(q)
++q_scale = torch.ones(1, heads, 1, 1, device="cuda", requires_grad=True)
++k_scale = torch.ones_like(q_scale, requires_grad=True)
++cos, sin = Rotary(head_size, 500_000, seq_len).cuda().get_cos_sin(seq_len, q.dtype, q.device)
++gradient = torch.randn_like(q)
++block_mask = create_block_mask(lambda b, h, q, k: q >= k, batch, heads, seq_len, seq_len, device="cuda")
++flex_core = torch.compile(lambda q, k: flex_attention(q, k, v, block_mask=block_mask), fullgraph=True)
++sdpa_core = lambda q, k: F.scaled_dot_product_attention(q, k, v, is_causal=True)
++for label, core in (("flex", flex_core), ("sdpa", sdpa_core)):
++    check(run(qk_norm_rope, (q, k, q_scale, k_scale), cos, sin, True, [gradient], core=core), run(reference, (q, k, q_scale, k_scale), cos, sin, True, [gradient], core=core), label)
++
++q_scale = torch.tensor([float("nan"), float("inf"), float("-inf"), 0.5], device="cuda").reshape(1, heads, 1, 1).requires_grad_()
++k_scale = q_scale.detach().flip(1).clone().requires_grad_()
++for rms in (False, True):
++    actual = run(qk_norm_rope, (q, k, q_scale, k_scale), cos, sin, rms, [gradient, gradient])
++    expected = run(reference, (q, k, q_scale, k_scale), cos, sin, rms, [gradient, gradient])
++    for value, ref in zip(actual, expected):
++        torch.testing.assert_close(value, ref, rtol=0.03, atol=0.03, equal_nan=True)
++    assert actual[-2][0, 0, 0, 0] == 0 and actual[-1][0, -1, 0, 0] == 0
++print("nonfinite learned-scale checks passed")
++print("fused QK normalization/RoPE checks passed")

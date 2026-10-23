@@ -1,0 +1,1172 @@
+diff --git a/docker_build/cu134-performance/Dockerfile b/docker_build/cu134-performance/Dockerfile
+new file mode 100644
+--- /dev/null
++++ b/docker_build/cu134-performance/Dockerfile
+@@ -0,0 +1,59 @@
++FROM anywinter4079/pytorch:2.16.0.dev20261009-cu134-deepgemm-experimental
++
++WORKDIR /workspace
++
++ENV CUTLASS_REVISION=2c85f497547eb441f0fe80bfb0fb2e6f9add1719
++ENV CUTLASS_PATH=/opt/cutlass
++ENV FA4_REVISION=e7a6402a9ff099de5eb628ce207a88a3f0aa5378
++
++RUN python -m pip install --no-cache-dir --no-deps --only-binary=:all: \
++    setuptools==80.9.0 setuptools-scm==9.2.2 wheel==0.45.1 packaging==25.0 \
++    "nvidia-cutlass-dsl[cu13]==4.8.1" \
++    nvidia-cutlass-dsl-libs-core==4.8.1 nvidia-cutlass-dsl-libs-base==4.8.1 \
++    nvidia-cutlass-dsl-libs-cu12==4.8.1 nvidia-cutlass-dsl-libs-cu13==4.8.1 \
++    quack-kernels==0.6.5 apache-tvm-ffi==0.1.11 torch-c-dlpack-ext==0.1.5 \
++    einops==0.8.2 typing_extensions==4.16.0 \
++    cuda-bindings==13.4.4 cuda-pathfinder==1.8.4 protobuf==7.36.2
++
++RUN git clone --depth 1 --filter=blob:none --no-checkout --branch v4.8.1 \
++    https://github.com/NVIDIA/cutlass.git "${CUTLASS_PATH}" \
++ && git -C "${CUTLASS_PATH}" sparse-checkout set include tools/util/include \
++ && git -C "${CUTLASS_PATH}" checkout --detach "${CUTLASS_REVISION}" \
++ && test -f "${CUTLASS_PATH}/include/cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl" \
++ && test -f "${CUTLASS_PATH}/tools/util/include/cutlass/util/packed_stride.hpp"
++
++ARG FA4_SM120_FLEX=0
++ARG FA4_DEVICE_WINDOW=0
++
++RUN case "${FA4_SM120_FLEX}:${FA4_DEVICE_WINDOW}" in \
++      0:0|1:0|0:1) ;; \
++      *) echo "FA4_SM120_FLEX and FA4_DEVICE_WINDOW must be 0 or 1 and cannot both be 1" >&2; exit 1 ;; \
++    esac
++
++COPY cu134-fa4/fa4-sm120-local-window.patch /tmp/fa4-sm120-local-window.patch
++COPY cu134-fa4/fa4-sm120-flex.patch /tmp/fa4-sm120-flex.patch
++COPY cu134-fa4/fa4-sm120-device-window.patch /tmp/fa4-sm120-device-window.patch
++
++RUN git clone --depth 1 --filter=blob:none --no-checkout --branch fa4-v4.0.0.beta36 \
++    https://github.com/Dao-AILab/flash-attention.git /opt/flash-attention \
++ && git -C /opt/flash-attention sparse-checkout set flash_attn/cute \
++ && git -C /opt/flash-attention checkout --detach "${FA4_REVISION}" \
++ && git -C /opt/flash-attention apply --check /tmp/fa4-sm120-local-window.patch \
++ && git -C /opt/flash-attention apply /tmp/fa4-sm120-local-window.patch \
++ && if [ "${FA4_SM120_FLEX}" = 1 ]; then \
++      git -C /opt/flash-attention apply --check --include='flash_attn/*' /tmp/fa4-sm120-flex.patch \
++   && git -C /opt/flash-attention apply --include='flash_attn/*' /tmp/fa4-sm120-flex.patch \
++   && FA4_TORCH_ROOT="$(python -c 'from importlib.metadata import distribution; print(distribution("torch").locate_file(""))')" \
++   && git -C "${FA4_TORCH_ROOT}" apply --check --include='torch/*' /tmp/fa4-sm120-flex.patch \
++   && git -C "${FA4_TORCH_ROOT}" apply --include='torch/*' /tmp/fa4-sm120-flex.patch; \
++    elif [ "${FA4_DEVICE_WINDOW}" = 1 ]; then \
++      git -C /opt/flash-attention apply --check /tmp/fa4-sm120-device-window.patch \
++   && git -C /opt/flash-attention apply /tmp/fa4-sm120-device-window.patch; fi \
++ && SETUPTOOLS_SCM_PRETEND_VERSION_FOR_FLASH_ATTN_4=4.0.0b36 \
++    python -m pip install --no-cache-dir --no-build-isolation --no-deps \
++    "/opt/flash-attention/flash_attn/cute[cu13]" \
++ && rm -f /tmp/fa4-sm120-local-window.patch /tmp/fa4-sm120-flex.patch /tmp/fa4-sm120-device-window.patch
++
++RUN nvcc --version \
++ && "${CXX}" --version \
++ && python -c "import inspect; import torch, triton, deep_gemm; import transformer_engine.pytorch; import cutlass; from flash_attn.cute import flash_attn_func; from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd; import flash_attn.cute.interface as fa4_interface; from importlib.metadata import version; device_window = all('window_size_tensor' in inspect.signature(fn).parameters for fn in (_flash_attn_fwd, _flash_attn_bwd)); print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'triton:', triton.__version__, 'transformer-engine:', version('transformer-engine'), 'deep-gemm:', version('deep-gemm'), 'flash-attn-4:', version('flash-attn-4'), 'nvidia-cutlass-dsl:', version('nvidia-cutlass-dsl'), 'SM120 Flex:', getattr(fa4_interface, 'SM120_FLEX_SUPPORT', False), 'device window:', device_window); assert torch.__version__ == '2.16.0.dev20261009+cu134'; assert torch.version.cuda == '13.4'; assert version('flash-attn-4') == '4.0.0b36'; assert version('nvidia-cutlass-dsl') == '4.8.1'; assert getattr(fa4_interface, 'SM120_FLEX_SUPPORT', False) == bool(int('${FA4_SM120_FLEX}')); assert device_window == bool(int('${FA4_DEVICE_WINDOW}'))"
+diff --git a/docker_build/cu134-fa4/fa4-sm120-local-window.patch b/docker_build/cu134-fa4/fa4-sm120-local-window.patch
+new file mode 100644
+--- /dev/null
++++ b/docker_build/cu134-fa4/fa4-sm120-local-window.patch
+@@ -0,0 +1,68 @@
++diff --git a/flash_attn/cute/flash_fwd.py b/flash_attn/cute/flash_fwd.py
++--- a/flash_attn/cute/flash_fwd.py
+++++ b/flash_attn/cute/flash_fwd.py
++@@ -957,6 +957,7 @@
++                 batch_idx=batch_size,
++                 head_idx=num_head,
++                 m_block=m_block,
+++                n_block_min=n_block_min,
++                 aux_data=aux_data,
++                 fastdiv_mods=fastdiv_mods,
++             )
++@@ -991,11 +992,11 @@
++ 
++             for stage in cutlass.range_constexpr(self.num_stages):
++                 if const_expr(not self.Q_in_regs or stage > 0):
++-                    if stage == 0 or n_block - stage >= 0:
+++                    if stage == 0 or n_block - stage >= n_block_min:
++                         load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
++                     cute.arch.cp_async_commit_group()
++                 if const_expr(stage < self.num_stages - 1):
++-                    if stage == 0 or n_block - stage >= 0:
+++                    if stage == 0 or n_block - stage >= n_block_min:
++                         load_V(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
++                     cute.arch.cp_async_commit_group()
++             if const_expr(not self.Q_in_regs):
++@@ -1059,7 +1060,7 @@
++                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
++                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
++             # The remaining iterations have no masking
++-            for n_tile in cutlass.range(n_block, unroll=1):
+++            for n_tile in cutlass.range(cutlass.max(n_block - n_block_min, 0), unroll=1):
++                 compute_one_n_block(
++                     n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
++                     seqlen=seqlen, is_first_n_block=False,
++@@ -1067,7 +1068,6 @@
++                 )
++                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
++                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
++-            # TODO: local
++ 
++             # normalize acc_O by row_sum and calculate the lse
++             row_scale = softmax.finalize()
++@@ -1110,6 +1110,7 @@
++         head_idx: cutlass.Int32,
++         m_block: cutlass.Int32,
++         seqlen: SeqlenInfoQK,
+++        n_block_min: Int32,
++         aux_data: AuxData = AuxData(),
++         fastdiv_mods=None,
++         mask_fn: Optional[Callable] = None,
++@@ -1134,7 +1135,7 @@
++ 
++         # need predicates for the first tile
++         def load_V_next():
++-            if self.num_stages == 1 or n_block - self.num_stages + 1 >= 0:
+++            if self.num_stages == 1 or n_block - self.num_stages + 1 >= n_block_min:
++                 load_V(
++                     n_block - self.num_stages + 1,
++                     smem_pipe_write,
++@@ -1174,7 +1175,7 @@
++         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
++ 
++         def load_K_next():
++-            if n_block - self.num_stages >= 0:
+++            if n_block - self.num_stages >= n_block_min:
++                 load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
++             cute.arch.cp_async_commit_group()
++ 
+diff --git a/docker_build/cu134-fa4/fa4-sm120-flex.patch b/docker_build/cu134-fa4/fa4-sm120-flex.patch
+new file mode 100644
+--- /dev/null
++++ b/docker_build/cu134-fa4/fa4-sm120-flex.patch
+@@ -0,0 +1,881 @@
++diff --git a/flash_attn/cute/flash_fwd.py b/flash_attn/cute/flash_fwd.py
++--- a/flash_attn/cute/flash_fwd.py
+++++ b/flash_attn/cute/flash_fwd.py
++@@ -28,6 +28,10 @@
++ from flash_attn.cute import utils
++ from flash_attn.cute.mask import AttentionMask
++ from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
+++from flash_attn.cute.block_sparse_utils import (
+++    get_curr_blocksparse_tensors,
+++    get_m_block_from_iter_bwd,
+++)
++ from flash_attn.cute.seqlen_info import SeqlenInfoQK
++ from flash_attn.cute.block_info import BlockInfo
++ from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
++@@ -57,6 +61,7 @@
++         mask_mod: Optional[cutlass.Constexpr] = None,
++         has_aux_tensors: bool = False,
++         q_subtile_factor: int = 1,
+++        kv_subtile_factor: int = 1,
++     ):
++         """Initializes the configuration for a flash attention kernel.
++ 
++@@ -96,6 +101,7 @@
++         self.num_threads = num_threads
++         self.num_stages = num_stages
++         self.q_subtile_factor = q_subtile_factor
+++        self.kv_subtile_factor = kv_subtile_factor
++         self.Q_in_regs = Q_in_regs
++         self.score_mod = score_mod
++         self.mask_mod = mask_mod
++@@ -713,6 +719,10 @@
++         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
++         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
++         fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors)
+++        self.use_block_sparsity = const_expr(blocksparse_tensors is not None)
+++        if const_expr(self.use_block_sparsity):
+++            assert self.num_stages == 1 and not self.Q_in_regs
+++            assert not self.pack_gqa
++ 
++         self.kernel(
++             mQ,
++@@ -744,6 +754,7 @@
++             TileScheduler,
++             aux_data,
++             fastdiv_mods,
+++            blocksparse_tensors,
++         ).launch(
++             grid=grid_dim,
++             block=[self.num_threads, 1, 1],
++@@ -783,6 +794,7 @@
++         TileScheduler: cutlass.Constexpr[Callable],
++         aux_data: AuxData = AuxData(),
++         fastdiv_mods=None,
+++        blocksparse_tensors: Optional[BlockSparseTensors] = None,
++     ):
++         # Thread index, block index
++         tidx, _, _ = cute.arch.thread_idx()
++@@ -981,93 +993,102 @@
++                     tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
++                     cute.copy(smem_thr_copy_Q, tSsQ, tSrQ_copy_view)
++ 
++-            # If Q_in_regs, we load Q, then load 1 stage of K, then (optionally) rotate Q and
++-            # read from smem_q to registers, then load V.
++-            # If !Q_in_regs, we load Q, load all stages of K & V, then (optionally) rotate Q.
++-            if const_expr(self.Q_in_regs):
++-                load_K(n_block, smem_pipe_write=0, need_predicates=True)
++-                cute.arch.cp_async_commit_group()
++-                preprocess_Q()
++-                cute.arch.barrier()  # Make sure all threads have read smem_q before loading V
++-
++-            for stage in cutlass.range_constexpr(self.num_stages):
++-                if const_expr(not self.Q_in_regs or stage > 0):
++-                    if stage == 0 or n_block - stage >= n_block_min:
++-                        load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
+++            if const_expr(self.use_block_sparsity):
+++                self.compute_sparse_n_blocks(
+++                    compute_one_n_block, load_K, preprocess_Q, blocksparse_tensors,
+++                    seqlen, m_block, batch_size, num_head, thr_mma_qk,
+++                    window_size_left, window_size_right, aux_data, fastdiv_mods,
+++                )
+++                cute.arch.cp_async_wait_group(0)
+++                cute.arch.barrier()
+++            else:
+++                # If Q_in_regs, we load Q, then load 1 stage of K, then (optionally) rotate Q and
+++                # read from smem_q to registers, then load V.
+++                # If !Q_in_regs, we load Q, load all stages of K & V, then (optionally) rotate Q.
+++                if const_expr(self.Q_in_regs):
+++                    load_K(n_block, smem_pipe_write=0, need_predicates=True)
++                     cute.arch.cp_async_commit_group()
++-                if const_expr(stage < self.num_stages - 1):
++-                    if stage == 0 or n_block - stage >= n_block_min:
++-                        load_V(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
++-                    cute.arch.cp_async_commit_group()
++-            if const_expr(not self.Q_in_regs):
++-                preprocess_Q()
++-
++-            # ///////////////////////////////////////////////////////////////////////////////
++-            # Mainloop
++-            # ///////////////////////////////////////////////////////////////////////////////
++-            # Start processing of the first n-block.
++-            # For performance reason, we separate out two kinds of iterations:
++-            # those that need masking on S, and those that don't.
++-            # We need masking on S for the very last block when K and V has length not multiple of tile_n.
++-            # We also need masking on S if it's causal, for the last several blocks.
++-            mask = AttentionMask(
++-                self.tile_m,
++-                self.tile_n,
++-                seqlen,
++-                window_size_left,
++-                window_size_right,
++-                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
++-            )
++-            mask_fn = partial(
++-                mask.apply_mask,
++-                batch_idx=batch_size,
++-                head_idx=num_head,
++-                m_block=m_block,
++-                thr_mma=thr_mma_qk,
++-                mask_causal=self.is_causal,
++-                mask_local=self.is_local,
++-                aux_data=aux_data,
++-                fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
++-            )
++-
++-            # First iteration with seqlen masking
++-            smem_pipe_read = Int32(0)
++-            smem_pipe_write = Int32(self.num_stages - 1)
++-            compute_one_n_block(
++-                n_block,
++-                smem_pipe_read,
++-                smem_pipe_write,
++-                is_first_n_block=True,
++-                seqlen=seqlen,
++-                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
++-            )
++-            smem_pipe_read = self.advance_pipeline(smem_pipe_read)
++-            smem_pipe_write = self.advance_pipeline(smem_pipe_write)
++-            # Next couple of iterations with causal masking
++-            if const_expr(self.is_causal or self.is_local):
++-                n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
++-                    seqlen, m_block, n_block_min
+++                    preprocess_Q()
+++                    cute.arch.barrier()  # Make sure all threads have read smem_q before loading V
+++
+++                for stage in cutlass.range_constexpr(self.num_stages):
+++                    if const_expr(not self.Q_in_regs or stage > 0):
+++                        if stage == 0 or n_block - stage >= n_block_min:
+++                            load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
+++                        cute.arch.cp_async_commit_group()
+++                    if const_expr(stage < self.num_stages - 1):
+++                        if stage == 0 or n_block - stage >= n_block_min:
+++                            load_V(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
+++                        cute.arch.cp_async_commit_group()
+++                if const_expr(not self.Q_in_regs):
+++                    preprocess_Q()
+++
+++                # ///////////////////////////////////////////////////////////////////////////////
+++                # Mainloop
+++                # ///////////////////////////////////////////////////////////////////////////////
+++                # Start processing of the first n-block.
+++                # For performance reason, we separate out two kinds of iterations:
+++                # those that need masking on S, and those that don't.
+++                # We need masking on S for the very last block when K and V has length not multiple of tile_n.
+++                # We also need masking on S if it's causal, for the last several blocks.
+++                mask = AttentionMask(
+++                    self.tile_m,
+++                    self.tile_n,
+++                    seqlen,
+++                    window_size_left,
+++                    window_size_right,
+++                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
++                 )
++-                for n_tile in cutlass.range(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
++-                    n_block = n_block_max - 2 - n_tile
+++                mask_fn = partial(
+++                    mask.apply_mask,
+++                    batch_idx=batch_size,
+++                    head_idx=num_head,
+++                    m_block=m_block,
+++                    thr_mma=thr_mma_qk,
+++                    mask_causal=self.is_causal,
+++                    mask_local=self.is_local,
+++                    aux_data=aux_data,
+++                    fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
+++                )
+++
+++                # First iteration with seqlen masking
+++                smem_pipe_read = Int32(0)
+++                smem_pipe_write = Int32(self.num_stages - 1)
+++                compute_one_n_block(
+++                    n_block,
+++                    smem_pipe_read,
+++                    smem_pipe_write,
+++                    is_first_n_block=True,
+++                    seqlen=seqlen,
+++                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+++                )
+++                smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+++                smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+++                # Next couple of iterations with causal masking
+++                if const_expr(self.is_causal or self.is_local):
+++                    n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+++                        seqlen, m_block, n_block_min
+++                    )
+++                    for n_tile in cutlass.range(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
+++                        n_block = n_block_max - 2 - n_tile
+++                        compute_one_n_block(
+++                            n_block,
+++                            smem_pipe_read,
+++                            smem_pipe_write,
+++                            seqlen=seqlen,
+++                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+++                        )
+++                        smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+++                        smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+++                # The remaining iterations have no masking
+++                for n_tile in cutlass.range(cutlass.max(n_block - n_block_min, 0), unroll=1):
++                     compute_one_n_block(
++-                        n_block,
++-                        smem_pipe_read,
++-                        smem_pipe_write,
++-                        seqlen=seqlen,
++-                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+++                        n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
+++                        seqlen=seqlen, is_first_n_block=False,
+++                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
++                     )
++                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
++                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
++-            # The remaining iterations have no masking
++-            for n_tile in cutlass.range(cutlass.max(n_block - n_block_min, 0), unroll=1):
++-                compute_one_n_block(
++-                    n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
++-                    seqlen=seqlen, is_first_n_block=False,
++-                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
++-                )
++-                smem_pipe_read = self.advance_pipeline(smem_pipe_read)
++-                smem_pipe_write = self.advance_pipeline(smem_pipe_write)
++ 
++             # normalize acc_O by row_sum and calculate the lse
++             row_scale = softmax.finalize()
++@@ -1116,6 +1137,8 @@
++         mask_fn: Optional[Callable] = None,
++         is_first_n_block: cutlass.Constexpr = False,
++         check_inf: cutlass.Constexpr = True,
+++        n_block_next: Optional[Int32] = None,
+++        has_next: cutlass.Boolean = False,
++     ):
++         """Compute one n_block of S/O.
++ 
++@@ -1139,7 +1162,7 @@
++                 load_V(
++                     n_block - self.num_stages + 1,
++                     smem_pipe_write,
++-                    need_predicates=is_first_n_block and self.num_stages == 1,
+++                    need_predicates=self.use_block_sparsity or (is_first_n_block and self.num_stages == 1),
++                 )
++             cute.arch.cp_async_commit_group()
++ 
++@@ -1175,8 +1198,12 @@
++         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
++ 
++         def load_K_next():
++-            if n_block - self.num_stages >= n_block_min:
++-                load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
+++            if const_expr(self.use_block_sparsity):
+++                if has_next:
+++                    load_K(n_block_next, smem_pipe_write, need_predicates=True)
+++            else:
+++                if n_block - self.num_stages >= n_block_min:
+++                    load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
++             cute.arch.cp_async_commit_group()
++ 
++         # wait for smem tile V for O
++@@ -1207,6 +1234,79 @@
++         # if const_expr(self.num_stages > 1):
++         #     load_K_next()
++     @cute.jit
+++    def compute_sparse_n_blocks(
+++        self,
+++        compute_one_n_block: Callable,
+++        load_K: Callable,
+++        preprocess_Q: Callable,
+++        blocksparse_tensors: BlockSparseTensors,
+++        seqlen: SeqlenInfoQK,
+++        m_block: Int32,
+++        batch_idx: Int32,
+++        head_idx: Int32,
+++        thr_mma_qk: cute.ThrMma,
+++        window_size_left: Optional[Int32],
+++        window_size_right: Optional[Int32],
+++        aux_data: AuxData,
+++        fastdiv_mods,
+++    ):
+++        partial_count, partial_indices, full_count, full_indices = get_curr_blocksparse_tensors(
+++            batch_idx, head_idx, m_block // self.q_subtile_factor,
+++            blocksparse_tensors, seqlen, self.kv_subtile_factor,
+++        )
+++        total_count = (partial_count + full_count) * self.kv_subtile_factor
+++        get_n_block = partial(
+++            get_m_block_from_iter_bwd,
+++            curr_q_cnt=partial_count, curr_q_idx=partial_indices,
+++            curr_full_cnt=full_count, curr_full_idx=full_indices,
+++            q_subtile_factor=self.kv_subtile_factor,
+++        )
+++        mask = AttentionMask(self.tile_m, self.tile_n, seqlen)
+++        mask_fn = partial(
+++            mask.apply_mask, batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
+++            thr_mma=thr_mma_qk, mask_seqlen=True, mask_causal=False, mask_local=False,
+++            aux_data=aux_data, fastdiv_mods=fastdiv_mods,
+++        )
+++        if total_count > 0:
+++            n_block, is_full_block = get_n_block(0)
+++            load_K(n_block, smem_pipe_write=0, need_predicates=True)
+++            cute.arch.cp_async_commit_group()
+++            preprocess_Q()
+++            n_block_next = Int32(0)
+++            if total_count > 1:
+++                n_block_next, _ = get_n_block(1)
+++            compute_one_n_block(
+++                n_block, Int32(0), Int32(0), seqlen=seqlen,
+++                is_first_n_block=True, n_block_next=n_block_next,
+++                has_next=total_count > 1,
+++                mask_fn=partial(self.apply_sparse_mask, mask_fn=mask_fn, is_full_block=is_full_block),
+++            )
+++            for block_idx in cutlass.range(1, total_count, unroll=1):
+++                n_block, is_full_block = get_n_block(block_idx)
+++                n_block_next = Int32(0)
+++                if block_idx + 1 < total_count:
+++                    n_block_next, _ = get_n_block(block_idx + 1)
+++                compute_one_n_block(
+++                    n_block, Int32(0), Int32(0), seqlen=seqlen,
+++                    is_first_n_block=False, n_block_next=n_block_next,
+++                    has_next=block_idx + 1 < total_count,
+++                    mask_fn=partial(self.apply_sparse_mask, mask_fn=mask_fn, is_full_block=is_full_block),
+++                )
+++
+++    @cute.jit
+++    def apply_sparse_mask(
+++        self,
+++        acc_S: cute.Tensor,
+++        n_block: Int32,
+++        mask_fn: Callable,
+++        is_full_block: cutlass.Boolean,
+++    ):
+++        if is_full_block:
+++            mask_fn(acc_S, n_block=n_block, mask_mod=None)
+++        else:
+++            mask_fn(acc_S, n_block=n_block, mask_mod=self.mask_mod)
+++
+++    @cute.jit
++     def apply_score_mod(
++         self,
++         thr_mma_qk,
++diff --git a/flash_attn/cute/flash_bwd.py b/flash_attn/cute/flash_bwd.py
++--- a/flash_attn/cute/flash_bwd.py
+++++ b/flash_attn/cute/flash_bwd.py
++@@ -19,12 +19,16 @@
++ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
++ from flash_attn.cute import utils
++ from flash_attn.cute.mask import AttentionMask
++-from flash_attn.cute.softmax import call_score_mod, call_score_mod_bwd
+++from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
++ from flash_attn.cute.seqlen_info import SeqlenInfoQK
++ from flash_attn.cute.block_info import BlockInfo
++ from quack.cute_dsl_utils import ParamsBase
++ from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
++ from flash_attn.cute.block_sparsity import BlockSparseTensors
+++from flash_attn.cute.block_sparse_utils import (
+++    get_block_sparse_iteration_info_bwd,
+++    get_m_block_from_iter_bwd,
+++)
++ from flash_attn.cute.utils import AuxData
++ 
++ 
++@@ -52,6 +56,10 @@
++         V_in_regs: bool = False,
++         score_mod: cutlass.Constexpr | None = None,
++         score_mod_bwd: cutlass.Constexpr | None = None,
+++        mask_mod: cutlass.Constexpr | None = None,
+++        has_aux_tensors: cutlass.Constexpr = False,
+++        q_subtile_factor: int = 1,
+++        kv_subtile_factor: int = 1,
++     ):
++         """Initializes the configuration for a flash attention v2 kernel.
++ 
++@@ -100,6 +108,27 @@
++         self.share_QV_smem = V_in_regs
++         self.score_mod = score_mod
++         self.score_mod_bwd = score_mod_bwd
+++        self.q_subtile_factor = q_subtile_factor
+++        self.kv_subtile_factor = kv_subtile_factor
+++        self.mask_mod = mask_mod
+++        self.qk_acc_dtype = cutlass.Float32
+++        self.score_vec_size: cutlass.Constexpr = getattr(
+++            score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
+++        )
+++        self.score_bwd_vec_size: cutlass.Constexpr = getattr(
+++            score_mod_bwd, "__vec_size__", self.score_vec_size
+++        )
+++        if self.score_vec_size > 2 or self.score_bwd_vec_size > 2:
+++            raise ValueError(
+++                "score_mod vec_size greater than 2 not supported on Sm80/120 "
+++                "due to accumulator thread ownership pattern."
+++            )
+++        self.mask_vec_size: cutlass.Constexpr = getattr(mask_mod, "__vec_size__", 1)
+++        if self.mask_vec_size > 1:
+++            raise ValueError(
+++                f"mask_mod vec_size {self.mask_vec_size} not supported on Sm80/120 "
+++                "due to accumulator thread ownership pattern."
+++            )
++ 
++     @staticmethod
++     def can_implement(
++@@ -412,25 +441,25 @@
++         SharedStorage = self._get_shared_storage_cls()
++         tiled_mma_sdp, tiled_mma_dkv, tiled_mma_dq = self._get_tiled_mma()
++ 
++-        num_head = mQ.shape[1] if cutlass.const_expr(mCuSeqlensQ is not None) else mQ.shape[2]
++-
++         if cutlass.const_expr(mCuSeqlensK is not None):
++             TileScheduler = SingleTileVarlenScheduler
++             num_batch = mCuSeqlensK.shape[0] - 1
+++            total_k = cute.size(mK.shape[0])
++         else:
++             TileScheduler = SingleTileScheduler
++             num_batch = mK.shape[0]
+++            total_k = cute.size(mK.shape[0]) * cute.size(mK.shape[1])
++ 
++         # Uses seqlen k, etc. since main bwd kernel's blocks are over n
++         tile_sched_args = TileSchedulerArguments(
++-            num_block=cute.ceil_div(mK.shape[1], self.n_block_size),
++-            num_head=num_head,
+++            num_block=cute.ceil_div(mK.shape[-3], self.n_block_size),
+++            num_head=mQ.shape[-2],
++             num_batch=num_batch,
++             num_splits=1,
++-            seqlen_k=0,
++-            headdim=mK.shape[2],
++-            headdim_v=mV.shape[2],
++-            total_q=mK.shape[0],
+++            seqlen_k=cute.size(mQ.shape[-3]),
+++            headdim=mK.shape[-1],
+++            headdim_v=mV.shape[-1],
+++            total_q=total_k,
++             tile_shape_mn=(self.n_block_size, self.m_block_size),
++             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
++             mCuSeqlensQ=mCuSeqlensK,
++@@ -444,6 +473,11 @@
++         softmax_scale_log2, _ = utils.compute_softmax_scale_log2(
++             softmax_scale, self.score_mod
++         )
+++        fastdiv_mods = utils.compute_fastdiv_mods(
+++            mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors,
+++            seqlen_dim=-3,
+++        )
+++        self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
++         self.kernel(
++             mQ,
++             mK,
++@@ -482,6 +516,8 @@
++             tile_sched_params,
++             TileScheduler,
++             aux_data,
+++            fastdiv_mods,
+++            blocksparse_tensors,
++         ).launch(
++             grid=grid_dim,
++             block=[self.num_threads, 1, 1],
++@@ -529,6 +565,8 @@
++         tile_sched_params: ParamsBase,
++         TileScheduler: cutlass.Constexpr[Callable],
++         aux_data: AuxData = AuxData(),
+++        fastdiv_mods=None,
+++        blocksparse_tensors: Optional[BlockSparseTensors] = None,
++     ):
++         # Thread index, block index
++         tidx, _, _ = cute.arch.thread_idx()
++@@ -561,6 +599,19 @@
++                 window_size_right,
++             )
++             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+++            get_m_block = None
+++            if cutlass.const_expr(self.use_block_sparsity):
+++                partial_count, partial_indices, full_count, full_indices, total_count = get_block_sparse_iteration_info_bwd(
+++                    blocksparse_tensors, batch_idx, head_idx,
+++                    n_block // self.kv_subtile_factor, self.q_subtile_factor,
+++                )
+++                get_m_block = partial(
+++                    get_m_block_from_iter_bwd,
+++                    curr_q_cnt=partial_count, curr_q_idx=partial_indices,
+++                    curr_full_cnt=full_count, curr_full_idx=full_indices,
+++                    q_subtile_factor=self.q_subtile_factor,
+++                )
+++                m_block_min, m_block_max = Int32(0), total_count
++             # TODO: return early if m_block_max == 0
++ 
++             # ///////////////////////////////////////////////////////////////////////////////
++@@ -790,14 +841,16 @@
++                 tdOgdO, tdOsdO, tdOcdO, t0dOcdO, tdOpdO,
++                 tLSEgdPsum, tLSEsdPsum, tLSEcLSE, seqlen=seqlen.seqlen_q
++             )
+++            if cutlass.const_expr(self.use_block_sparsity):
+++                load_Q_LSE = partial(self.load_sparse_m_block, load_block=load_Q_LSE, get_m_block=get_m_block)
+++                load_dO_dPsum = partial(self.load_sparse_m_block, load_block=load_dO_dPsum, get_m_block=get_m_block)
++             compute_one_m_block = partial(
++                 self.compute_one_m_block, mma_params=mma_params,
++                 smem_copy_params=smem_copy_params, gmem_copy_params=gmem_copy_params,
++                 load_Q_LSE=load_Q_LSE, load_dO_dPsum=load_dO_dPsum,
++                 m_block_max=m_block_max,
++-                softmax_scale=softmax_scale,
++                 softmax_scale_log2=softmax_scale_log2,
++-                aux_data=aux_data,
+++                get_m_block=get_m_block,
++             )
++ 
++             if m_block_min < m_block_max:
++@@ -843,11 +896,24 @@
++                     seqlen,
++                     window_size_left,
++                     window_size_right,
+++                    self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
+++                    swap_AB=self.SdP_swapAB,
++                 )
++                 mask_fn = partial(
++                     mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
++                     batch_idx=batch_idx, head_idx=head_idx,
++-                    mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local
+++                    mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local,
+++                    mask_mod=self.mask_mod, aux_data=aux_data, fastdiv_mods=fastdiv_mods,
+++                )
+++                score_mod_fn = partial(
+++                    self.apply_score_mod, n_block=n_block, batch_idx=batch_idx,
+++                    head_idx=head_idx, seqlen_info=seqlen, thr_mma_SdP=thr_mma_sdp,
+++                    softmax_scale=softmax_scale, aux_data=aux_data, fastdiv_mods=fastdiv_mods,
+++                )
+++                score_mod_bwd_fn = partial(
+++                    self.apply_score_mod_bwd, n_block=n_block, batch_idx=batch_idx,
+++                    head_idx=head_idx, seqlen_info=seqlen, thr_mma_SdP=thr_mma_sdp,
+++                    softmax_scale=softmax_scale, aux_data=aux_data, fastdiv_mods=fastdiv_mods,
++                 )
++                 smem_pipe_read_q = cutlass.Int32(0)
++                 smem_pipe_read_do = cutlass.Int32(0)
++@@ -856,7 +922,7 @@
++                 for m_tile in cutlass.range(m_block_min, m_block_max, unroll=1):
++                     compute_one_m_block(
++                         m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
++-                        mask_fn=mask_fn,
+++                        mask_fn=mask_fn, score_mod_fn=score_mod_fn, score_mod_bwd_fn=score_mod_bwd_fn,
++                     )
++                     smem_pipe_read_q = self.advance_pipeline(smem_pipe_read_q, self.num_stages_Q)
++                     smem_pipe_read_do = self.advance_pipeline(smem_pipe_read_do, self.num_stages_dO)
++@@ -892,20 +958,26 @@
++         load_Q_LSE: Callable,
++         load_dO_dPsum: Callable,
++         m_block_max: cutlass.Int32,
++-        softmax_scale: cutlass.Float32,
++         softmax_scale_log2: cutlass.Float32,
++-        aux_data: AuxData = AuxData(),
++         mask_fn: Optional[Callable] = None,
+++        score_mod_fn: Optional[Callable] = None,
+++        score_mod_bwd_fn: Optional[Callable] = None,
+++        get_m_block: Optional[Callable] = None,
++     ):
+++        m_block_index = m_block
+++        is_full_block = False
+++        if cutlass.const_expr(self.use_block_sparsity):
+++            m_block, is_full_block = get_m_block(m_block_index)
+++
++         def load_Q_next():
++-            m_block_next = m_block + (self.num_stages_Q - 1 if cutlass.const_expr(self.num_stages_Q > 1) else 1)
+++            m_block_next = m_block_index + (self.num_stages_Q - 1 if cutlass.const_expr(self.num_stages_Q > 1) else 1)
++             if m_block_next < m_block_max:
++                 load_Q_LSE(m_block_next, smem_pipe_write_q)
++             cute.arch.cp_async_commit_group()
++ 
++         def load_dO_next():
++-            if m_block + self.num_stages_dO < m_block_max:
++-                load_dO_dPsum(m_block + self.num_stages_dO, smem_pipe_write_do)
+++            if m_block_index + self.num_stages_dO < m_block_max:
+++                load_dO_dPsum(m_block_index + self.num_stages_dO, smem_pipe_write_do)
++             cute.arch.cp_async_commit_group()
++ 
++         # MMA S
++@@ -929,25 +1001,17 @@
++         cute.autovec_copy(
++             smem_copy_params.tSsLSEMma[None, smem_pipe_read_q if cutlass.const_expr(self.num_stages_Q > 1) else 0], tLSErLSE
++         )
++-        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
++-        acc_S_pre_mn = layout_utils.reshape_acc_to_mn(acc_S_pre)
++         if cutlass.const_expr(self.score_mod is not None):
++-            for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
++-                acc_S_mn[r, None].store(
++-                    call_score_mod(
++-                        self.score_mod,
++-                        acc_S_mn[r, None].load() * softmax_scale,
++-                        0,
++-                        0,
++-                        0,
++-                        0,
++-                        None,
++-                        aux_data,
++-                    )
++-                )
+++            score_mod_fn(acc_S, m_block=m_block)
++         if cutlass.const_expr(mask_fn is not None):
++-            mask_fn(acc_S, m_block=m_block)
++-        bidx = 0
+++            if cutlass.const_expr(self.use_block_sparsity):
+++                if is_full_block:
+++                    mask_fn(acc_S, m_block=m_block, mask_mod=None)
+++                else:
+++                    mask_fn(acc_S, m_block=m_block)
+++            else:
+++                mask_fn(acc_S, m_block=m_block)
+++        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.SdP_swapAB)
++         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
++         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == 1: cute.print_tensor(tLSErLSE)
++         assert cute.size(acc_S_mn, mode=[0]) == cute.size(tLSErLSE)
++@@ -972,24 +1036,15 @@
++         cute.autovec_copy(
++             smem_copy_params.tSsdPsumMma[None, smem_pipe_read_do if cutlass.const_expr(self.num_stages_dO > 1) else 0], tLSErdPsum
++         )
++-        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
+++        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=self.SdP_swapAB)
++         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
++         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
++         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
++-            grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
++-            if cutlass.const_expr(self.score_mod_bwd is not None):
++-                grad_val = call_score_mod_bwd(
++-                    self.score_mod_bwd,
++-                    grad_val,
++-                    acc_S_pre_mn[r, None].load() * softmax_scale,
++-                    0,
++-                    0,
++-                    0,
++-                    0,
++-                    None,
++-                    aux_data,
++-                )
++-            acc_dP_mn[r, None].store(grad_val)
+++            acc_dP_mn[r, None].store(
+++                acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
+++            )
+++        if cutlass.const_expr(self.score_mod_bwd is not None):
+++            score_mod_bwd_fn(acc_dP, acc_S_pre, m_block=m_block)
++         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
++         rP = cute.make_fragment_like(acc_S, self.dtype)
++         rP.store(acc_S.load().to(self.dtype))
++@@ -1066,6 +1121,73 @@
++         if cutlass.const_expr(self.num_stages_Q == 1):
++             cute.arch.barrier()
++             dQ_mma(load_Q_next)
+++
+++    @cute.jit
+++    def load_sparse_m_block(
+++        self,
+++        block: Int32,
+++        smem_pipe_write_q: Int32,
+++        load_block: Callable,
+++        get_m_block: Callable,
+++    ):
+++        m_block, _ = get_m_block(block)
+++        load_block(m_block, smem_pipe_write_q)
+++
+++    @cute.jit
+++    def apply_score_mod(
+++        self,
+++        acc_S: cute.Tensor,
+++        thr_mma_SdP: cute.ThrMma,
+++        batch_idx,
+++        head_idx,
+++        m_block,
+++        n_block,
+++        softmax_scale,
+++        seqlen_info: SeqlenInfoQK,
+++        aux_data: AuxData = AuxData(),
+++        fastdiv_mods=None,
+++    ):
+++        acc_shape = (self.m_block_size, self.n_block_size)
+++        cS = cute.make_identity_tensor(acc_shape if not self.SdP_swapAB else acc_shape[::-1])
+++        offset = (m_block * self.m_block_size, n_block * self.n_block_size)
+++        cS = cute.domain_offset(offset if not self.SdP_swapAB else offset[::-1], cS)
+++        tScS = thr_mma_SdP.partition_C(cS)
+++        apply_score_mod_inner(
+++            acc_S, tScS, self.score_mod, batch_idx, head_idx, softmax_scale,
+++            self.score_vec_size, self.qk_acc_dtype, aux_data, fastdiv_mods, seqlen_info,
+++            constant_q_idx=None,
+++            qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
+++            transpose_indices=self.SdP_swapAB,
+++        )
+++
+++    @cute.jit
+++    def apply_score_mod_bwd(
+++        self,
+++        grad_tensor: cute.Tensor,
+++        score_tensor: cute.Tensor,
+++        thr_mma_SdP: cute.ThrMma,
+++        batch_idx,
+++        head_idx,
+++        m_block,
+++        n_block,
+++        softmax_scale,
+++        seqlen_info: SeqlenInfoQK,
+++        aux_data: AuxData = AuxData(),
+++        fastdiv_mods=None,
+++    ):
+++        acc_shape = (self.m_block_size, self.n_block_size)
+++        cS = cute.make_identity_tensor(acc_shape if not self.SdP_swapAB else acc_shape[::-1])
+++        offset = (m_block * self.m_block_size, n_block * self.n_block_size)
+++        cS = cute.domain_offset(offset if not self.SdP_swapAB else offset[::-1], cS)
+++        tScS = thr_mma_SdP.partition_C(cS)
+++        apply_score_mod_bwd_inner(
+++            grad_tensor, score_tensor, tScS, self.score_mod_bwd,
+++            batch_idx, head_idx, softmax_scale, self.score_bwd_vec_size,
+++            self.qk_acc_dtype, aux_data, fastdiv_mods, seqlen_info,
+++            constant_q_idx=None,
+++            qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
+++            transpose_indices=self.SdP_swapAB,
+++        )
++ 
++     @cute.jit
++     def epilogue(
++diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
++--- a/flash_attn/cute/interface.py
+++++ b/flash_attn/cute/interface.py
++@@ -433,6 +433,9 @@
++             num_splits = 1
++ 
++     return FwdConfig(tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap, q_stage, num_splits)
+++
+++
+++SM120_FLEX_SUPPORT = True
++ 
++ 
++ def _resolve_causal_local_window(causal, window_size_left, window_size_right, mask_mod=None):
++@@ -1010,6 +1013,11 @@
++             # Prefer 2CTA over cp.async-Q PackGQA for hd256.
++             pack_gqa = False
++ 
+++    if arch // 10 == 12 and use_block_sparsity:
+++        pack_gqa = False
+++        assert cu_seqlens_q is None and cu_seqlens_k is None
+++        assert seqused_q is None and seqused_k is None
+++
++     fwd_cfg = _get_fwd_config(
++         arch=arch,
++         head_dim=head_dim,
++@@ -1162,7 +1170,7 @@
++             seqlen_k=seqlen_k,
++             block_size=(tile_m, tile_n),
++             q_stage=q_stage,
++-            allow_kv_subtile=arch // 10 in [10, 11],
+++            allow_kv_subtile=arch // 10 in [10, 11, 12],
++         )
++         normalized_block_sparse_tensors = block_sparse_config.tensors
++         block_sparse_broadcast_pattern = block_sparse_config.broadcast_pattern
++@@ -1750,7 +1758,6 @@
++                 )
++         elif arch // 10 == 12:
++             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
++-            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
++             assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
++             assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
++             fa_fwd = FlashAttentionForwardSm120(
++@@ -1769,6 +1776,8 @@
++                 score_mod=score_mod,
++                 mask_mod=mask_mod,
++                 has_aux_tensors=aux_tensors is not None,
+++                q_subtile_factor=q_subtile_factor,
+++                kv_subtile_factor=kv_subtile_factor,
++             )
++         else:
++             raise ValueError(
++@@ -2321,7 +2330,7 @@
++ 
++     window_size = [window_size_left, window_size_right]
++     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
++-        causal, window_size_left, window_size_right
+++        causal, window_size_left, window_size_right, mask_mod if arch // 10 == 12 else None
++     )
++ 
++     if arch // 10 == 12:
++@@ -2346,9 +2355,7 @@
++         use_2cta_instrs = False
++         dQaccum_order = dKVaccum_order = None
++         num_threads = 128
++-        assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
++-        assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
++-        assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
+++        kv_subtile_factor = get_kv_subtile_factor(block_sparse_tensors, n_block_size)
++         assert deterministic is False, "deterministic backward not supported on SM 12.0"
++     elif arch // 10 == 9:
++         cfg = _tile_size_bwd_sm90(
++@@ -2503,6 +2510,10 @@
++             f"tile_m={m_block_size}; got {sparse_q}."
++         )
++     q_subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
+++    if arch // 10 == 12 and use_block_sparsity:
+++        sparse_q_block = q_subtile_factor * m_block_size
+++        if seqlen_q % sparse_q_block != 0:
+++            raise ValueError("SM120 block-sparse backward requires Q length divisible by the sparse Q block size")
++     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
++     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
++     num_n_blocks = seqlen_k_rounded // n_block_size
++@@ -2820,6 +2831,7 @@
++             aux_scalar_metadata,
++             use_block_sparsity,
++             q_subtile_factor,
+++            kv_subtile_factor,
++             block_sparse_broadcast_pattern,
++             get_broadcast_dims(q),
++             get_broadcast_dims(k),
++@@ -2923,6 +2935,10 @@
++                 V_in_regs=V_in_regs,
++                 score_mod=score_mod,
++                 score_mod_bwd=score_mod_bwd,
+++                mask_mod=mask_mod,
+++                has_aux_tensors=aux_tensors is not None,
+++                q_subtile_factor=q_subtile_factor,
+++                kv_subtile_factor=kv_subtile_factor,
++             )
++         elif arch // 10 == 9:
++             fa_bwd_obj = FlashAttentionBackwardSm90(
++diff --git a/flash_attn/cute/utils.py b/flash_attn/cute/utils.py
++--- a/flash_attn/cute/utils.py
+++++ b/flash_attn/cute/utils.py
++@@ -227,18 +227,18 @@
++         return LOG2_E, softmax_scale
++ 
++ 
++-def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
+++def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None, seqlen_dim=0):
++     """Compute FastDivmodDivisorV2 pairs for aux_tensors index computation.
++ 
++     Returns a (seqlen_q_divmod, seqlen_k_divmod) tuple, or None if aux_tensors is None.
++     """
++     if const_expr(aux_tensors is None):
++         return None
++-    seqlen_q = cute.size(mQ.shape[0]) // (qhead_per_kvhead if const_expr(pack_gqa) else 1)
+++    seqlen_q = cute.size(mQ.shape[seqlen_dim]) // (qhead_per_kvhead if const_expr(pack_gqa) else 1)
++     seqlen_k = (
++-        cute.size(mK.shape[0])
+++        cute.size(mK.shape[seqlen_dim])
++         if const_expr(mPageTable is None)
++-        else mK.shape[0] * mPageTable.shape[1]
+++        else mK.shape[seqlen_dim] * mPageTable.shape[1]
++     )
++     return (FastDivmodDivisorV2(seqlen_q), FastDivmodDivisorV2(seqlen_k))
++ 
++diff --git a/torch/_inductor/kernel/flex/flex_flash_attention.py b/torch/_inductor/kernel/flex/flex_flash_attention.py
++--- a/torch/_inductor/kernel/flex/flex_flash_attention.py
+++++ b/torch/_inductor/kernel/flex/flex_flash_attention.py
++@@ -81,7 +81,7 @@
++ ) -> list[FlexFlashConfig]:
++     cuda_major = None
++     if torch.cuda.is_available() and (
++-        has_mask_mod or (has_score_mod and has_aux_tensors)
+++        has_mask_mod or has_score_mod
++     ):
++         device_index = None if device is None else device.index
++         cuda_major = torch.cuda.get_device_capability(device_index)[0]
++@@ -95,7 +95,7 @@
++     score_mod_vec_size = select_score_mod_vec_size(
++         has_score_mod=has_score_mod,
++         has_aux_tensors=has_aux_tensors,
++-        is_sm100_or_later=cuda_major is not None and cuda_major >= 10,
+++        is_sm100_or_later=cuda_major is not None and cuda_major >= 10 and cuda_major != 12,
++         graph_module=score_mod_graph_module,
++         other_buffers=score_mod_other_buffers,
++     )
++@@ -117,7 +117,7 @@
++         # None means no captured tensor load constrained the score_mod vector width.
++         # Scalar captures are lane-uniform aux_scalars, so any kernel-supported
++         # power-of-two vector width is legal.
++-        score_mod_vec_sizes = (1, 2, 4, 8, 16, 32, 64, 128)
+++        score_mod_vec_sizes = (1, 2) if cuda_major == 12 else (1, 2, 4, 8, 16, 32, 64, 128)
++     else:
++         score_mod_vec_sizes = (score_mod_vec_size,)
++     configs = [
+diff --git a/docker_build/cu134-fa4/fa4-sm120-device-window.patch b/docker_build/cu134-fa4/fa4-sm120-device-window.patch
+new file mode 100644
+--- /dev/null
++++ b/docker_build/cu134-fa4/fa4-sm120-device-window.patch
+@@ -0,0 +1,144 @@
++diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
++--- a/flash_attn/cute/interface.py
+++++ b/flash_attn/cute/interface.py
++@@ -717,6 +717,7 @@
++     seqlen_k_per_split: Optional[int] = None,
++     disable_scheduler_metadata: bool = False,
++     gather_bwd_recompute_p: bool = False,
+++    window_size_tensor: Optional[torch.Tensor] = None,
++ ) -> Tuple[
++     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
++ ]:
++@@ -843,6 +844,17 @@
++         ), "inputs must be on CUDA device"
++     arch = _get_device_arch() if _arch is None else _arch
++     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+++    if window_size_tensor is not None:
+++        assert arch // 10 == 12, "Device window is only implemented for SM120"
+++        assert not causal, "Device window bounds encode causality; pass causal=False"
+++        assert qv is None and score_mod is None and mask_mod is None and block_sparse_tensors is None
+++        assert softcap is None or softcap == 0.0
+++        assert aux_tensors is None and aux_scalars is None, "Device window owns the native kernel aux slot"
+++        assert window_size_tensor.device == v.device and window_size_tensor.dtype == torch.int32
+++        assert window_size_tensor.shape == (2,) and window_size_tensor.is_contiguous()
+++        # left/right values are loaded on the device; these host placeholders only select local kernels
+++        window_size_left = window_size_right = 0
+++        aux_tensors = [window_size_tensor]
++     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
++     alignment = 16 // v.element_size()
++     if arch // 10 not in [8, 12]:
++@@ -1451,6 +1463,7 @@
++ 
++     compile_key = (
++         mla_1cta,
+++        window_size_tensor is not None,
++         mla_1cta_kb64,
++         mla_1cta_s_ahead if mla_1cta else None,
++         dtype,
++@@ -1769,6 +1782,7 @@
++                 score_mod=score_mod,
++                 mask_mod=mask_mod,
++                 has_aux_tensors=aux_tensors is not None,
+++                device_window=window_size_tensor is not None,
++             )
++         else:
++             raise ValueError(
++@@ -2281,11 +2295,22 @@
++     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
++     dlse: Optional[torch.Tensor] = None,
++     learnable_sink: Optional[torch.Tensor] = None,
+++    window_size_tensor: Optional[torch.Tensor] = None,
++ ) -> Tuple[torch.Tensor, ...]:
++     aux_scalars = tuple(aux_scalars) if aux_scalars else None
++     fake_mode = is_fake_mode()
++     arch = _get_device_arch()
++     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+++    if window_size_tensor is not None:
+++        assert arch // 10 == 12, "Device window is only implemented for SM120"
+++        assert not causal, "Device window bounds encode causality; pass causal=False"
+++        assert score_mod is None and score_mod_bwd is None and mask_mod is None and block_sparse_tensors is None
+++        assert softcap == 0.0 and learnable_sink is None
+++        assert aux_tensors is None and aux_scalars is None, "Device window owns the native kernel aux slot"
+++        assert window_size_tensor.device == q.device and window_size_tensor.dtype == torch.int32
+++        assert window_size_tensor.shape == (2,) and window_size_tensor.is_contiguous()
+++        window_size_left = window_size_right = 0
+++        aux_tensors = [window_size_tensor]
++     if block_sparse_tensors is not None:
++         assert (
++             cu_seqlens_q is None
++@@ -2786,6 +2811,7 @@
++     if arch // 10 in [8, 9, 12]:
++         compile_key = (
++             arch,
+++            window_size_tensor is not None,
++             dtype,
++             head_dim,
++             head_dim_v,
++@@ -2923,6 +2949,7 @@
++                 V_in_regs=V_in_regs,
++                 score_mod=score_mod,
++                 score_mod_bwd=score_mod_bwd,
+++                device_window=window_size_tensor is not None,
++             )
++         elif arch // 10 == 9:
++             fa_bwd_obj = FlashAttentionBackwardSm90(
++diff --git a/flash_attn/cute/flash_fwd.py b/flash_attn/cute/flash_fwd.py
++--- a/flash_attn/cute/flash_fwd.py
+++++ b/flash_attn/cute/flash_fwd.py
++@@ -57,6 +57,7 @@
++         mask_mod: Optional[cutlass.Constexpr] = None,
++         has_aux_tensors: bool = False,
++         q_subtile_factor: int = 1,
+++        device_window: bool = False,
++     ):
++         """Initializes the configuration for a flash attention kernel.
++ 
++@@ -90,6 +91,7 @@
++         self.qhead_per_kvhead = qhead_per_kvhead
++         self.is_causal = is_causal
++         self.is_local = is_local
+++        self.device_window = device_window
++         self.pack_gqa = pack_gqa
++         self.tile_m = tile_m
++         self.tile_n = tile_n
++@@ -787,6 +789,10 @@
++         # Thread index, block index
++         tidx, _, _ = cute.arch.thread_idx()
++ 
+++        if const_expr(self.device_window):
+++            window_size_left = aux_data.tensors[0][0]
+++            window_size_right = aux_data.tensors[0][1]
+++
++         tile_scheduler = TileScheduler.create(tile_sched_params)
++         work_tile = tile_scheduler.initial_work_tile_info()
++ 
++diff --git a/flash_attn/cute/flash_bwd.py b/flash_attn/cute/flash_bwd.py
++--- a/flash_attn/cute/flash_bwd.py
+++++ b/flash_attn/cute/flash_bwd.py
++@@ -52,6 +52,7 @@
++         V_in_regs: bool = False,
++         score_mod: cutlass.Constexpr | None = None,
++         score_mod_bwd: cutlass.Constexpr | None = None,
+++        device_window: bool = False,
++     ):
++         """Initializes the configuration for a flash attention v2 kernel.
++ 
++@@ -86,6 +87,7 @@
++         self.pack_gqa = pack_gqa
++         self.is_causal = is_causal
++         self.is_local = is_local
+++        self.device_window = device_window
++         self.num_stages_Q = num_stages_Q
++         self.num_stages_dO = num_stages_dO
++         self.SdP_swapAB = SdP_swapAB
++@@ -533,6 +535,10 @@
++         # Thread index, block index
++         tidx, _, _ = cute.arch.thread_idx()
++ 
+++        if cutlass.const_expr(self.device_window):
+++            window_size_left = aux_data.tensors[0][0]
+++            window_size_right = aux_data.tensors[0][1]
+++
++         tile_scheduler = TileScheduler.create(tile_sched_params)
++         work_tile = tile_scheduler.initial_work_tile_info()
++ 

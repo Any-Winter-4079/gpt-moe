@@ -1,0 +1,107 @@
+diff --git a/model/linear/attention_fp8.py b/model/linear/attention_fp8.py
+--- a/model/linear/attention_fp8.py
++++ b/model/linear/attention_fp8.py
+@@ -43,15 +43,14 @@
+     tl.store(Transposed + col[None, :] * n + packed_row[:, None], quantized)
+     exponent = (scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+     k_block = tl.program_id(1)
+-    scale_ptr = Scale.to(tl.pointer_type(tl.uint8)) + ((k_block // 4) * n + packed_row) * 4
+-    transposed_ptr = TransposedScale.to(tl.pointer_type(tl.uint8)) + ((block // 4) * k + col) * 4
+-    tl.store(scale_ptr + k_block % 4, exponent)
+-    tl.store(transposed_ptr + block % 4, exponent)
+-    for padding in tl.static_range(1, 4):
+-        if k_block == k // 128 - 1:
+-            tl.store(scale_ptr + k_block % 4 + padding, 0, k_block % 4 + padding < 4)
+-        if block == n // 128 - 1:
+-            tl.store(transposed_ptr + block % 4 + padding, 0, block % 4 + padding < 4)
++    lane = tl.arange(0, 128)
++    swizzle = (lane % 32) * 16 + (lane // 32) * 4
++    scale_ptr = Scale + (block * (k // 128) + k_block) * 512 + swizzle
++    transposed_ptr = TransposedScale + (k_block * (n // 128) + block) * 512 + swizzle
++    # repeat each 128-element scale across the four hardware groups
++    for group in tl.static_range(4):
++        tl.store(scale_ptr + group, exponent)
++        tl.store(transposed_ptr + group, exponent)
+ 
+ 
+ @triton_op("gpt_moe::attention_quantize_weights", mutates_args=())
+@@ -63,16 +62,16 @@
+     padded_k = triton.cdiv(k, 128) * 128
+     quantized = torch.empty((n, padded_k), device=weights[0].device, dtype=torch.float8_e4m3fn)
+     transposed = torch.empty((padded_k, n), device=weights[0].device, dtype=quantized.dtype)
+-    # native dense GEMMs read MN-major scales with four UE8M0 bytes per int32
+-    scale = torch.empty((triton.cdiv(k, 512), n), device=weights[0].device, dtype=torch.int32).t()
+-    transposed_scale = torch.empty((triton.cdiv(n, 512), padded_k), device=weights[0].device, dtype=torch.int32).t()
++    # cuBLAS reads contiguous UE8M0 scales in its 128-by-4 tiled layout
++    scale = torch.empty((n * (padded_k // 32),), device=weights[0].device, dtype=torch.uint8)
++    transposed_scale = torch.empty((padded_k * (n // 32),), device=weights[0].device, dtype=torch.uint8)
+     w0, w1, w2 = weights if len(weights) == 3 else (weights[0], weights[0], weights[0])
+     n0, n1, n2 = widths if len(weights) == 3 else (widths[0], 0, 0)
+     wrap_triton(_quantize_weights_kernel)[(n // 128, triton.cdiv(k, 128))](
+         w0, w1, w2, quantized, scale, transposed, transposed_scale,
+         n0, n1, n2, k, *w0.stride(), *w1.stride(), *w2.stride(), num_warps=8,
+     )
+-    return quantized, scale, transposed, transposed_scale
++    return quantized, scale.view(torch.float8_e8m0fnu), transposed, transposed_scale.view(torch.float8_e8m0fnu)
+ 
+ 
+ @triton.jit
+@@ -102,13 +101,11 @@
+     packed_col = block * 128 + tl.arange(0, 128)
+     row_scale = _inverse_scale(tl.max(tl.abs(values), axis=1))
+     tl.store(Row + row[:, None] * K + packed_col[None, :], (values / row_scale[:, None]).to(tl.float8e4nv), row[:, None] < M)
+-    scale_m: tl.constexpr = tl.cdiv(M, 4) * 4
+-    row_scale_ptr = RowScale.to(tl.pointer_type(tl.uint8)) + ((block // 4) * scale_m + row) * 4
++    lane = tl.arange(0, 128)
++    row_scale_ptr = RowScale + (tile * (K // 128) + block) * 512 + (lane % 32) * 16 + (lane // 32) * 4
+     row_exponent = (row_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+-    tl.store(row_scale_ptr + block % 4, tl.where(row < M, row_exponent, 0), row < scale_m)
+-    if block == K // 128 - 1:
+-        for padding in tl.static_range(1, 4):
+-            tl.store(row_scale_ptr + block % 4 + padding, 0, (row < scale_m) & (block % 4 + padding < 4))
++    for group in tl.static_range(4):
++        tl.store(row_scale_ptr + group, tl.where(row < M, row_exponent, 0))
+     if SAVE_COLUMN:
+         column_scale = _inverse_scale(tl.max(tl.abs(values), axis=0))
+         column_m: tl.constexpr = tl.cdiv(M, 128) * 128
+@@ -121,13 +118,13 @@
+                 tl.store(scale_ptr + tile % 4 + padding, 0, tile % 4 + padding < 4)
+ 
+ 
+-@triton_op("gpt_moe::attention_dg_quantize_activations", mutates_args=())
++@triton_op("gpt_moe::attention_mx_quantize_activations", mutates_args=())
+ def _quantize_activations(inputs: List[Tensor], save_column: bool) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     m = inputs[0].shape[0]
+     widths = [value.shape[1] for value in inputs]
+     k = sum(triton.cdiv(width, 128) * 128 for width in widths)
+     row = torch.empty((m, k), device=inputs[0].device, dtype=torch.float8_e4m3fn)
+-    row_scale = torch.empty((triton.cdiv(k, 512), triton.cdiv(m, 4) * 4), device=row.device, dtype=torch.int32)[:, :m].t()
++    row_scale = torch.empty((triton.cdiv(m, 128) * 128 * (k // 32),), device=row.device, dtype=torch.uint8)
+     column = torch.empty((k, triton.cdiv(m, 128) * 128) if save_column else (0,), device=row.device, dtype=row.dtype)
+     column_scale = torch.empty((triton.cdiv(m, 512), k) if save_column else (0,), device=row.device, dtype=torch.int32)
+     x0, x1, x2 = inputs if len(inputs) == 3 else (inputs[0], inputs[0], inputs[0])
+@@ -136,18 +133,14 @@
+         x0, x1, x2, row, row_scale, column, column_scale, m, k0, k1, k2,
+         *x0.stride(), *x1.stride(), *x2.stride(), save_column, num_warps=8,
+     )
+-    return row, row_scale, column, column_scale
+-
+-
+-@custom_op("gpt_moe::attention_deepgemm_mm", mutates_args=())
++    return row, row_scale.view(torch.float8_e8m0fnu), column, column_scale
++
++
++@custom_op("gpt_moe::attention_cublas_mxfp8_mm", mutates_args=())
+ def _matmul(a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, dtype: torch.dtype) -> Tensor:
+-    import deep_gemm
+-
+     if torch.cuda.get_device_capability(a.device) != (12, 0):
+-        raise ValueError("DeepGEMM FP8 attention projections require SM120")
+-    out = torch.empty((a.shape[0], b.shape[0]), device=a.device, dtype=dtype)
+-    deep_gemm.fp8_gemm_nt((a, a_scale), (b, b_scale), out, recipe=(1, 1, 128), disable_ue8m0_cast=True)
+-    return out
++        raise ValueError("cuBLAS MXFP8 attention projections require SM120")
++    return torch._scaled_mm(a, b.t(), scale_a=a_scale, scale_b=b_scale, out_dtype=dtype, use_fast_accum=False)
+ 
+ 
+ @_matmul.register_fake
