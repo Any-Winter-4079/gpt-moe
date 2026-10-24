@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime
+import fcntl
 import math
 import os
 from pathlib import Path
@@ -56,10 +57,29 @@ COMBINATIONS = {
     "5+20+11+12+19+21+inverse-route": ["027", "042"],
     "5+20+11+12+19+21+inverse-route+qk": ["027", "042", "039"],
     "5+20+11+12+19+21+route+qk+fa4": ["027", "042", "039", "041"],
+    "5+20+11+12+19+21+route+qk+te": ["027", "042", "039", "049"],
+    "5+20+11+12+19+21+route+qk+dw": ["027", "042", "029", "030", "047", "039"],
+    "5+20+11+12+19+21+route+qkv-bq": ["027", "042", "029", "030", "044"],
+    "5+20+11+12+19+21+route+qkv-epi": ["027", "042", "029", "030", "040", "045"],
+    "5+20+11+12+19+21+route+qk+mx": ["027", "042", "029", "030", "035", "039"],
+    "5+20+11+12+19+21+route+qk+exact": ["027", "042", "039", "036"],
+    "5+20+11+12+19+21+route+qk+swa-fa4": ["027", "042", "039", "036", "041"],
+    "5+20+11+12+19+21+route+mla": ["027", "042", "038"],
     "5+20+11+12+19+21+inverse-route+tri": ["027", "042", "048"],
     "5+20+11+12+19+21+polar-triangle": ["027", "048"],
     "5+20+11+12+19+21+attention-te": ["027", "049"],
 }
+OVERNIGHT = [
+    "5+20+11+12+19+21+route+qk+te",
+    "5+20+11+12+19+21+route+qk+dw",
+    "5+20+11+12+19+21+route+qkv-bq",
+    "5+20+11+12+19+21+route+qkv-epi",
+    "5+20+11+12+19+21+route+qk+mx",
+    "5+20+11+12+19+21+route+qk+exact",
+    "5+20+11+12+19+21+route+qk+fa4",
+    "5+20+11+12+19+21+route+qk+swa-fa4",
+    "5+20+11+12+19+21+route+mla",
+]
 PREVIOUS_5_20_GAIN = 8.64
 
 
@@ -107,7 +127,10 @@ def main():
     parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs or registered combinations in execution order; include baseline explicitly; omitted runs all experiments with baseline first")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="number of training GPUs (default: 1)")
     parser.add_argument("--adaptive", action="store_true", help="run baseline and 3+5, select against 5+20's historical 8.64%% saving, then test fused RoPE and Polar Express fusion")
+    parser.add_argument("--overnight", action="store_true", help="run nine candidates on the current best reference using the FA4 image; no additional baseline")
     args = parser.parse_args()
+    if args.overnight and (args.experiments or args.adaptive):
+        parser.error("--overnight selects its own experiments; do not supply IDs or --adaptive")
     if args.adaptive and args.experiments:
         parser.error("--adaptive selects its own experiments; do not supply IDs")
     if any(experiment not in ORDER and experiment not in COMBINATIONS for experiment in args.experiments):
@@ -126,6 +149,11 @@ def main():
     patches = {path.name[:3]: path for path in (ROOT / "experiments").glob("*.patch")}
     runs_dir = ROOT / "configs_and_logs"
     runs_dir.mkdir(exist_ok=True)
+    lock = (runs_dir / ".runner.lock").open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        parser.error("another experiment runner is active in this repository")
     summary_path = ROOT / f"experiments-{batch}.log"
     failed = False
 
@@ -133,7 +161,7 @@ def main():
     with summary_path.open("x") as summary:
         summary.write("experiment\ttrain_exit\tupload_exit\ttimestamp\n")
         summary.flush()
-        experiments = ["baseline", "023"] if args.adaptive else args.experiments or ORDER
+        experiments = ["baseline", "023"] if args.adaptive else OVERNIGHT.copy() if args.overnight else args.experiments or ORDER
         combinations = COMBINATIONS.copy()
         for index, experiment in enumerate(experiments, 1):
             applied = []

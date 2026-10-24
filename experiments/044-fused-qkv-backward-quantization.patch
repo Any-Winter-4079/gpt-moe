@@ -64,7 +64,7 @@ diff --git a/model/attention/qkv_norm_rope_fp8.py b/model/attention/qkv_norm_rop
 new file mode 100644
 --- /dev/null
 +++ b/model/attention/qkv_norm_rope_fp8.py
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,292 @@
 +from __future__ import annotations
 +
 +from typing import List, Optional, Tuple
@@ -97,7 +97,10 @@ new file mode 100644
 +    ct: tl.constexpr, cd: tl.constexpr, st: tl.constexpr, sd: tl.constexpr,
 +    EPS: tl.constexpr, RMS: tl.constexpr,
 +    SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
++    MIN_INF: tl.constexpr, MAX_INF: tl.constexpr,
 +):
++    scale_min: tl.constexpr = SCALE_MIN if MIN_INF == 0 else (float("-inf") if MIN_INF < 0 else float("inf"))
++    scale_max: tl.constexpr = SCALE_MAX if MAX_INF == 0 else (float("-inf") if MAX_INF < 0 else float("inf"))
 +    batch_head = tl.program_id(0)
 +    batch = batch_head // (2 * H)
 +    head = batch_head % (2 * H)
@@ -127,7 +130,7 @@ new file mode 100644
 +    if RMS:
 +        statistic /= 64
 +    gain = tl.rsqrt(statistic + EPS)
-+    scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, SCALE_MIN), SCALE_MAX)).to(dtype).to(tl.float32)
++    scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, scale_min), scale_max)).to(dtype).to(tl.float32)
 +    normalized = (rotated * gain[:, None].to(dtype).to(tl.float32)).to(dtype).to(tl.float32)
 +    tl.store(out, normalized * scale, valid)
 +    tl.store(gain_out, gain, token < T)
@@ -143,10 +146,14 @@ new file mode 100644
 +    k_out = torch.empty(k.shape, device=k.device, dtype=k.dtype)
 +    q_gain = torch.empty((batch, heads, seq_len), device=q.device, dtype=torch.float32)
 +    k_gain = torch.empty_like(q_gain)
++    # keep infinities out of Inductor's generated Python metadata
++    min_inf = (scale_min == float("inf")) - (scale_min == float("-inf"))
++    max_inf = (scale_max == float("inf")) - (scale_max == float("-inf"))
 +    wrap_triton(_forward_kernel)[(batch * 2 * heads, triton.cdiv(seq_len, 16))](
 +        q, k, q_scale, k_scale, cos, sin, q_out, k_out, q_gain, k_gain,
 +        seq_len, heads, *q.stride(), *k.stride(), *cos.stride()[-2:], *sin.stride()[-2:],
-+        eps, rms, scale_min, scale_max, num_warps=4, enable_fp_fusion=False,
++        eps, rms, 0.0 if min_inf else scale_min, 0.0 if max_inf else scale_max,
++        min_inf, max_inf, num_warps=4, enable_fp_fusion=False,
 +    )
 +    return q_out, k_out, q_gain, k_gain
 +
@@ -163,7 +170,10 @@ new file mode 100644
 +    dvb: tl.constexpr, dvh: tl.constexpr, dvt: tl.constexpr, dvd: tl.constexpr,
 +    ct: tl.constexpr, cd: tl.constexpr, st: tl.constexpr, sd: tl.constexpr,
 +    RMS: tl.constexpr, SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
++    MIN_INF: tl.constexpr, MAX_INF: tl.constexpr,
 +):
++    scale_min: tl.constexpr = SCALE_MIN if MIN_INF == 0 else (float("-inf") if MIN_INF < 0 else float("inf"))
++    scale_max: tl.constexpr = SCALE_MAX if MAX_INF == 0 else (float("-inf") if MAX_INF < 0 else float("inf"))
 +    tile = tl.program_id(0)
 +    block = tl.program_id(1)
 +    row = tile * 128 + tl.arange(0, 128)
@@ -201,7 +211,7 @@ new file mode 100644
 +        scale_part = (grad * normalized).to(dtype).to(tl.float32).reshape(128, 2, 64)
 +        partial = tl.sum(tl.sum(scale_part, axis=2), axis=0)
 +        tl.store(DScalePart + scale_head * tl.cdiv(M, 128) + tile, partial)
-+        scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, SCALE_MIN), SCALE_MAX)).to(dtype).to(tl.float32)
++        scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, scale_min), scale_max)).to(dtype).to(tl.float32)
 +        grad = (grad * scale[None, :]).to(dtype).to(tl.float32)
 +        grad_gain = tl.sum((grad * rotated).to(dtype).to(tl.float32).reshape(128, 2, 64), axis=2).to(dtype).to(tl.float32)
 +        # rsqrt backward consumes the unrounded FP32 gain
@@ -246,19 +256,21 @@ new file mode 100644
 +def _scale_backward_kernel(
 +    Partials, QScale, KScale, DQScale, DKScale, Q,
 +    H: tl.constexpr, TILES: tl.constexpr, SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
-+    BLOCK: tl.constexpr,
++    MIN_INF: tl.constexpr, MAX_INF: tl.constexpr, BLOCK: tl.constexpr,
 +):
++    scale_min: tl.constexpr = SCALE_MIN if MIN_INF == 0 else (float("-inf") if MIN_INF < 0 else float("inf"))
++    scale_max: tl.constexpr = SCALE_MAX if MAX_INF == 0 else (float("-inf") if MAX_INF < 0 else float("inf"))
 +    head = tl.program_id(0)
 +    tile = tl.arange(0, BLOCK)
 +    partial = tl.load(Partials + head * TILES + tile, tile < TILES, 0.0)
 +    grad = tl.sum(partial, axis=0).to(Q.dtype.element_ty).to(tl.float32)
 +    if head < H:
 +        scale = tl.load(QScale + head).to(tl.float32)
-+        tl.store(DQScale + head, tl.where((scale >= SCALE_MIN) & (scale <= SCALE_MAX), grad, 0.0))
++        tl.store(DQScale + head, tl.where((scale >= scale_min) & (scale <= scale_max), grad, 0.0))
 +    else:
 +        head -= H
 +        scale = tl.load(KScale + head).to(tl.float32)
-+        tl.store(DKScale + head, tl.where((scale >= SCALE_MIN) & (scale <= SCALE_MAX), grad, 0.0))
++        tl.store(DKScale + head, tl.where((scale >= scale_min) & (scale <= scale_max), grad, 0.0))
 +
 +
 +@triton_op("gpt_moe::attention_qkv_norm_rope_backward_quantize", mutates_args=())
@@ -277,16 +289,20 @@ new file mode 100644
 +    partials = torch.empty((2 * heads, tiles), device=q.device, dtype=torch.float32)
 +    dq_scale = torch.empty_like(q_scale)
 +    dk_scale = torch.empty_like(k_scale)
++    min_inf = (scale_min == float("inf")) - (scale_min == float("-inf"))
++    max_inf = (scale_max == float("inf")) - (scale_max == float("-inf"))
 +    wrap_triton(_backward_quantize_kernel)[(tiles, width // 128)](
 +        q, k, q_scale, k_scale, cos, sin, q_gain, k_gain, grad_q, grad_k, grad_v,
 +        row, row_scale, column, column_scale, partials, m, seq_len, heads,
 +        *q.stride(), *k.stride(), *grad_q.stride(), *grad_k.stride(), *grad_v.stride(),
-+        *cos.stride()[-2:], *sin.stride()[-2:], rms, scale_min, scale_max,
++        *cos.stride()[-2:], *sin.stride()[-2:], rms,
++        0.0 if min_inf else scale_min, 0.0 if max_inf else scale_max, min_inf, max_inf,
 +        num_warps=8, enable_fp_fusion=False,
 +    )
 +    wrap_triton(_scale_backward_kernel)[(2 * heads,)](
 +        partials, q_scale, k_scale, dq_scale, dk_scale, q,
-+        heads, tiles, scale_min, scale_max, triton.next_power_of_2(tiles), num_warps=4,
++        heads, tiles, 0.0 if min_inf else scale_min, 0.0 if max_inf else scale_max,
++        min_inf, max_inf, triton.next_power_of_2(tiles), num_warps=4,
 +    )
 +    return row, row_scale, column, column_scale, dq_scale, dk_scale
 +
