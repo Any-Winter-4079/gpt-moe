@@ -143,7 +143,7 @@ resume_config = {
             "moe_load_balance_weight", "use_bf16_autocast", "use_all_bf16_and_null_ctx",
             "use_bf16_weights_params_or_scales", "use_bf16_adamw_moments",
             "keep_1d_weights_params_and_scales_in_fp32", "keep_fp32_loss",
-            "cast_activations_to_weight_dtype_if_no_autocast", "use_liger_loss", "linear_precision",
+            "cast_activations_to_weight_dtype_if_no_autocast", "use_liger_loss", "linear_config",
         )
     },
     "bf16_weights_params_and_scales": {
@@ -178,7 +178,9 @@ if training_config.use_all_bf16_and_null_ctx or training_config.use_bf16_weights
         training_config.bf16_weights_params_and_scales,
         training_config.keep_1d_weights_params_and_scales_in_fp32,
     )
-if parallel_mode == "ddp" and (training_config.activation_offload_layers or any("fp8" in policy.values() for policy in training_config.linear_precision.values())):
+if parallel_mode == "ddp" and (training_config.activation_offload_layers or any(
+        options["precision"] == "fp8" for policy in training_config.linear_config.values() for options in policy.values()
+)):
     torch._dynamo.config.optimize_ddp = False
 if training_config.activation_offload_layers:
     # keep transfer hooks outside compiled blocks and avoid CUDA graph pools retaining activations
@@ -372,6 +374,9 @@ try:
         raw_gpt_model.set_precision_phase("training")
         for optimizer in optimizers.values():
             optimizer.zero_grad()
+        # reuse detached quantized weights only while accumulating gradients at fixed parameters
+        if grad_accum_mini_steps > 1:
+            raw_gpt_model.prepare_fp8_weights()
         train_loss = 0.0
         checkpoint_val_loss = None
         validation_improved = False
@@ -479,6 +484,7 @@ try:
             for param_group in optimizers["muon"].param_groups:
                 param_group['lr'] = adamw_lr * raw_gpt_model.muon_lr_scale
         # step present optimizers
+        raw_gpt_model.clear_fp8_weights()
         for optimizer in optimizers.values():
             optimizer.step()
 
@@ -745,6 +751,7 @@ except Exception as e:
     dist.barrier()
     raise
 finally:
+    raw_gpt_model.clear_fp8_weights()
     flush_log(run)
     dist.barrier()
     destroy_process_group()

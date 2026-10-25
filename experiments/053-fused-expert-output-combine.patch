@@ -1,0 +1,135 @@
+diff --git a/model/feedforward/moe.py b/model/feedforward/moe.py
+--- a/model/feedforward/moe.py
++++ b/model/feedforward/moe.py
+@@ -10,6 +10,7 @@
+ from ..linear.default.grouped import grouped_linear
+ from ..linear.fp8.custom.grouped import _quantize_expert_weights, grouped_linear_fp8_weights
+ from ..linear.linear import Linear
++from .combine import combine_expert_outputs
+ from .mlp import MLP
+ 
+ if TYPE_CHECKING:
+@@ -133,6 +134,4 @@
+             down_bias = torch.stack([expert.down_proj.bias for expert in self.experts]).to(packed.dtype)
+             packed = packed + down_bias[expert_indices]
+ 
+-        # restore token/top-k order before summing, avoiding atomic output accumulation
+-        expert_output = packed[inverse_order].view(hidden_states.shape[0], self.top_k, -1).to(hidden_states.dtype)
+-        return (expert_output * top_k_weights[:, :, None].to(hidden_states.dtype)).sum(dim=1)
++        return combine_expert_outputs(packed, inverse_order, top_k_weights, hidden_states.dtype)
+diff --git a/model/feedforward/combine.py b/model/feedforward/combine.py
+new file mode 100644
+--- /dev/null
++++ b/model/feedforward/combine.py
+@@ -0,0 +1,111 @@
++from __future__ import annotations
++
++from typing import Any, Optional, Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import triton_op, wrap_triton
++
++
++@triton.jit
++def _forward_kernel(
++    Packed, InverseOrder, Weights, Output,
++    M: tl.constexpr, D: tl.constexpr, TOP_K: tl.constexpr,
++    pm: tl.constexpr, pd: tl.constexpr, wm: tl.constexpr, wk: tl.constexpr,
++    ROWS: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    token = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
++    feature = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
++    valid = (token[:, None] < M) & (feature[None, :] < D)
++    dtype: tl.constexpr = Output.dtype.element_ty
++    acc = tl.zeros((ROWS, BLOCK_D), dtype=tl.float32)
++    for selected in tl.static_range(TOP_K):
++        row = tl.load(InverseOrder + token * TOP_K + selected, token < M, 0)
++        value = tl.load(Packed + row[:, None] * pm + feature[None, :] * pd, valid, 0.0).to(dtype).to(tl.float32)
++        weight = tl.load(Weights + token * wm + selected * wk, token < M, 0.0).to(dtype).to(tl.float32)
++        # retain the cast and product rounding before the top-k reduction
++        product = (value * weight[:, None]).to(dtype).to(tl.float32)
++        acc += product
++    tl.store(Output + token[:, None] * D + feature[None, :], acc, valid)
++
++
++@triton.jit
++def _backward_kernel(
++    Packed, InverseOrder, Weights, Grad, DPacked, DWeights,
++    M: tl.constexpr, D: tl.constexpr, TOP_K: tl.constexpr,
++    pm: tl.constexpr, pd: tl.constexpr, wm: tl.constexpr, wk: tl.constexpr,
++    gm: tl.constexpr, gd: tl.constexpr,
++    NEED_PACKED: tl.constexpr, NEED_WEIGHTS: tl.constexpr,
++    ROWS: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    token = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
++    feature = tl.arange(0, BLOCK_D)
++    valid = (token[:, None] < M) & (feature[None, :] < D)
++    dtype: tl.constexpr = Grad.dtype.element_ty
++    grad = tl.load(Grad + token[:, None] * gm + feature[None, :] * gd, valid, 0.0).to(tl.float32)
++    for selected in tl.static_range(TOP_K):
++        row = tl.load(InverseOrder + token * TOP_K + selected, token < M, 0)
++        if NEED_PACKED:
++            weight = tl.load(Weights + token * wm + selected * wk, token < M, 0.0).to(dtype).to(tl.float32)
++            grad_value = (grad * weight[:, None]).to(dtype)
++            # inverse order is a permutation, so every packed element has one writer
++            tl.store(DPacked + row[:, None] * D + feature[None, :], grad_value, valid)
++        if NEED_WEIGHTS:
++            value = tl.load(Packed + row[:, None] * pm + feature[None, :] * pd, valid, 0.0).to(dtype).to(tl.float32)
++            product = (grad * value).to(dtype).to(tl.float32)
++            grad_weight = tl.sum(product, axis=1).to(dtype)
++            tl.store(DWeights + token * TOP_K + selected, grad_weight, token < M)
++
++
++@triton_op("gpt_moe::combine_expert_outputs", mutates_args=())
++def combine_expert_outputs(packed: Tensor, inverse_order: Tensor, weights: Tensor, dtype: torch.dtype) -> Tensor:
++    tokens, top_k = weights.shape
++    width = packed.shape[1]
++    output = torch.empty((tokens, width), device=packed.device, dtype=dtype)
++    if tokens:
++        wrap_triton(_forward_kernel)[(triton.cdiv(tokens, 4), triton.cdiv(width, 256))](
++            packed, inverse_order, weights, output, tokens, width, top_k,
++            *packed.stride(), *weights.stride(), 4, 256,
++            num_warps=4, enable_fp_fusion=False,
++        )
++    return output
++
++
++@triton_op("gpt_moe::combine_expert_outputs_backward", mutates_args=())
++def _backward_call(
++    packed: Tensor, inverse_order: Tensor, weights: Tensor, grad: Tensor,
++    need_packed: bool, need_weights: bool,
++) -> Tuple[Tensor, Tensor]:
++    tokens, top_k = weights.shape
++    width = packed.shape[1]
++    grad_packed = torch.empty(packed.shape if need_packed else (0,), device=packed.device, dtype=packed.dtype)
++    grad_weights = torch.empty(weights.shape if need_weights else (0,), device=weights.device, dtype=weights.dtype)
++    rows = 4 if width <= 1024 else 1
++    if tokens:
++        wrap_triton(_backward_kernel)[(triton.cdiv(tokens, rows),)](
++            packed, inverse_order, weights, grad, grad_packed, grad_weights,
++            tokens, width, top_k, *packed.stride(), *weights.stride(), *grad.stride(),
++            need_packed, need_weights, rows, triton.next_power_of_2(width),
++            num_warps=4, enable_fp_fusion=False,
++        )
++    return grad_packed, grad_weights
++
++
++def _setup_context(ctx: Any, inputs: Tuple, output: Tensor) -> None:
++    packed, inverse_order, weights, _ = inputs
++    # retain the packed source instead of a reordered tensor cast to the residual dtype
++    ctx.save_for_backward(packed, inverse_order, weights)
++    ctx.set_materialize_grads(False)
++
++
++def _backward(ctx: Any, grad: Optional[Tensor]) -> Tuple:
++    if grad is None:
++        return None, None, None, None
++    need_packed, _, need_weights, _ = ctx.needs_input_grad
++    grad_packed, grad_weights = _backward_call(*ctx.saved_tensors, grad, need_packed, need_weights)
++    return grad_packed if need_packed else None, None, grad_weights if need_weights else None, None
++
++
++combine_expert_outputs.register_autograd(_backward, setup_context=_setup_context)

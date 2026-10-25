@@ -77,7 +77,7 @@ def _grouped_mm(a: Tensor, b: Tensor, offsets: Tensor) -> Tensor:
     n = b.shape[-1]
     num_experts = offsets.numel()
     out = a.new_empty((num_experts, m, n) if group_k else (m, n))
-    num_programs = torch.cuda.get_device_properties(a.device).multi_processor_count
+    num_programs = torch.cuda.get_device_properties(a.device).multi_processor_count * 2
     wrap_triton(_grouped_mm_kernel)[(num_programs,)](
         a, b, out, offsets, m, n, k,
         a.stride(0), a.stride(1),

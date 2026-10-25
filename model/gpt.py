@@ -63,13 +63,26 @@ class GPT(nn.Module):
         self.data_uses_padding = training_config.data_uses_padding
         self.keep_fp32_loss = training_config.keep_fp32_loss
         self.use_liger_loss = training_config.use_liger_loss
-        self.linear_precision = training_config.linear_precision
+        self.linear_config = training_config.linear_config
         for phase in ("training", "validation", "evaluation", "sampling"):
             for role in ("q_proj", "k_proj", "v_proj", "out_proj", "up_proj", "down_proj", "router", "lm_head"):
-                if self.linear_precision[phase][role] not in ("default", "fp8"):
-                    raise ValueError(f"unsupported linear precision for {phase}.{role}: {self.linear_precision[phase][role]}")
-        if self.use_liger_loss and self.linear_precision["training"]["lm_head"] == "fp8":
-            raise ValueError("use_liger_loss requires linear_precision['training']['lm_head']='default'")
+                policy = self.linear_config[phase][role]
+                precision, backend = policy["precision"], policy["backend"]
+                if precision not in ("default", "fp8"):
+                    raise ValueError(f"unsupported linear precision for {phase}.{role}: {precision}")
+                if backend not in ("custom", "te"):
+                    raise ValueError(f"unsupported linear backend for {phase}.{role}: {backend}")
+                if precision == "default" and backend != "custom":
+                    raise ValueError(f"{phase}.{role}: default precision uses backend='custom'; no Transformer Engine default implementation is available")
+                if precision == "fp8":
+                    if role == "router":
+                        raise ValueError(f"{phase}.{role}: an optimized FP8 router implementation is not available; use precision='default', backend='custom'")
+                    if backend == "te" and gpt_config.use_moe and role in ("up_proj", "down_proj"):
+                        raise ValueError(f"{phase}.{role}: Transformer Engine FP8 is not available for grouped MoE; use backend='custom'")
+                    if backend == "custom" and (role == "lm_head" or (not gpt_config.use_moe and role in ("up_proj", "down_proj"))):
+                        raise ValueError(f"{phase}.{role}: a custom FP8 implementation is not available; use backend='te'")
+        if self.use_liger_loss and self.linear_config["training"]["lm_head"]["precision"] == "fp8":
+            raise ValueError("use_liger_loss requires linear_config['training']['lm_head']['precision']='default'")
         if self.use_liger_loss and stage_index != 0:
             from .loss import FusedLinearCrossEntropyLoss
 
@@ -102,19 +115,41 @@ class GPT(nn.Module):
 
         if self.pos_encoding_type == "rope" or self.pos_encoding_type == "nope":
             self.transformer = nn.ModuleDict(dict(
-                wte = nn.Embedding(gpt_config.vocab_size, gpt_config.d_model),
+                wte = nn.Embedding(gpt_config.vocab_size, gpt_config.hidden_size),
                 h = nn.ModuleList([Block(gpt_config, training_config, layer_idx=i) for i in range(gpt_config.n_layers)]),
-                ln_f = nn.RMSNorm(gpt_config.d_model) if gpt_config.norm_type.lower() == "rms" else nn.LayerNorm(gpt_config.d_model),
+                ln_f = nn.RMSNorm(gpt_config.hidden_size) if gpt_config.norm_type.lower() == "rms" else nn.LayerNorm(gpt_config.hidden_size),
             ))
         else:
             self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(gpt_config.vocab_size, gpt_config.d_model),
-            wpe = nn.Embedding(training_config.max_seq_len, gpt_config.d_model),
+            wte = nn.Embedding(gpt_config.vocab_size, gpt_config.hidden_size),
+            wpe = nn.Embedding(training_config.max_seq_len, gpt_config.hidden_size),
             h = nn.ModuleList([Block(gpt_config, training_config, layer_idx=i) for i in range(gpt_config.n_layers)]),
-            ln_f = nn.RMSNorm(gpt_config.d_model) if gpt_config.norm_type.lower() == "rms" else nn.LayerNorm(gpt_config.d_model),
+            ln_f = nn.RMSNorm(gpt_config.hidden_size) if gpt_config.norm_type.lower() == "rms" else nn.LayerNorm(gpt_config.hidden_size),
         ))
-        self.lm_head = Linear(gpt_config.d_model, gpt_config.vocab_size, role="lm_head", bias=False)
+        self.lm_head = Linear(gpt_config.hidden_size, gpt_config.vocab_size, role="lm_head", bias=False)
         
+        for name, module in self.named_modules():
+            if not isinstance(module, Linear):
+                continue
+            for phase in ("training", "validation", "evaluation", "sampling"):
+                policy = self.linear_config[phase][module.role]
+                if policy["precision"] != "fp8" or policy["backend"] != "custom":
+                    continue
+                out_features, in_features = module.weight.shape
+                if in_features % 4 or out_features % 4:
+                    suggestion = "Choose hidden_size and projection widths divisible by 4."
+                    if module.role in ("up_proj", "down_proj") and gpt_config.activation.lower() == "swiglu" and gpt_config.use_fair_swiglu:
+                        compatible_width = ((gpt_config.mlp_hidden_dim + 11) // 12) * 12
+                        suggestion += (
+                            " FairSwiGLU uses round(2 * mlp_hidden_dim / 3), which must also be divisible by 4;"
+                            f" for example, mlp_hidden_dim={compatible_width} produces width={compatible_width * 2 // 3}."
+                            " Disabling use_fair_swiglu is another option only if the resulting widths satisfy the same requirement."
+                        )
+                    raise ValueError(
+                        f"{phase}.{module.role} ({name}): custom FP8 with DeepGEMM requires input and output widths divisible by 4;"
+                        f" got input width={in_features}, output width={out_features}. {suggestion}"
+                    )
+
         self.use_tied_embeddings = gpt_config.use_tied_embeddings
         if self.use_tied_embeddings:
             self.transformer.wte.weight = self.lm_head.weight
@@ -159,9 +194,11 @@ class GPT(nn.Module):
     def set_precision_phase(self, phase: str) -> None:
         if phase == self.precision_phase:
             return
-        policy = self.linear_precision[phase]
+        self.clear_fp8_weights()
+        policy = self.linear_config[phase]
         for module in self._linear_modules:
-            module.precision = policy[module.role]
+            module.precision = policy[module.role]["precision"]
+            module.backend = policy[module.role]["backend"]
         self.precision_phase = phase
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -171,6 +208,18 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def prepare_fp8_weights(self) -> None:
+        for block in self.transformer.h:
+            block.attn.prepare_fp8_weights()
+            if block.use_moe:
+                block.mlp.prepare_fp8_weights()
+
+    def clear_fp8_weights(self) -> None:
+        for block in self.transformer.h:
+            block.attn.clear_fp8_weights()
+            if block.use_moe:
+                block.mlp.clear_fp8_weights()
 
     def configure_optimizers(
             self,

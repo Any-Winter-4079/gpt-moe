@@ -1,0 +1,167 @@
+diff --git a/model/block.py b/model/block.py
+--- a/model/block.py
++++ b/model/block.py
+@@ -10,6 +10,7 @@
+ from .attention.self_attention import SelfAttention
+ from .feedforward.mlp import MLP
+ from .feedforward.moe import MoE
++from .residual_rms_norm import residual_rms_norm
+ 
+ if TYPE_CHECKING:
+     from config.model import GPTConfig
+@@ -58,6 +59,7 @@
+             sdpa_attn_mask: Optional[Tensor] = None,
+             ) -> Tuple[Tensor, Optional[Tensor]]:
+         balance_loss = None
++        normalized_mlp_input = None
+         # weighted path
+         if self.use_weighted_residual_path or self.use_weighted_main_path:
+             # match activation dtype to the receiving module's weight dtype when autocast is disabled
+@@ -71,7 +73,21 @@
+                 x = self.attn_residual_scale * x + self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+             elif not self.use_weighted_residual_path and self.use_weighted_main_path:
+                 # x = x + beta_1 * Attn(norm(x))
+-                x = x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
++                attention_output = self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
++                fused_residual = (
++                    self.training and torch.is_grad_enabled() and x.is_cuda
++                    and x.dtype == torch.float32 and attention_output.dtype == torch.bfloat16
++                    and x.is_contiguous() and attention_output.is_contiguous()
++                    and isinstance(self.ln_2, nn.RMSNorm) and self.ln_2.weight.dtype == torch.float32
++                    and self.attn_main_scale.dtype == torch.float32 and x.shape[-1] <= 4096
++                )
++                if fused_residual:
++                    eps = self.ln_2.eps if self.ln_2.eps is not None else torch.finfo(x.dtype).eps
++                    x, normalized_mlp_input = residual_rms_norm(
++                        x, attention_output, self.attn_main_scale, self.ln_2.weight, eps,
++                    )
++                else:
++                    x = x + self.attn_main_scale * attention_output
+             else:
+                 # x = alpha_1 * x + beta_1 * Attn(norm(x))
+                 x = self.attn_residual_scale * x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+@@ -80,7 +96,7 @@
+             x_ln2 = x
+             if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+                 x_ln2 = x_ln2.to(dtype=self.ln_2.weight.dtype)
+-            mlp_output = self.mlp(self.ln_2(x_ln2))
++            mlp_output = self.mlp(self.ln_2(x_ln2) if normalized_mlp_input is None else normalized_mlp_input)
+             if self.use_moe:
+                 mlp_output, balance_loss = mlp_output
+ 
+diff --git a/model/residual_rms_norm.py b/model/residual_rms_norm.py
+new file mode 100644
+--- /dev/null
++++ b/model/residual_rms_norm.py
+@@ -0,0 +1,111 @@
++from __future__ import annotations
++
++from typing import Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import triton_op, wrap_triton
++
++
++@triton.jit
++def _forward_kernel(
++    X, Branch, Scale, Weight, Residual, Normalized, Gain,
++    M: tl.constexpr, N: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0) * 4 + tl.arange(0, 4)
++    col = tl.arange(0, BLOCK)
++    mask = (row[:, None] < M) & (col[None, :] < N)
++    x = tl.load(X + row[:, None] * N + col[None, :], mask, 0.0)
++    branch = tl.load(Branch + row[:, None] * N + col[None, :], mask, 0.0).to(tl.float32)
++    scale = tl.load(Scale)
++    # keep the FP32 multiply and add boundaries of x + scale * branch
++    residual = x + scale * branch
++    residual = tl.where(col[None, :] < N, residual, 0.0)
++    gain = tl.rsqrt(tl.sum(residual * residual, axis=1) / N + EPS)
++    weight = tl.load(Weight + col, col < N, 0.0)
++    normalized = (residual * gain[:, None]) * weight[None, :]
++    tl.store(Residual + row[:, None] * N + col[None, :], residual, mask)
++    tl.store(Normalized + row[:, None] * N + col[None, :], normalized, mask)
++    tl.store(Gain + row, gain, row < M)
++
++
++@triton_op("gpt_moe::residual_rms_norm_forward", mutates_args=())
++def _forward(x: Tensor, branch: Tensor, scale: Tensor, weight: Tensor, eps: float) -> Tuple[Tensor, Tensor, Tensor]:
++    m, n = x.numel() // x.shape[-1], x.shape[-1]
++    residual = torch.empty_like(x)
++    normalized = torch.empty_like(x)
++    gain = torch.empty((m,), device=x.device, dtype=torch.float32)
++    wrap_triton(_forward_kernel)[(triton.cdiv(m, 4),)](
++        x, branch, scale, weight, residual, normalized, gain,
++        m, n, eps, triton.next_power_of_2(n), num_warps=4, enable_fp_fusion=False,
++    )
++    return residual, normalized, gain
++
++
++@triton.jit
++def _backward_kernel(
++    Residual, Branch, Scale, Weight, Gain, DResidual, DNormalized,
++    DX, DBranch, DScalePart, DWeightPart,
++    M: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr,
++):
++    tile = tl.program_id(0)
++    row = tile * 16 + tl.arange(0, 16)
++    col = tl.arange(0, BLOCK)
++    mask = (row[:, None] < M) & (col[None, :] < N)
++    residual = tl.load(Residual + row[:, None] * N + col[None, :], mask, 0.0)
++    branch = tl.load(Branch + row[:, None] * N + col[None, :], mask, 0.0).to(tl.float32)
++    weight = tl.load(Weight + col, col < N, 0.0)
++    gain = tl.load(Gain + row, row < M, 0.0)
++    direct = tl.load(DResidual + row[:, None] * N + col[None, :], mask, 0.0)
++    grad = tl.load(DNormalized + row[:, None] * N + col[None, :], mask, 0.0)
++    weighted_grad = grad * weight[None, :]
++    correlation = tl.sum(weighted_grad * residual, axis=1) / N
++    # both output paths contribute before differentiating the learned residual scale
++    dx = direct + gain[:, None] * (weighted_grad - residual * ((gain * gain) * correlation)[:, None])
++    scale = tl.load(Scale)
++    tl.store(DX + row[:, None] * N + col[None, :], dx, mask)
++    tl.store(DBranch + row[:, None] * N + col[None, :], dx * scale, mask)
++    weight_part = tl.sum(grad * (residual * gain[:, None]), axis=0)
++    scale_part = tl.sum(tl.sum(dx * branch, axis=1), axis=0)
++    tl.store(DWeightPart + tile * N + col, weight_part, col < N)
++    tl.store(DScalePart + tile, scale_part)
++
++
++@triton_op("gpt_moe::residual_rms_norm_backward", mutates_args=())
++def _backward(
++    residual: Tensor, branch: Tensor, scale: Tensor, weight: Tensor, gain: Tensor,
++    grad_residual: Tensor, grad_normalized: Tensor,
++) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
++    m, n = residual.numel() // residual.shape[-1], residual.shape[-1]
++    dx = torch.empty_like(residual)
++    dbranch = torch.empty_like(branch)
++    scale_part = torch.empty((triton.cdiv(m, 16),), device=residual.device, dtype=torch.float32)
++    weight_part = torch.empty((triton.cdiv(m, 16), n), device=residual.device, dtype=torch.float32)
++    wrap_triton(_backward_kernel)[(triton.cdiv(m, 16),)](
++        residual, branch, scale, weight, gain, grad_residual, grad_normalized,
++        dx, dbranch, scale_part, weight_part, m, n, triton.next_power_of_2(n),
++        num_warps=8, enable_fp_fusion=False,
++    )
++    return dx, dbranch, scale_part, weight_part
++
++
++class _ResidualRMSNorm(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, branch, scale, weight, eps):
++        residual, normalized, gain = _forward(x, branch, scale, weight, eps)
++        ctx.save_for_backward(residual, branch, scale, weight, gain)
++        return residual, normalized
++
++    @staticmethod
++    def backward(ctx, grad_residual, grad_normalized):
++        residual, branch, scale, weight, gain = ctx.saved_tensors
++        dx, dbranch, scale_part, weight_part = _backward(
++            residual, branch, scale, weight, gain, grad_residual.contiguous(), grad_normalized.contiguous(),
++        )
++        return dx, dbranch, scale_part.sum().reshape_as(scale), weight_part.sum(dim=0), None
++
++
++def residual_rms_norm(x: Tensor, branch: Tensor, scale: Tensor, weight: Tensor, eps: float) -> Tuple[Tensor, Tensor]:
++    return _ResidualRMSNorm.apply(x, branch, scale, weight, eps)

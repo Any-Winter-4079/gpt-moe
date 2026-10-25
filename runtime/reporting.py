@@ -128,9 +128,9 @@ def log_parameter_counts(run, gpt_config) -> None:
         # the full output projection stays active, including when tied to the input embedding
         active_params = total_params - inactive_expert_params
         if not gpt_config.use_tied_embeddings:
-            active_params -= raw_gpt_model.transformer.wte.weight.numel() - gpt_config.d_model
+            active_params -= raw_gpt_model.transformer.wte.weight.numel() - gpt_config.hidden_size
         if hasattr(raw_gpt_model.transformer, "wpe"):
-            active_params -= raw_gpt_model.transformer.wpe.weight.numel() - gpt_config.d_model
+            active_params -= raw_gpt_model.transformer.wpe.weight.numel() - gpt_config.hidden_size
         message = f"active parameters per token: {active_params:,}"
         print(message)
         run.log_buffer.append(message)

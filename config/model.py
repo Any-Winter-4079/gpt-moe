@@ -8,7 +8,7 @@ from typing import List
 class GPTConfig:
     # miscellaneous
     n_layers: int = 8
-    d_model: int = 1024
+    hidden_size: int = 1024
     use_bias: bool = False
     mlp_hidden_dim: int = 2048
     use_tied_embeddings: bool = True
@@ -37,8 +37,8 @@ class GPTConfig:
     # n_heads > n_kv_heads > 1 for GQA (Grouped-Query Attention) 
     # and n_kv_heads == 1      for MQA  (Multi-Query Attention)
     # NOTE: increasing n_heads (fixing n_kv_heads) reduces the parameters for GQA/MQA
-    # q_proj: (d_model → attn_dim)
-    # k_proj: (d_model → n_kv_heads * head_size)
+    # q_proj: (hidden_size → attn_dim)
+    # k_proj: (hidden_size → n_kv_heads * head_size)
     # when attn_dim is split, the more (q) heads, the smaller the head_size, which is reused for k, v.
     # head_size ~128 looks good
     n_heads: int = 16
@@ -78,8 +78,6 @@ class GPTConfig:
     use_moe: bool = True
     num_experts: int = 8
     moe_top_k: int = 2
-    use_grouped_moe: bool = True # packed tokens and grouped projections; False uses the expert loop
-    grouped_fp8_wgrad_backend: str = "deepgemm" # "triton" or "deepgemm" (patched SM120 build)
     # for top-k > 1, use full-softmax gates instead of renormalizing the selected experts; top-1 always uses full softmax
     moe_full_softmax_gating: bool = False
 

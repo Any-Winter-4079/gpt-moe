@@ -1,0 +1,64 @@
+diff --git a/model/attention/qk_norm_rope.py b/model/attention/qk_norm_rope.py
+--- a/model/attention/qk_norm_rope.py
++++ b/model/attention/qk_norm_rope.py
+@@ -42,14 +42,14 @@
+         source = Q + batch * qb + head * qh + token[:, None] * qt
+         x = tl.load(source + feature[None, :] * qd, valid, 0.0).to(tl.float32)
+         scale = tl.load(QScale + head).to(tl.float32)
+-        out = QOut + ((batch * H + head) * T + token[:, None]) * D + feature[None, :]
++        out = QOut + ((batch * T + token[:, None]) * H + head) * D + feature[None, :]
+         gain_out = QGain + (batch * H + head) * T + token
+     else:
+         head -= H
+         source = K + batch * kb + head * kh + token[:, None] * kt
+         x = tl.load(source + feature[None, :] * kd, valid, 0.0).to(tl.float32)
+         scale = tl.load(KScale + head).to(tl.float32)
+-        out = KOut + ((batch * H + head) * T + token[:, None]) * D + feature[None, :]
++        out = KOut + ((batch * T + token[:, None]) * H + head) * D + feature[None, :]
+         gain_out = KGain + (batch * H + head) * T + token
+     dtype: tl.constexpr = Q.dtype.element_ty
+     pair_index = tl.broadcast_to((feature[None, :] ^ 1), (ROWS, BLOCK_D))
+@@ -156,8 +156,9 @@
+     eps: float, rms: bool, scale_min: float, scale_max: float,
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     batch, heads, seq_len, head_size = q.shape
+-    q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+-    k_out = torch.empty(k.shape, device=k.device, dtype=k.dtype)
++    # keep logical BHTD views over token-major storage for the attention output layout
++    q_out = torch.empty((batch, seq_len, heads, head_size), device=q.device, dtype=q.dtype).transpose(1, 2)
++    k_out = torch.empty((batch, seq_len, heads, head_size), device=k.device, dtype=k.dtype).transpose(1, 2)
+     q_gain = torch.empty((batch, heads, seq_len), device=q.device, dtype=torch.float32)
+     k_gain = torch.empty_like(q_gain)
+     rows = 16 if head_size <= 64 else 8
+diff --git a/model/attention/qkv_norm_rope_fp8.py b/model/attention/qkv_norm_rope_fp8.py
+--- a/model/attention/qkv_norm_rope_fp8.py
++++ b/model/attention/qkv_norm_rope_fp8.py
+@@ -44,14 +44,14 @@
+         source = Q + batch * qb + head * qh + token[:, None] * qt
+         x = tl.load(source + feature[None, :] * qd, valid, 0.0).to(tl.float32)
+         scale = tl.load(QScale + head).to(tl.float32)
+-        out = QOut + ((batch * H + head) * T + token[:, None]) * 64 + feature[None, :]
++        out = QOut + ((batch * T + token[:, None]) * H + head) * 64 + feature[None, :]
+         gain_out = QGain + (batch * H + head) * T + token
+     else:
+         head -= H
+         source = K + batch * kb + head * kh + token[:, None] * kt
+         x = tl.load(source + feature[None, :] * kd, valid, 0.0).to(tl.float32)
+         scale = tl.load(KScale + head).to(tl.float32)
+-        out = KOut + ((batch * H + head) * T + token[:, None]) * 64 + feature[None, :]
++        out = KOut + ((batch * T + token[:, None]) * H + head) * 64 + feature[None, :]
+         gain_out = KGain + (batch * H + head) * T + token
+     dtype: tl.constexpr = Q.dtype.element_ty
+     paired = tl.gather(x, tl.broadcast_to(feature[None, :] ^ 1, (16, 64)), axis=1)
+@@ -75,8 +75,9 @@
+     eps: float, rms: bool, scale_min: float, scale_max: float,
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     batch, heads, seq_len, _ = q.shape
+-    q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+-    k_out = torch.empty(k.shape, device=k.device, dtype=k.dtype)
++    # keep logical BHTD views over token-major storage for the attention output layout
++    q_out = torch.empty((batch, seq_len, heads, 64), device=q.device, dtype=q.dtype).transpose(1, 2)
++    k_out = torch.empty((batch, seq_len, heads, 64), device=k.device, dtype=k.dtype).transpose(1, 2)
+     q_gain = torch.empty((batch, heads, seq_len), device=q.device, dtype=torch.float32)
+     k_gain = torch.empty_like(q_gain)
+     # keep infinities out of Inductor's generated Python metadata

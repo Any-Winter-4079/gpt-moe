@@ -1,0 +1,115 @@
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -6,7 +6,7 @@
+ import torch.nn as nn
+ from torch import Tensor
+ 
+-from .polar_express import zeropower_via_polar_express
++from .polar_express import aX_plus_BX_update, zeropower_via_polar_express
+ 
+ 
+ # In Muon, the goal is:
+@@ -180,8 +180,16 @@
+                 for start in range(0, len(bucket), 8):
+                     batch = bucket[start:start + 8]
+                     updates = torch.stack([g for _, g in batch])
+-                    updates = zeropower_backend(updates, steps=group['backend_steps'])
+                     scale = max(updates.shape[-2:]) ** 0.5
+-                    for (weight, _), update in zip(batch, updates):
+-                        weight.add_(update, alpha=-lr * scale)
++                    if updates.is_cuda and all(weight.dtype == torch.float32 for weight, _ in batch):
++                        B, X = zeropower_backend(updates, steps=group['backend_steps'], return_last=True)
++                        # keep the changing learning rate outside the compiled projection graph
++                        aX_plus_BX_update(
++                            B, X, tuple(weight for weight, _ in batch), -lr * scale,
++                            updates.size(-2) > updates.size(-1),
++                        )
++                    else:
++                        updates = zeropower_backend(updates, steps=group['backend_steps'])
++                        for (weight, _), update in zip(batch, updates):
++                            weight.add_(update, alpha=-lr * scale)
+ # -- End of (modified) source: https://github.com/tyler-romero/nanogpt-speedrun/blob/main/src/train_gpt2.py --
+diff --git a/optimizers/polar_express.py b/optimizers/polar_express.py
+--- a/optimizers/polar_express.py
++++ b/optimizers/polar_express.py
+@@ -322,6 +322,61 @@
+     return out
+ 
+ 
++@triton.jit
++def aX_plus_BX_update_kernel(
++    B_ptr, X_ptr, Weights,
++    M: tl.constexpr, N: tl.constexpr,
++    b_stride_b, b_stride_r, b_stride_c,
++    x_stride_b, x_stride_r, x_stride_c,
++    weight_strides_r: tl.constexpr, weight_strides_c: tl.constexpr,
++    alpha, update_alpha,
++    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    batch = tl.program_id(1)
++    num_pid_m = tl.cdiv(M, BLOCK_M)
++    num_pid_n = tl.cdiv(N, BLOCK_N)
++    pid_m, pid_n = tl.swizzle2d(pid // num_pid_n, pid % num_pid_n, num_pid_m, num_pid_n, 8)
++    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    reduction = tl.arange(0, BLOCK_K)
++    B_ptr += batch * b_stride_b
++    X_ptr += batch * x_stride_b
++    accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
++    for block in range(tl.cdiv(M, BLOCK_K)):
++        k = block * BLOCK_K + reduction
++        b = tl.load(B_ptr + rows[:, None] * b_stride_r + k[None, :] * b_stride_c,
++                    mask=(rows[:, None] < M) & (k[None, :] < M), other=0.0)
++        x = tl.load(X_ptr + k[:, None] * x_stride_r + cols[None, :] * x_stride_c,
++                    mask=(k[:, None] < M) & (cols[None, :] < N), other=0.0)
++        accumulator = tl.dot(b, x, accumulator)
++    mask = (rows[:, None] < M) & (cols[None, :] < N)
++    original = tl.load(X_ptr + rows[:, None] * x_stride_r + cols[None, :] * x_stride_c,
++                       mask=mask, other=0.0).to(tl.float32)
++    # retain the BF16 projection boundary before updating the master parameters
++    update = tl.fma(alpha, original, accumulator).to(tl.bfloat16).to(tl.float32)
++    for index in tl.static_range(len(Weights)):
++        if batch == index:
++            offsets = rows[:, None] * weight_strides_r[index] + cols[None, :] * weight_strides_c[index]
++            weight = tl.load(Weights[index] + offsets, mask=mask, other=0.0).to(tl.float32)
++            tl.store(Weights[index] + offsets, tl.fma(update_alpha, update, weight), mask=mask)
++
++
++def aX_plus_BX_update(B: Tensor, X: Tensor, weights, update_alpha: float, transpose: bool):
++    M, N = X.shape[-2:]
++    row_dim, col_dim = (-1, -2) if transpose else (-2, -1)
++    # use fixed tiles: autotuning a kernel that mutates parameters would repeat updates
++    aX_plus_BX_update_kernel[(triton.cdiv(M, 64) * triton.cdiv(N, 128), len(weights))](
++        B, X, weights, M, N,
++        B.stride(0), B.stride(-2), B.stride(-1),
++        X.stride(0), X.stride(-2), X.stride(-1),
++        tuple(weight.stride(row_dim) for weight in weights),
++        tuple(weight.stride(col_dim) for weight in weights),
++        polar_express_coeffs[-1][0], update_alpha,
++        BLOCK_M=64, BLOCK_N=128, BLOCK_K=32, num_stages=3, num_warps=4,
++    )
++
++
+ # Computed for num_iters=5, safety_factor=2e-2, cushion=2
+ polar_express_coeffs = [
+     (8.156554524902461, -22.48329292557795, 15.878769915207462),
+@@ -333,7 +388,7 @@
+ 
+ 
+ @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
+-def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool = False):
++def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool = False, return_last: bool = False):
+     """
+     Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+@@ -371,6 +426,8 @@
+             BX_matmul(B, X, out=C)  # C = B @ X  
+             C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+         elif X.is_cuda:
++            if return_last and (a, b, c) == polar_express_coeffs[-1]:
++                return B, X
+             aX_plus_BX(B, X, alpha=a, out=C)
+         else:
+             addmm(X, B, X, beta=a, out=C)  # C = a * X + B @ X

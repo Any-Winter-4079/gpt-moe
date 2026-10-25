@@ -14,7 +14,7 @@ def grouped_fp8_wgrad(
     import deep_gemm
 
     if torch.cuda.get_device_capability(grad.device) != (12, 0):
-        raise ValueError("DeepGEMM grouped FP8 weight gradients require SM120; select the triton backend on other GPUs")
+        raise ValueError("DeepGEMM grouped FP8 weight gradients require SM120")
     if grad.shape[0] % 4 or x.shape[0] % 4:
         raise ValueError("DeepGEMM grouped FP8 projection widths must be multiples of 4")
     if dtype not in (torch.float32, torch.bfloat16):

@@ -1,12 +1,12 @@
 diff --git a/config/training.py b/config/training.py
 --- a/config/training.py
 +++ b/config/training.py
-@@ -212,7 +212,7 @@
-             "q_proj": "fp8",
-             "k_proj": "fp8",
-             "v_proj": "fp8",
--            "out_proj": "fp8",
-+            "out_proj": "default",
-             "up_proj": "fp8",
-             "down_proj": "fp8",
-             "router": "default",
+@@ -213,7 +213,7 @@
+             "q_proj": {"precision": "fp8", "backend": "custom"},
+             "k_proj": {"precision": "fp8", "backend": "custom"},
+             "v_proj": {"precision": "fp8", "backend": "custom"},
+-            "out_proj": {"precision": "fp8", "backend": "custom"},
++            "out_proj": {"precision": "default", "backend": "custom"},
+             "up_proj": {"precision": "fp8", "backend": "custom"},
+             "down_proj": {"precision": "fp8", "backend": "custom"},
+             "router": {"precision": "default", "backend": "custom"},

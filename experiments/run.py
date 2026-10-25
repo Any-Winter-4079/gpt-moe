@@ -1,10 +1,8 @@
 import argparse
 from datetime import datetime
 import fcntl
-import math
 import os
 from pathlib import Path
-import re
 import shlex
 import signal
 import subprocess
@@ -12,75 +10,27 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ORDER = ["baseline", "012", "014", "017", "000", "001", "018", "002", "003", "005", "019", "020", "022", "023", "021", "009", "013", "015", "016", "004", "010", "006", "011", "007", "008"]
-DEPENDENCIES = {
-    "009": ["005"],
-    "010": ["004"],
-    "013": ["005", "009"],
-    "014": ["012"],
-    "015": ["005", "009", "013"],
-    "016": ["005", "009", "013", "015"],
-    "017": ["012", "014"],
-    "018": ["000"],
-    "019": ["005"],
-    "020": ["005"],
-    "021": ["005"],
-    "022": ["005", "019"],
-    "023": ["005"],
+REFERENCE_COMMIT = "00d0970a55f47999bc35b98d2e1a7ca3b91038da"
+EXPERIMENTS = {
+    "baseline": [],
+    "attention-te": ["049"],
+    "attention-qkv-only": ["033"],
+    "attention-out-only": ["034"],
+    "attention-bf16-dgrad": ["031"],
+    "moe-counted-route": ["052"],
+    "moe-output-combine": ["053"],
+    "qkv-head-tiled-backward": ["054"],
+    "polar-final-update": ["055"],
+    "polar-gram-trace": ["056"],
+    "residual-rmsnorm": ["057"],
+    "rmsnorm-fp8-preparation": ["058"],
+    "streaming-cross-entropy": ["059"],
+    "integer-fp8-scales": ["060"],
+    "lm-head-custom": ["061"],
+    "attention-output-layout": ["062"],
+    "qk-token-major-layout": ["063"],
+    "polar-momentum-pack": ["064"],
 }
-COMBINATIONS = {
-    "5+20+11": ["005", "020", "011"],
-    "5+20+11+6": ["005", "020", "011", "006"],
-    "5+20+11+12": ["024"],
-    "5+20+11+6+12": ["025"],
-    "5+20+11+12+19": ["026"],
-    "5+20+11+12+19+21": ["027"],
-    "5+20+11+12+19+21+exact-swa": ["027", "036"],
-    "5+20+11+12+19+21+exact-swa+fa4": ["027", "036", "037"],
-    "5+20+11+12+19+21+fa4-device": ["027", "036", "037", "046"],
-    "5+20+11+12+19+21+mla": ["027", "038"],
-    "5+20+11+12+19+21+qk-rope": ["027", "039"],
-    "5+20+11+12+19+21+exact-swa+flex-fa4": ["027", "036", "041"],
-    "5+20+11+12+19+21+attention": ["027", "028"],
-    "5+20+11+12+19+21+attention-fused": ["027", "029"],
-    "5+20+11+12+19+21+attention-dg": ["027", "029", "030"],
-    "5+20+11+12+19+21+attention-mx": ["027", "029", "030", "035"],
-    "5+20+11+12+19+21+attention-cuda": ["027", "029", "030", "040"],
-    "5+20+11+12+19+21+attention-wide": ["027", "029", "030", "040", "050"],
-    "5+20+11+12+19+21+qkv-epilogue": ["027", "029", "030", "040", "045"],
-    "5+20+11+12+19+21+qkv-backquant": ["027", "029", "030", "044"],
-    "5+20+11+12+19+21+attention-dw": ["027", "029", "030", "047"],
-    "5+20+11+12+19+21+attention-dx16": ["027", "029", "030", "031"],
-    "5+20+11+12+19+21+attention-pipe": ["027", "029", "032"],
-    "5+20+11+12+19+21+attention-qkv": ["027", "029", "030", "033"],
-    "5+20+11+12+19+21+attention-out": ["027", "029", "030", "034"],
-    "5+20+11+12+19+21+inverse-route": ["027", "042"],
-    "5+20+11+12+19+21+inverse-route+qk": ["027", "042", "039"],
-    "5+20+11+12+19+21+route+qk+fa4": ["027", "042", "039", "041"],
-    "5+20+11+12+19+21+route+qk+te": ["027", "042", "039", "049"],
-    "5+20+11+12+19+21+route+qk+dw": ["027", "042", "029", "030", "047", "039"],
-    "5+20+11+12+19+21+route+qkv-bq": ["027", "042", "029", "030", "044"],
-    "5+20+11+12+19+21+route+qkv-epi": ["027", "042", "029", "030", "040", "045"],
-    "5+20+11+12+19+21+route+qk+mx": ["027", "042", "029", "030", "035", "039"],
-    "5+20+11+12+19+21+route+qk+exact": ["027", "042", "039", "036"],
-    "5+20+11+12+19+21+route+qk+swa-fa4": ["027", "042", "039", "036", "041"],
-    "5+20+11+12+19+21+route+mla": ["027", "042", "038"],
-    "5+20+11+12+19+21+inverse-route+tri": ["027", "042", "048"],
-    "5+20+11+12+19+21+polar-triangle": ["027", "048"],
-    "5+20+11+12+19+21+attention-te": ["027", "049"],
-}
-OVERNIGHT = [
-    "5+20+11+12+19+21+route+qk+te",
-    "5+20+11+12+19+21+route+qk+dw",
-    "5+20+11+12+19+21+route+qkv-bq",
-    "5+20+11+12+19+21+route+qkv-epi",
-    "5+20+11+12+19+21+route+qk+mx",
-    "5+20+11+12+19+21+route+qk+exact",
-    "5+20+11+12+19+21+route+qk+fa4",
-    "5+20+11+12+19+21+route+qk+swa-fa4",
-    "5+20+11+12+19+21+route+mla",
-]
-PREVIOUS_5_20_GAIN = 8.64
 
 
 def run_command(command, log):
@@ -104,37 +54,16 @@ def stop(signum, frame):
     raise SystemExit(128 + signum)
 
 
-def read_training_result(run_dir):
-    train_minutes = None
-    val_loss = None
-    with (run_dir / "console.log").open() as log:
-        for line in log:
-            train = re.search(r"^step:\s*[\d,]+\s*\|\s*train loss:.*\|\s*total train time:\s*([\d,.]+)\s*min", line)
-            validation = re.search(r"^step:\s*[\d,]+\s*\|\s*val loss:\s*(\S+)", line)
-            if train:
-                train_minutes = float(train.group(1).replace(",", ""))
-            if validation:
-                val_loss = float(validation.group(1))
-    if train_minutes is None or not math.isfinite(train_minutes) or train_minutes <= 0:
-        raise ValueError("missing or invalid total training time")
-    if val_loss is None or not math.isfinite(val_loss) or val_loss > 3.28:
-        raise ValueError("run did not reach validation loss 3.28")
-    return train_minutes, val_loss
-
-
 def main():
     parser = argparse.ArgumentParser(description="Apply experiments, train, upload to the Hub and reverse the patches")
-    parser.add_argument("experiments", nargs="*", metavar="ID", help="experiment IDs or registered combinations in execution order; include baseline explicitly; omitted runs all experiments with baseline first")
+    parser.add_argument("experiments", nargs="*", metavar="NAME", help="experiment names in execution order; omitted runs the consolidated baseline only")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="number of training GPUs (default: 1)")
-    parser.add_argument("--adaptive", action="store_true", help="run baseline and 3+5, select against 5+20's historical 8.64%% saving, then test fused RoPE and Polar Express fusion")
-    parser.add_argument("--overnight", action="store_true", help="run nine candidates on the current best reference using the FA4 image; no additional baseline")
     args = parser.parse_args()
-    if args.overnight and (args.experiments or args.adaptive):
-        parser.error("--overnight selects its own experiments; do not supply IDs or --adaptive")
-    if args.adaptive and args.experiments:
-        parser.error("--adaptive selects its own experiments; do not supply IDs")
-    if any(experiment not in ORDER and experiment not in COMBINATIONS for experiment in args.experiments):
-        parser.error(f"experiment IDs must be one of: {', '.join([*ORDER, *COMBINATIONS])}")
+    if any(experiment not in EXPERIMENTS for experiment in args.experiments):
+        parser.error(
+            f"choose from: {', '.join(EXPERIMENTS)}. Historical patch IDs and combinations target the old code; "
+            f"check out {REFERENCE_COMMIT} to use its runner (see experiments/README.md)"
+        )
 
     os.chdir(ROOT)
     if not (os.environ.get("hf_user") or os.environ.get("HF_USER")):
@@ -161,16 +90,15 @@ def main():
     with summary_path.open("x") as summary:
         summary.write("experiment\ttrain_exit\tupload_exit\ttimestamp\n")
         summary.flush()
-        experiments = ["baseline", "023"] if args.adaptive else OVERNIGHT.copy() if args.overnight else args.experiments or ORDER
-        combinations = COMBINATIONS.copy()
+        experiments = args.experiments or ["baseline"]
         for index, experiment in enumerate(experiments, 1):
             applied = []
-            label = "3+5" if args.adaptive and experiment == "023" else experiment
+            label = experiment
             console_path = ROOT / f"experiment-{experiment}-{batch}-{index:02d}.log"
             print(f"experiment {label}; training output: {console_path}", flush=True)
             try:
                 with console_path.open("x") as console:
-                    patch_ids = [] if experiment == "baseline" else combinations.get(experiment, DEPENDENCIES.get(experiment, []) + [experiment])
+                    patch_ids = EXPERIMENTS[experiment]
                     for patch_id in patch_ids:
                         patch = patches[patch_id]
                         if run_command(["git", "apply", "--check", str(patch)], console):
@@ -212,51 +140,12 @@ def main():
                         summary.flush()
                         failed = failed or train_exit != 0 or upload_exit != 0
                         print(f"experiment {label}: upload exit {upload_exit}; upload output: {upload_path}", flush=True)
-                        if args.adaptive:
-                            if train_exit != 0:
-                                print(f"experiment {label}: adaptive sequence stopped after training failure", flush=True)
-                                return 1
-                            try:
-                                train_minutes, val_loss = read_training_result(run_dir)
-                            except (OSError, ValueError) as error:
-                                print(f"experiment {label}: adaptive sequence stopped: {error}", flush=True)
-                                return 1
-                            messages = [f"{label}: total train time {train_minutes:.2f} min; final validation loss {val_loss:.8f}"]
-                            if index == 1:
-                                baseline_minutes = train_minutes
-                            elif index == 2:
-                                gain = 100 * (1 - train_minutes / baseline_minutes)
-                                # normalize the historical result to this machine's baseline
-                                winner_minutes = baseline_minutes * (1 - PREVIOUS_5_20_GAIN / 100)
-                                if train_minutes < winner_minutes:
-                                    winner = "3+5"
-                                    winner_patches = ["005", "023"]
-                                    winner_minutes = train_minutes
-                                else:
-                                    winner = "5+20"
-                                    winner_patches = ["005", "020"]
-                                messages.append(f"3+5 saved {gain:.4f}% versus this baseline; 5+20 saved {PREVIOUS_5_20_GAIN:.2f}% versus its historical baseline; selected {winner}")
-                                messages.append(f"{winner}: reference time {winner_minutes:.4f} min; next add 8 (fused RoPE)")
-                                experiments.append(f"{winner}+8")
-                                combinations[experiments[-1]] = winner_patches + ["008"]
-                            elif index == 3:
-                                keep_rope = train_minutes < winner_minutes
-                                next_experiment = f"{winner}+8+11" if keep_rope else f"{winner}+11"
-                                combinations[next_experiment] = winner_patches + (["008"] if keep_rope else []) + ["011"]
-                                experiments.append(next_experiment)
-                                messages.append(f"8 (fused RoPE): {'retain' if keep_rope else 'omit'}; {train_minutes:.2f} min versus {winner_minutes:.4f} min; next {next_experiment} adds 11 (Polar Express fusion)")
-                            for message in messages:
-                                print(message, flush=True)
-                                summary.write(f"# {message}\n")
-                            summary.flush()
                         continue
 
                 failed = True
                 summary.write(f"{label}\tpatch_failed\tnot_attempted\t-\n")
                 summary.flush()
                 print(f"experiment {label}: patch failed; see {console_path}", flush=True)
-                if args.adaptive:
-                    return 1
             finally:
                 # keep cleanup running until the applied patch stack is fully reversed
                 previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})

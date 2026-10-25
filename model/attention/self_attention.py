@@ -10,7 +10,10 @@ from torch.nn.attention.flex_attention import flex_attention, BlockMask
 
 from ..position.rotary import Rotary, apply_rotation
 from ..linear.linear import Linear
+from ..linear.fp8.custom.dense import project, quantize_weights
 from .logit_softcapping import generate_tanh_softcap
+from .qkv_norm_rope_fp8 import project_qkv_norm_rope
+from .qk_norm_rope import qk_norm_rope
 
 if TYPE_CHECKING:
     from config.model import GPTConfig
@@ -54,7 +57,7 @@ class SelfAttention(nn.Module):
     def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig, layer_idx: int = 0) -> None:
         super().__init__()
 
-        self.d_model = gpt_config.d_model
+        self.hidden_size = gpt_config.hidden_size
         self.n_heads = gpt_config.n_heads
 
         # full (global) attention layers use different attn_dim, n_kv_heads, and rope_theta
@@ -71,10 +74,12 @@ class SelfAttention(nn.Module):
         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads for GQA/MQA"
         assert self.attn_dim % self.n_heads == 0, "attn_dim must be divisible by n_heads"
         self.q_heads_per_kv_head = self.n_heads // self.n_kv_heads
-        self.q_proj = Linear(gpt_config.d_model, self.attn_dim, role="q_proj", bias=gpt_config.use_bias)
-        self.k_proj = Linear(gpt_config.d_model, self.n_kv_heads * self.head_size, role="k_proj", bias=gpt_config.use_bias)
-        self.v_proj = Linear(gpt_config.d_model, self.n_kv_heads * self.head_size, role="v_proj", bias=gpt_config.use_bias)
-        self.out_proj = Linear(self.attn_dim, gpt_config.d_model, role="out_proj", bias=gpt_config.use_bias)
+        self.q_proj = Linear(gpt_config.hidden_size, self.attn_dim, role="q_proj", bias=gpt_config.use_bias)
+        self.k_proj = Linear(gpt_config.hidden_size, self.n_kv_heads * self.head_size, role="k_proj", bias=gpt_config.use_bias)
+        self.v_proj = Linear(gpt_config.hidden_size, self.n_kv_heads * self.head_size, role="v_proj", bias=gpt_config.use_bias)
+        self.out_proj = Linear(self.attn_dim, gpt_config.hidden_size, role="out_proj", bias=gpt_config.use_bias)
+        self.prepared_qkv_weight = None
+        self.prepared_out_weight = None
 
         rope_theta = gpt_config.global_rope_theta if is_full_attention else gpt_config.rope_base_theta
         self.rotary = Rotary(self.head_size, rope_theta, training_config.max_seq_len) if gpt_config.pos_encoding_type.lower() == "rope" else None
@@ -109,6 +114,23 @@ class SelfAttention(nn.Module):
         self.tanh_backend = gpt_config.tanh_backend
         self._score_mod = generate_tanh_softcap(self.attn_logit_softcap, backend=self.tanh_backend) if self.use_attn_logit_softcapping else None
 
+    @torch.no_grad()
+    def prepare_fp8_weights(self) -> None:
+        self.clear_fp8_weights()
+        if all(projection.precision == "fp8" and projection.backend == "custom"
+               for projection in (self.q_proj, self.k_proj, self.v_proj)):
+            self.prepared_qkv_weight = quantize_weights([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight])
+        if self.out_proj.precision == "fp8" and self.out_proj.backend == "custom":
+            self.prepared_out_weight = quantize_weights([self.out_proj.weight])
+
+    def clear_fp8_weights(self) -> None:
+        self.prepared_qkv_weight = None
+        self.prepared_out_weight = None
+
+    def _load_from_state_dict(self, *args, **kwargs) -> None:
+        self.clear_fp8_weights()
+        super()._load_from_state_dict(*args, **kwargs)
+
     def forward(
             self,
             x: Tensor,
@@ -121,11 +143,58 @@ class SelfAttention(nn.Module):
         if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x.dtype != self.q_proj.weight.dtype:
             x = x.to(dtype=self.q_proj.weight.dtype)
 
-        q = self.q_proj(x).view(x.size(0), seq_len, self.n_heads, self.head_size).transpose(1, 2)
-        k = self.k_proj(x).view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
-        v = self.v_proj(x).view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
+        reuse_weights = self.training and torch.is_grad_enabled()
+        fused_qkv = (
+            reuse_weights and torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.bfloat16
+            and self.use_qk_norm and self.rotary is not None
+            and self.n_kv_heads == self.n_heads and self.head_size == 64 and self.n_heads % 2 == 0
+            and all(projection.precision == "fp8" and projection.backend == "custom" and projection.bias is None
+                    for projection in (self.q_proj, self.k_proj, self.v_proj))
+        )
+        if fused_qkv:
+            cos = self.rotary.cos_cached[..., :seq_len, :]
+            sin = self.rotary.sin_cached[..., :seq_len, :]
+            q, k, v = project_qkv_norm_rope(
+                x, [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], self.q_scale, self.k_scale,
+                cos, sin, self.qk_eps, self.qk_norm_type == "rms", self.qk_scale_min, self.qk_scale_max,
+                self.n_heads, self.prepared_qkv_weight,
+            )
+        elif all(projection.precision == "fp8" and projection.backend == "custom"
+                 for projection in (self.q_proj, self.k_proj, self.v_proj)):
+            q, k, v = project(
+                x, [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
+                self.prepared_qkv_weight if reuse_weights else None,
+            )
+            if self.q_proj.bias is not None:
+                q = q + self.q_proj.bias.to(q.dtype)
+                k = k + self.k_proj.bias.to(k.dtype)
+                v = v + self.v_proj.bias.to(v.dtype)
+        else:
+            q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        if q.dtype != k.dtype or q.dtype != v.dtype:
+            raise ValueError(
+                f"attention Q/K/V projections must produce the same dtype; got q={q.dtype}, k={k.dtype}, v={v.dtype}. "
+                "Use BF16 autocast or compatible projection precisions/backends."
+            )
+        if not fused_qkv:
+            q = q.view(x.size(0), seq_len, self.n_heads, self.head_size).transpose(1, 2)
+            k = k.view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
+            v = v.view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
 
-        if self.rotary is not None:
+        fused_qk = fused_qkv or (
+            self.training and q.is_cuda and q.dtype == torch.bfloat16
+            and torch.is_autocast_enabled("cuda")
+            and k.dtype == q.dtype and self.rotary is not None and self.use_qk_norm
+            and self.n_kv_heads == self.n_heads and self.head_size <= 256
+        )
+        if fused_qk and not fused_qkv:
+            cos = self.rotary.cos_cached[..., :seq_len, :]
+            sin = self.rotary.sin_cached[..., :seq_len, :]
+            q, k = qk_norm_rope(
+                q, k, self.q_scale, self.k_scale, cos, sin, self.qk_eps,
+                self.qk_norm_type == "rms", self.qk_scale_min, self.qk_scale_max,
+            )
+        elif self.rotary is not None and not fused_qkv:
             # apply RoPE
             cos, sin = self.rotary.get_cos_sin(seq_len, q.dtype, q.device)
             q, k = apply_rotation(q, k, cos, sin)
@@ -135,7 +204,7 @@ class SelfAttention(nn.Module):
             k = k.unsqueeze(2).expand(x.size(0), self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(x.size(0), self.n_heads, seq_len, self.head_size)
             v = v.unsqueeze(2).expand(x.size(0), self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(x.size(0), self.n_heads, seq_len, self.head_size)
 
-        if self.use_qk_norm:
+        if self.use_qk_norm and not fused_qk:
             if self.qk_norm_type == "rms":
                 # inverse RMS, ignoring epsilon in this derivation:
                 # 1 / RMS(q) = 1 / sqrt(mean(q_i^2)) = 1 / (sqrt(1/head_size * sum(q_i^2))) =
@@ -183,5 +252,10 @@ class SelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(x.size(0), seq_len, self.attn_dim)
         if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and y.dtype != self.out_proj.weight.dtype:
             y = y.to(dtype=self.out_proj.weight.dtype)
-        y = self.out_proj(y)
+        if self.out_proj.precision == "fp8" and self.out_proj.backend == "custom":
+            y = project(y, [self.out_proj.weight], self.prepared_out_weight if reuse_weights else None)[0]
+            if self.out_proj.bias is not None:
+                y = y + self.out_proj.bias.to(y.dtype)
+        else:
+            y = self.out_proj(y)
         return y

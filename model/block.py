@@ -38,14 +38,14 @@ class Block(nn.Module):
             self.residual_scale = nn.Parameter(torch.full((1,), (2 * gpt_config.n_layers) ** -0.5), requires_grad=False)
 
         if gpt_config.norm_type.lower() == "rms":
-            self.ln_1 = nn.RMSNorm(gpt_config.d_model)
+            self.ln_1 = nn.RMSNorm(gpt_config.hidden_size)
         else:
-            self.ln_1 = nn.LayerNorm(gpt_config.d_model)
+            self.ln_1 = nn.LayerNorm(gpt_config.hidden_size)
         self.attn = SelfAttention(gpt_config, training_config, layer_idx=layer_idx)
         if gpt_config.norm_type.lower() == "rms":
-            self.ln_2 = nn.RMSNorm(gpt_config.d_model)
+            self.ln_2 = nn.RMSNorm(gpt_config.hidden_size)
         else:
-            self.ln_2 = nn.LayerNorm(gpt_config.d_model)
+            self.ln_2 = nn.LayerNorm(gpt_config.hidden_size)
         if self.use_moe:
             self.mlp = MoE(gpt_config, training_config, num_experts=gpt_config.num_experts, top_k=gpt_config.moe_top_k)
         else:

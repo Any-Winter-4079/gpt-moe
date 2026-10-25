@@ -46,6 +46,9 @@ def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
                 for optimizer in optimizers.values():
                     optimizer.zero_grad(set_to_none=True)
 
+                if grad_accum_mini_steps > 1:
+                    raw_gpt_model.prepare_fp8_weights()
+
                 pipeline_batches = []
                 for mini_step in range(grad_accum_mini_steps):
                     # make shapes match training
@@ -77,6 +80,7 @@ def _kernel_warmup_pp(run, num_train_steps: int = 2) -> None:
                 with ctx:
                     pipeline_train_step(pipeline_batches)
 
+                raw_gpt_model.clear_fp8_weights()
                 for optimizer in optimizers.values():
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -162,6 +166,9 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
                 for optimizer in optimizers.values():
                     optimizer.zero_grad(set_to_none=True)
 
+                if grad_accum_mini_steps > 1:
+                    raw_gpt_model.prepare_fp8_weights()
+
                 for mini_step in range(grad_accum_mini_steps):
                     # mimic the real training loop’s DDP behavior
                     gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
@@ -192,6 +199,7 @@ def _kernel_warmup_ddp(run, num_train_steps: int = 2) -> None:
 
                     (warm_loss / grad_accum_mini_steps).backward()
 
+                raw_gpt_model.clear_fp8_weights()
                 for optimizer in optimizers.values():
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -243,10 +251,13 @@ def kernel_warmup(run, num_train_steps: int = 2) -> None:
     dist.barrier()
     torch.cuda.synchronize()
     start_t = time.perf_counter()
-    if run.parallel_mode == "pp":
-        _kernel_warmup_pp(run, num_train_steps)
-    else:
-        _kernel_warmup_ddp(run, num_train_steps)
+    try:
+        if run.parallel_mode == "pp":
+            _kernel_warmup_pp(run, num_train_steps)
+        else:
+            _kernel_warmup_ddp(run, num_train_steps)
+    finally:
+        run.raw_gpt_model.clear_fp8_weights()
     torch.cuda.synchronize()
     dist.barrier()
     elapsed = torch.tensor([time.perf_counter() - start_t], dtype=torch.float64, device=run.device)

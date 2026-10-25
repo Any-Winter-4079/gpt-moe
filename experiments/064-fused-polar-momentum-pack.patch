@@ -1,0 +1,104 @@
+diff --git a/optimizers/muon.py b/optimizers/muon.py
+--- a/optimizers/muon.py
++++ b/optimizers/muon.py
+@@ -7,6 +7,7 @@
+ from torch import Tensor
+ 
+ from .polar_express import zeropower_via_polar_express
++from .polar_prepare import prepare_polar
+ 
+ 
+ # In Muon, the goal is:
+@@ -149,6 +150,7 @@
+             momentum = group['momentum']
+             zeropower_backend = zeropower_backends[group['backend']]
+             buckets = {}
++            prepare_buckets = {}
+             for p in group['params']:
+                 g = p.grad
+                 if g is None:
+@@ -157,6 +159,15 @@
+                 if 'momentum_buffer' not in state:
+                     state['momentum_buffer'] = torch.zeros_like(g)
+                 buf = state['momentum_buffer']
++                if group['backend'] == 'polarexpress' and g.is_cuda and g.dtype == torch.float32:
++                    if g.size(0) == 3 * g.size(1):
++                        prepared = zip(p.data.split(g.size(1)), g.split(g.size(1)), buf.split(g.size(1)))
++                    else:
++                        prepared = [(p.data, g, buf)]
++                    for weight, gradient, buffer in prepared:
++                        key = (gradient.shape, gradient.device, gradient.dtype)
++                        prepare_buckets.setdefault(key, []).append((weight, gradient, buffer))
++                    continue
+                 buf.mul_(momentum).add_(g)
+                 if group['nesterov']:
+                     g.add_(buf, alpha=momentum)
+@@ -184,4 +195,16 @@
+                     scale = max(updates.shape[-2:]) ** 0.5
+                     for (weight, _), update in zip(batch, updates):
+                         weight.add_(update, alpha=-lr * scale)
++
++            for bucket in prepare_buckets.values():
++                for start in range(0, len(bucket), 8):
++                    batch = bucket[start:start + 8]
++                    updates = prepare_polar(
++                        tuple(g for _, g, _ in batch), tuple(buf for _, _, buf in batch),
++                        momentum, group['nesterov'],
++                    )
++                    updates = zeropower_backend(updates, steps=group['backend_steps'])
++                    scale = max(updates.shape[-2:]) ** 0.5
++                    for (weight, _, _), update in zip(batch, updates):
++                        weight.add_(update, alpha=-lr * scale)
+ # -- End of (modified) source: https://github.com/tyler-romero/nanogpt-speedrun/blob/main/src/train_gpt2.py --
+diff --git a/optimizers/polar_prepare.py b/optimizers/polar_prepare.py
+new file mode 100644
+--- /dev/null
++++ b/optimizers/polar_prepare.py
+@@ -0,0 +1,47 @@
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def prepare_polar_kernel(
++    Gradients, Buffers, Packed,
++    ROWS: tl.constexpr, COLS: tl.constexpr,
++    grad_strides_r: tl.constexpr, grad_strides_c: tl.constexpr,
++    buffer_strides_r: tl.constexpr, buffer_strides_c: tl.constexpr,
++    momentum, NESTEROV: tl.constexpr, BLOCK: tl.constexpr,
++):
++    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    matrix = tl.program_id(1)
++    rows, cols = offsets // COLS, offsets % COLS
++    mask = offsets < ROWS * COLS
++    for index in tl.static_range(len(Gradients)):
++        if matrix == index:
++            grad_ptrs = Gradients[index] + rows * grad_strides_r[index] + cols * grad_strides_c[index]
++            buffer_ptrs = Buffers[index] + rows * buffer_strides_r[index] + cols * buffer_strides_c[index]
++            gradient = tl.load(grad_ptrs, mask=mask, other=0.0).to(tl.float32)
++            buffer = tl.load(buffer_ptrs, mask=mask, other=0.0).to(tl.float32)
++            # retain the separate FP32 rounding of buf.mul_(momentum).add_(g)
++            buffer = buffer * momentum
++            buffer = buffer + gradient
++            tl.store(buffer_ptrs, buffer, mask=mask)
++            if NESTEROV:
++                gradient = tl.fma(momentum, buffer, gradient)
++                tl.store(grad_ptrs, gradient, mask=mask)
++            else:
++                gradient = buffer
++            tl.store(Packed + matrix * ROWS * COLS + offsets, gradient.to(tl.bfloat16), mask=mask)
++
++
++def prepare_polar(gradients, buffers, momentum: float, nesterov: bool):
++    rows, cols = gradients[0].shape
++    packed = torch.empty((len(gradients), rows, cols), dtype=torch.bfloat16, device=gradients[0].device)
++    prepare_polar_kernel[(triton.cdiv(rows * cols, 1024), len(gradients))](
++        gradients, buffers, packed, rows, cols,
++        tuple(g.stride(0) for g in gradients), tuple(g.stride(1) for g in gradients),
++        tuple(buf.stride(0) for buf in buffers), tuple(buf.stride(1) for buf in buffers),
++        momentum, nesterov, BLOCK=1024, num_warps=4, enable_fp_fusion=False,
++    )
++    return packed

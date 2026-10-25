@@ -1,18 +1,18 @@
 diff --git a/config/training.py b/config/training.py
 --- a/config/training.py
 +++ b/config/training.py
-@@ -209,10 +209,10 @@
-     # default inherits the surrounding precision context; fp8 explicitly enables block scaling
-     linear_precision: Dict[str, Dict[str, str]] = field(default_factory=lambda: {
+@@ -210,10 +210,10 @@
+     # te uses E4M3 block scaling: activations/gradients in 1D, weights in 2D
+     linear_config: Dict[str, Dict[str, Dict[str, str]]] = field(default_factory=lambda: {
          "training": {
--            "q_proj": "default",
--            "k_proj": "default",
--            "v_proj": "default",
--            "out_proj": "default",
-+            "q_proj": "fp8",
-+            "k_proj": "fp8",
-+            "v_proj": "fp8",
-+            "out_proj": "fp8",
-             "up_proj": "fp8",
-             "down_proj": "fp8",
-             "router": "default",
+-            "q_proj": {"precision": "fp8", "backend": "custom"},
+-            "k_proj": {"precision": "fp8", "backend": "custom"},
+-            "v_proj": {"precision": "fp8", "backend": "custom"},
+-            "out_proj": {"precision": "fp8", "backend": "custom"},
++            "q_proj": {"precision": "fp8", "backend": "te"},
++            "k_proj": {"precision": "fp8", "backend": "te"},
++            "v_proj": {"precision": "fp8", "backend": "te"},
++            "out_proj": {"precision": "fp8", "backend": "te"},
+             "up_proj": {"precision": "fp8", "backend": "custom"},
+             "down_proj": {"precision": "fp8", "backend": "custom"},
+             "router": {"precision": "default", "backend": "custom"},
