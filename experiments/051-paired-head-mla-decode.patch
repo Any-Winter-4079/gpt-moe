@@ -1,0 +1,224 @@
+diff --git a/model/attention/mla_decode.py b/model/attention/mla_decode.py
+--- a/model/attention/mla_decode.py
++++ b/model/attention/mla_decode.py
+@@ -115,6 +115,145 @@
+ 
+ 
+ @triton.jit
++def _mla_decode_paired_step(
++    latent, rope, valid, q_latent, q_rope, query_bias, gain,
++    maximum, denominator, acc,
++    P: tl.constexpr, SCALE: tl.constexpr, SOFTCAP: tl.constexpr, BACKEND: tl.constexpr,
++):
++    score = tl.sum(latent * q_latent[None, :], axis=1) + query_bias
++    if P:
++        score += tl.sum(rope * q_rope[None, :], axis=1)
++    score = score * gain * SCALE
++    if SOFTCAP > 0.0:
++        if BACKEND == "clamp":
++            score = tl.where(score != score, score, tl.minimum(tl.maximum(score, -SOFTCAP), SOFTCAP))
++        elif BACKEND == "rational":
++            z = score / SOFTCAP
++            z = tl.where(z != z, z, tl.minimum(tl.maximum(z, -3.0), 3.0))
++            square = z * z
++            score = SOFTCAP * z * (27.0 + square) / (27.0 + 9.0 * square)
++        elif BACKEND == "ptx":
++            score = SOFTCAP * tl.inline_asm_elementwise(
++                "tanh.approx.f32 $0, $1;", constraints="=f,f",
++                args=[score / SOFTCAP], dtype=tl.float32, is_pure=True, pack=1,
++            )
++        else:
++            score = SOFTCAP * libdevice.tanh(score / SOFTCAP)
++    score = tl.where(valid, score * 1.4426950408889634, float("-inf"))
++    next_maximum = tl.maximum(maximum, tl.max(score, axis=0))
++    safe_maximum = tl.where(next_maximum == float("-inf"), 0.0, next_maximum)
++    correction = tl.exp2(maximum - safe_maximum)
++    probability = tl.exp2(score - safe_maximum)
++    denominator = denominator * correction + tl.sum(probability, axis=0)
++    acc = acc * correction + tl.sum(probability[:, None] * latent, axis=0)
++    return next_maximum, denominator, acc
++
++
++@triton.jit
++def _mla_decode_paired_kernel(
++    QLatent, QRope, QueryBias, Latent, Rope, KeyGain, Mask, Window, Out, Lse, Mass,
++    K, latent_stride_b, rope_stride_b, gain_stride_b,
++    H: tl.constexpr, Q: tl.constexpr, R: tl.constexpr, P: tl.constexpr,
++    KV_HEADS: tl.constexpr, SPLITS: tl.constexpr, HAS_WINDOW: tl.constexpr,
++    ql_stride_b: tl.constexpr, ql_stride_h: tl.constexpr, ql_stride_q: tl.constexpr,
++    qr_stride_b: tl.constexpr, qr_stride_h: tl.constexpr, qr_stride_q: tl.constexpr,
++    bias_stride_b: tl.constexpr, bias_stride_h: tl.constexpr, bias_stride_q: tl.constexpr,
++    SCALE: tl.constexpr, SOFTCAP: tl.constexpr, BACKEND: tl.constexpr,
++    BLOCK_K: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_P: tl.constexpr,
++):
++    pair_row = tl.program_id(0)
++    split = tl.program_id(1)
++    query = pair_row % Q
++    head = ((pair_row // Q) % (H // 2)) * 2
++    batch = pair_row // ((H // 2) * Q)
++    row0 = (batch * H + head) * Q + query
++    row1 = row0 + Q
++    kv_head0 = head // (H // KV_HEADS)
++    kv_head1 = (head + 1) // (H // KV_HEADS)
++    r = tl.arange(0, BLOCK_R)
++    q_latent0 = tl.load(
++        QLatent + batch * ql_stride_b + head * ql_stride_h + query * ql_stride_q + r,
++        mask=r < R, other=0.0,
++    ).to(tl.float32)
++    q_latent1 = tl.load(
++        QLatent + batch * ql_stride_b + (head + 1) * ql_stride_h + query * ql_stride_q + r,
++        mask=r < R, other=0.0,
++    ).to(tl.float32)
++    bias0 = tl.load(QueryBias + batch * bias_stride_b + head * bias_stride_h + query * bias_stride_q).to(tl.float32)
++    bias1 = tl.load(QueryBias + batch * bias_stride_b + (head + 1) * bias_stride_h + query * bias_stride_q).to(tl.float32)
++    q_rope0 = tl.zeros((BLOCK_P,), tl.float32)
++    q_rope1 = tl.zeros((BLOCK_P,), tl.float32)
++    if P:
++        p = tl.arange(0, BLOCK_P)
++        q_rope0 = tl.load(
++            QRope + batch * qr_stride_b + head * qr_stride_h + query * qr_stride_q + p,
++            mask=p < P, other=0.0,
++        ).to(tl.float32)
++        q_rope1 = tl.load(
++            QRope + batch * qr_stride_b + (head + 1) * qr_stride_h + query * qr_stride_q + p,
++            mask=p < P, other=0.0,
++        ).to(tl.float32)
++
++    maximum0 = tl.full((), float("-inf"), tl.float32)
++    maximum1 = tl.full((), float("-inf"), tl.float32)
++    denominator0 = tl.full((), 0.0, tl.float32)
++    denominator1 = tl.full((), 0.0, tl.float32)
++    acc0 = tl.zeros((BLOCK_R,), tl.float32)
++    acc1 = tl.zeros((BLOCK_R,), tl.float32)
++    first_key = 0
++    if HAS_WINDOW:
++        window = tl.maximum(tl.load(Window), 0)
++        first_key = tl.maximum(0, K - Q - window)
++    keys_in_range = K - first_key
++    start = first_key + keys_in_range * split // SPLITS
++    end = first_key + keys_in_range * (split + 1) // SPLITS
++    for tile in range(tl.cdiv(end - start, BLOCK_K)):
++        key = start + tile * BLOCK_K + tl.arange(0, BLOCK_K)
++        valid = tl.load(Mask + (batch * Q + query) * K + key, mask=key < end, other=False)
++        if tl.sum(valid.to(tl.int32), axis=0) > 0:
++            # reuse the loaded cache tile for both heads before advancing
++            latent = tl.load(
++                Latent + batch * latent_stride_b + key[:, None] * R + r[None, :],
++                mask=valid[:, None] & (r[None, :] < R), other=0.0,
++            ).to(tl.float32)
++            rope = tl.zeros((BLOCK_K, BLOCK_P), tl.float32)
++            if P:
++                rope = tl.load(
++                    Rope + batch * rope_stride_b + key[:, None] * P + p[None, :],
++                    mask=valid[:, None] & (p[None, :] < P), other=0.0,
++                ).to(tl.float32)
++            gain0 = tl.load(
++                KeyGain + batch * gain_stride_b + key * KV_HEADS + kv_head0,
++                mask=valid, other=0.0,
++            ).to(tl.float32)
++            gain1 = gain0
++            if kv_head0 != kv_head1:
++                gain1 = tl.load(
++                    KeyGain + batch * gain_stride_b + key * KV_HEADS + kv_head1,
++                    mask=valid, other=0.0,
++                ).to(tl.float32)
++            maximum0, denominator0, acc0 = _mla_decode_paired_step(
++                latent, rope, valid, q_latent0, q_rope0, bias0, gain0,
++                maximum0, denominator0, acc0, P, SCALE, SOFTCAP, BACKEND,
++            )
++            maximum1, denominator1, acc1 = _mla_decode_paired_step(
++                latent, rope, valid, q_latent1, q_rope1, bias1, gain1,
++                maximum1, denominator1, acc1, P, SCALE, SOFTCAP, BACKEND,
++            )
++
++    normalizer0 = tl.where(denominator0 > 0.0, denominator0, 1.0)
++    normalizer1 = tl.where(denominator1 > 0.0, denominator1, 1.0)
++    tl.store(Out + (row0 * SPLITS + split) * R + r, acc0 / normalizer0, mask=r < R)
++    tl.store(Out + (row1 * SPLITS + split) * R + r, acc1 / normalizer1, mask=r < R)
++    if SPLITS > 1:
++        tl.store(Lse + row0 * SPLITS + split, tl.where(denominator0 > 0.0, maximum0 + tl.log2(normalizer0), float("-inf")))
++        tl.store(Lse + row1 * SPLITS + split, tl.where(denominator1 > 0.0, maximum1 + tl.log2(normalizer1), float("-inf")))
++    else:
++        tl.store(Mass + row0, (denominator0 > 0.0).to(tl.float32))
++        tl.store(Mass + row1, (denominator1 > 0.0).to(tl.float32))
++
++
++@triton.jit
+ def _mla_decode_merge_kernel(
+     Partial, Lse, Out, Mass,
+     R: tl.constexpr, SPLITS: tl.constexpr,
+@@ -187,17 +326,20 @@
+ 
+     # parallelize the cache scan when a small decode batch cannot fill the GPU
+     rows = batch * heads * queries
++    paired = heads % 2 == 0
++    groups = rows // 2 if paired else rows
+     sm_count = torch.cuda.get_device_properties(q_latent.device).multi_processor_count
+-    splits = min(16, triton.cdiv(sm_count * 2, rows), triton.cdiv(keys, 256))
++    splits = min(32 if paired else 16, triton.cdiv(sm_count * 2, groups), triton.cdiv(keys, 128 if paired else 256))
+     context = torch.empty(q_latent.shape, device=q_latent.device, dtype=torch.float32)
+     mass = torch.empty((batch, heads, queries), device=q_latent.device, dtype=torch.float32)
+     partial = torch.empty((rows, splits, rank), device=q_latent.device, dtype=torch.float32) if splits > 1 else context
+     lse = torch.empty((rows, splits), device=q_latent.device, dtype=torch.float32) if splits > 1 else mass
+     block_r = triton.next_power_of_2(rank)
+     block_p = triton.next_power_of_2(positional) if positional else 1
+-    block_k = 16 if block_r + block_p > 512 else 32
++    block_k = 16 if paired or block_r + block_p > 512 else 32
+     warps = 8 if block_r + block_p > 256 else 4
+-    wrap_triton(_mla_decode_kernel)[(rows, splits)](
++    kernel = _mla_decode_paired_kernel if paired else _mla_decode_kernel
++    wrap_triton(kernel)[(groups, splits)](
+         q_latent, q_rope, query_bias, latent, rope, key_gain, mask, mask if window_size is None else window_size, partial, lse, mass,
+         keys, latent.stride(0), rope.stride(0), key_gain.stride(0),
+         heads, queries, rank, positional, kv_heads, splits, window_size is not None,
+diff --git a/experiments/check_mla.py b/experiments/check_mla.py
+--- a/experiments/check_mla.py
++++ b/experiments/check_mla.py
+@@ -99,13 +99,13 @@
+             start = end
+ 
+ 
+-def check_decode():
+-    batch, heads, queries, keys, capacity, rank, positional, kv_heads = 2, 4, 3, 677, 1031, 128, 16, 2
+-    latent = torch.randn(batch, capacity, rank, device="cuda", dtype=torch.bfloat16)[:, :keys]
+-    rope = torch.randn(batch, capacity, positional, device="cuda", dtype=torch.bfloat16)[:, :keys]
+-    gain = torch.rand(batch, capacity, kv_heads, device="cuda", dtype=torch.bfloat16)[:, :keys]
++def check_decode(heads, kv_heads, queries, keys, dtype=torch.bfloat16):
++    batch, capacity, rank, positional = 2, keys + 127, 128, 16
++    latent = torch.randn(batch, capacity, rank, device="cuda", dtype=dtype)[:, :keys]
++    rope = torch.randn(batch, capacity, positional, device="cuda", dtype=dtype)[:, :keys]
++    gain = torch.rand(batch, capacity, kv_heads, device="cuda", dtype=dtype)[:, :keys]
+     query_latent = torch.randn(batch, heads, queries, rank, device="cuda")
+-    query_rope = torch.randn(batch, heads, queries, positional, device="cuda", dtype=torch.bfloat16)
++    query_rope = torch.randn(batch, heads, queries, positional, device="cuda", dtype=dtype)
+     query_bias = torch.randn(batch, heads, queries, device="cuda")
+     mask = torch.rand(batch, 1, queries, keys, device="cuda") > .2
+     mask[0, :, 0] = False
+@@ -136,17 +136,21 @@
+             output, mass = mla_decode(query_latent, query_rope, query_bias, latent, rope, gain, local_mask, scale, cap, backend, None if window is None else window_size)
+             torch.testing.assert_close(output, target, atol=3e-5, rtol=3e-4)
+             torch.testing.assert_close(mass, valid[..., 0].expand(batch, heads, queries).float(), atol=0, rtol=0)
+-        print(f"PASS: absorbed streaming decode {backend}, changing windows, ragged capacity-strided cache and empty rows")
++        print(f"PASS: absorbed decode H={heads}/KV={kv_heads}/Q={queries}/K={keys}/{dtype}/{backend}, changing windows and empty rows")
+ 
+ 
+ parser = argparse.ArgumentParser()
+ parser.add_argument("--compile", action="store_true")
++parser.add_argument("--decode-only", action="store_true")
+ args = parser.parse_args()
+ torch.manual_seed(2026)
+ torch.set_float32_matmul_precision("highest")
+ assert torch.cuda.is_available(), "this correctness check requires CUDA"
+-check_decode()
+-for use_flex in (False, True):
+-    for q_rank in (0, 32):
+-        check_module(use_flex, q_rank, args.compile)
+-print("PASS: MLA projections, both attention routes, gradients and compressed decoding")
++for heads, kv_heads, queries, keys in ((1, 1, 1, 129), (3, 1, 3, 257), (4, 4, 1, 677), (6, 2, 3, 677), (16, 4, 2, 1409)):
++    check_decode(heads, kv_heads, queries, keys)
++check_decode(2, 2, 2, 513, torch.float32)
++if not args.decode_only:
++    for use_flex in (False, True):
++        for q_rank in (0, 32):
++            check_module(use_flex, q_rank, args.compile)
++print("PASS: MLA correctness checks")

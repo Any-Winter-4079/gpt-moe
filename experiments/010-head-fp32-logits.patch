@@ -1,0 +1,37 @@
+--- a/model/linear/deepgemm_head.py
++++ b/model/linear/deepgemm_head.py
+@@ -38,7 +38,7 @@
+     wrap_triton(_quantize_weights_kernel)[(1, triton.cdiv(n, 128), triton.cdiv(k, 128))](
+         weight, weight_fp8, weight_scale, n, k, 0, *weight.stride(), num_warps=8,
+     )
+-    out = _mm(row, weight_fp8, row_scale, weight_scale, dtype)
++    out = _mm(row, weight_fp8, row_scale, weight_scale, torch.float32)
+     return out, column, column_scale, weight_fp8, weight_scale, offsets
+ 
+ 
+--- a/experiments/check_deepgemm_head.py
++++ b/experiments/check_deepgemm_head.py
+@@ -38,7 +38,7 @@
+     x = torch.randn(2, 129, 256, device="cuda", requires_grad=True)
+     with torch.autocast("cuda", dtype=torch.bfloat16):
+         out = layer(x)
+-    assert out.shape == (2, 129, 512) and out.dtype == torch.bfloat16
++    assert out.shape == (2, 129, 512) and out.dtype == torch.float32
+     grad = torch.randn_like(out) * .01
+     loss = (out.float() * grad.float()).sum() + embedding(tokens).sum()
+     loss.backward()
+@@ -46,7 +46,7 @@
+     x_matrix = x.detach().reshape(-1, 256)
+     grad_matrix = grad.reshape(-1, 512)
+     quantized_weight = quantized_reference(weight, 128)
+-    expected_out = (quantized_reference(x_matrix, 1) @ quantized_weight.t()).bfloat16()
++    expected_out = quantized_reference(x_matrix, 1) @ quantized_weight.t()
+     expected_x_grad = (quantized_reference(grad_matrix, 1) @ quantized_weight).bfloat16().float()
+     expected_weight_grad = (quantized_reference(grad_matrix.t(), 1) @ quantized_reference(x_matrix.t(), 1).t()).bfloat16().float()
+     expected_weight_grad.index_add_(0, tokens, torch.ones(4, 256, device="cuda"))
+@@ -59,4 +59,4 @@
+ head.precision = "default"
+ with torch.autocast("cuda", dtype=torch.bfloat16):
+     torch.testing.assert_close(head(x), F.linear(x, weight), rtol=0, atol=0)
+-print("PASS: eager/compiled head, BF16 output, FP32 gradients, tied embeddings and default precision")
++print("PASS: eager/compiled head, FP32 output, BF16 backward GEMMs, FP32 gradients, tied embeddings and default precision")

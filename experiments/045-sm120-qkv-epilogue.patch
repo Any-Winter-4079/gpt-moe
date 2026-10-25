@@ -1,0 +1,780 @@
+diff --git a/model/attention/self_attention.py b/model/attention/self_attention.py
+--- a/model/attention/self_attention.py
++++ b/model/attention/self_attention.py
+@@ -11,6 +11,7 @@
+ from ..position.rotary import Rotary, apply_rotation
+ from ..linear.linear import Linear
+ from ..linear.attention_fp8 import project, quantize_weights
++from .qkv_sm120_epilogue import project_qkv_norm_rope
+ from .logit_softcapping import generate_tanh_softcap
+ 
+ if TYPE_CHECKING:
+@@ -141,7 +142,24 @@
+             x = x.to(dtype=self.q_proj.weight.dtype)
+ 
+         reuse_weights = self.training and torch.is_grad_enabled()
+-        if all(projection.precision == "fp8" for projection in (self.q_proj, self.k_proj, self.v_proj)):
++        fused_qkv = (
++            reuse_weights and torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.bfloat16
++            and self.use_qk_norm and self.rotary is not None
++            and self.n_kv_heads == self.n_heads and self.head_size == 64 and self.n_heads % 2 == 0
++            and self.rotary.cos_cached.dtype == torch.float32 and self.rotary.sin_cached.dtype == torch.float32
++            and self.q_scale.dtype == torch.float32 and self.k_scale.dtype == torch.float32
++            and all(projection.precision == "fp8" and projection.bias is None
++                    for projection in (self.q_proj, self.k_proj, self.v_proj))
++        )
++        if fused_qkv:
++            cos = self.rotary.cos_cached[..., :seq_len, :]
++            sin = self.rotary.sin_cached[..., :seq_len, :]
++            q, k, v = project_qkv_norm_rope(
++                x, [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], self.q_scale, self.k_scale,
++                cos, sin, self.qk_eps, self.qk_norm_type == "rms", self.qk_scale_min, self.qk_scale_max,
++                self.n_heads, self.prepared_qkv_weight,
++            )
++        elif all(projection.precision == "fp8" for projection in (self.q_proj, self.k_proj, self.v_proj)):
+             q, k, v = project(
+                 x, [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
+                 self.prepared_qkv_weight if reuse_weights else None,
+@@ -152,11 +170,12 @@
+                 v = v + self.v_proj.bias.to(v.dtype)
+         else:
+             q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+-        q = q.view(x.size(0), seq_len, self.n_heads, self.head_size).transpose(1, 2)
+-        k = k.view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
+-        v = v.view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
+-
+-        if self.rotary is not None:
++        if not fused_qkv:
++            q = q.view(x.size(0), seq_len, self.n_heads, self.head_size).transpose(1, 2)
++            k = k.view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
++            v = v.view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
++
++        if self.rotary is not None and not fused_qkv:
+             # apply RoPE
+             cos, sin = self.rotary.get_cos_sin(seq_len, q.dtype, q.device)
+             q, k = apply_rotation(q, k, cos, sin)
+@@ -166,7 +185,7 @@
+             k = k.unsqueeze(2).expand(x.size(0), self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(x.size(0), self.n_heads, seq_len, self.head_size)
+             v = v.unsqueeze(2).expand(x.size(0), self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(x.size(0), self.n_heads, seq_len, self.head_size)
+ 
+-        if self.use_qk_norm:
++        if self.use_qk_norm and not fused_qkv:
+             if self.qk_norm_type == "rms":
+                 # inverse RMS, ignoring epsilon in this derivation:
+                 # 1 / RMS(q) = 1 / sqrt(mean(q_i^2)) = 1 / (sqrt(1/head_size * sum(q_i^2))) =
+diff --git a/model/attention/qkv_sm120_epilogue.py b/model/attention/qkv_sm120_epilogue.py
+new file mode 100644
+--- /dev/null
++++ b/model/attention/qkv_sm120_epilogue.py
+@@ -0,0 +1,256 @@
++from __future__ import annotations
++
++from typing import List, Optional, Tuple
++
++import torch
++import triton
++import triton.language as tl
++from torch import Tensor
++from torch.library import custom_op, triton_op, wrap_triton
++
++from ..linear.attention_fp8 import _cuda_projection, _matmul, _quantize_activations, quantize_weights
++from ..linear.deepgemm import grouped_fp8_wgrad
++from ..linear.grouped_fp8 import _inverse_scale
++
++
++@triton.jit
++def _rotate(x, paired, cos, sin, feature, dtype: tl.constexpr, inverse: tl.constexpr):
++    first = (x * cos).to(dtype).to(tl.float32)
++    second = (paired * sin).to(dtype).to(tl.float32)
++    subtract = (feature % 2 == 1) if inverse else (feature % 2 == 0)
++    return (first + tl.where(subtract, -second, second)).to(dtype).to(tl.float32)
++
++
++@custom_op("gpt_moe::attention_sm120_qkv_epilogue", mutates_args=())
++def _forward_projection(
++    a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, q_scale: Tensor, k_scale: Tensor,
++    cos: Tensor, sin: Tensor, seq_len: int, heads: int, eps: float, rms: bool,
++    scale_min: float, scale_max: float,
++) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
++    batch = a.shape[0] // seq_len
++    raw = torch.empty((a.shape[0], b.shape[0]), device=a.device, dtype=torch.bfloat16)
++    q = torch.empty((batch, heads, seq_len, 64), device=a.device, dtype=torch.bfloat16)
++    k = torch.empty_like(q)
++    q_gain = torch.empty((batch, heads, seq_len), device=a.device, dtype=torch.float32)
++    k_gain = torch.empty_like(q_gain)
++    _cuda_projection().qkv_matmul(
++        a, b, a_scale, b_scale, raw, q, k, q_gain, k_gain, q_scale, k_scale, cos, sin,
++        seq_len, heads, eps, rms, scale_min, scale_max,
++    )
++    return raw, q, k, q_gain, k_gain
++
++
++@_forward_projection.register_fake
++def _forward_projection_fake(a, b, a_scale, b_scale, q_scale, k_scale, cos, sin, seq_len, heads,
++                             eps, rms, scale_min, scale_max):
++    batch = a.shape[0] // seq_len
++    raw = torch.empty((a.shape[0], b.shape[0]), device=a.device, dtype=torch.bfloat16)
++    q = torch.empty((batch, heads, seq_len, 64), device=a.device, dtype=torch.bfloat16)
++    k = torch.empty_like(q)
++    q_gain = torch.empty((batch, heads, seq_len), device=a.device, dtype=torch.float32)
++    k_gain = torch.empty_like(q_gain)
++    return raw, q, k, q_gain, k_gain
++
++
++
++
++
++
++@triton.jit
++def _backward_quantize_kernel(
++    Q, K, QScale, KScale, Cos, Sin, QGain, KGain, DQOut, DKOut, DVOut,
++    Row, RowScale, Column, ColumnScale, DScalePart,
++    M: tl.constexpr, T: tl.constexpr, H: tl.constexpr,
++    qb: tl.constexpr, qh: tl.constexpr, qt: tl.constexpr, qd: tl.constexpr,
++    kb: tl.constexpr, kh: tl.constexpr, kt: tl.constexpr, kd: tl.constexpr,
++    dqb: tl.constexpr, dqh: tl.constexpr, dqt: tl.constexpr, dqd: tl.constexpr,
++    dkb: tl.constexpr, dkh: tl.constexpr, dkt: tl.constexpr, dkd: tl.constexpr,
++    dvb: tl.constexpr, dvh: tl.constexpr, dvt: tl.constexpr, dvd: tl.constexpr,
++    ct: tl.constexpr, cd: tl.constexpr, st: tl.constexpr, sd: tl.constexpr,
++    RMS: tl.constexpr, SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
++    MIN_INF: tl.constexpr, MAX_INF: tl.constexpr,
++):
++    scale_min: tl.constexpr = SCALE_MIN if MIN_INF == 0 else (float("-inf") if MIN_INF < 0 else float("inf"))
++    scale_max: tl.constexpr = SCALE_MAX if MAX_INF == 0 else (float("-inf") if MAX_INF < 0 else float("inf"))
++    tile = tl.program_id(0)
++    block = tl.program_id(1)
++    row = tile * 128 + tl.arange(0, 128)
++    token = row % T
++    batch = row // T
++    feature = tl.arange(0, 128)
++    projection_block = block % (H // 2)
++    head = projection_block * 2 + feature // 64
++    dim = feature % 64
++    valid = row[:, None] < M
++    dtype: tl.constexpr = Q.dtype.element_ty
++    if block < H:
++        head_pair = projection_block * 2 + tl.arange(0, 2)
++        if block < H // 2:
++            source = Q + batch[:, None] * qb + head[None, :] * qh + token[:, None] * qt
++            x = tl.load(source + dim[None, :] * qd, valid, 0.0).to(tl.float32)
++            scale = tl.load(QScale + head).to(tl.float32)
++            head_gain = tl.load(QGain + (batch[:, None] * H + head_pair[None, :]) * T + token[:, None], valid, 0.0).to(tl.float32)
++            grad = tl.load(DQOut + batch[:, None] * dqb + head[None, :] * dqh + token[:, None] * dqt + dim[None, :] * dqd, valid, 0.0).to(tl.float32)
++            scale_head = head_pair
++        else:
++            source = K + batch[:, None] * kb + head[None, :] * kh + token[:, None] * kt
++            x = tl.load(source + dim[None, :] * kd, valid, 0.0).to(tl.float32)
++            scale = tl.load(KScale + head).to(tl.float32)
++            head_gain = tl.load(KGain + (batch[:, None] * H + head_pair[None, :]) * T + token[:, None], valid, 0.0).to(tl.float32)
++            grad = tl.load(DKOut + batch[:, None] * dkb + head[None, :] * dkh + token[:, None] * dkt + dim[None, :] * dkd, valid, 0.0).to(tl.float32)
++            scale_head = H + head_pair
++        gain = tl.broadcast_to(head_gain[:, :, None].to(dtype).to(tl.float32), (128, 2, 64)).reshape(128, 128)
++        pair_index = tl.broadcast_to(feature[None, :] ^ 1, (128, 128))
++        paired = tl.gather(x, pair_index, axis=1)
++        cos = tl.load(Cos + token[:, None] * ct + (dim[None, :] // 2) * cd, valid, 0.0).to(dtype).to(tl.float32)
++        sin = tl.load(Sin + token[:, None] * st + (dim[None, :] // 2) * sd, valid, 0.0).to(dtype).to(tl.float32)
++        rotated = _rotate(x, paired, cos, sin, dim[None, :], dtype, False)
++        normalized = (rotated * gain).to(dtype).to(tl.float32)
++        scale_part = (grad * normalized).to(dtype).to(tl.float32).reshape(128, 2, 64)
++        partial = tl.sum(tl.sum(scale_part, axis=2), axis=0)
++        tl.store(DScalePart + scale_head * tl.cdiv(M, 128) + tile, partial)
++        scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, scale_min), scale_max)).to(dtype).to(tl.float32)
++        grad = (grad * scale[None, :]).to(dtype).to(tl.float32)
++        grad_gain = tl.sum((grad * rotated).to(dtype).to(tl.float32).reshape(128, 2, 64), axis=2).to(dtype).to(tl.float32)
++        # rsqrt backward consumes the unrounded FP32 gain
++        cube = (head_gain * head_gain) * head_gain
++        grad_statistic = (grad_gain * -0.5) * cube
++        if RMS:
++            grad_statistic /= 64
++        direct = (grad * gain).to(dtype).to(tl.float32)
++        indirect = (grad_statistic[:, :, None] * (2.0 * rotated).reshape(128, 2, 64)).to(dtype).to(tl.float32)
++        grad_rotated = (direct + indirect.reshape(128, 128)).to(dtype).to(tl.float32)
++        paired_grad = tl.gather(grad_rotated, pair_index, axis=1)
++        # reload the small rotary tables after the norm derivative to shorten register lifetimes
++        cos = tl.load(Cos + token[:, None] * ct + (dim[None, :] // 2) * cd, valid, 0.0).to(dtype).to(tl.float32)
++        sin = tl.load(Sin + token[:, None] * st + (dim[None, :] // 2) * sd, valid, 0.0).to(dtype).to(tl.float32)
++        values = _rotate(grad_rotated, paired_grad, cos, sin, dim[None, :], dtype, True)
++    else:
++        values = tl.load(DVOut + batch[:, None] * dvb + head[None, :] * dvh + token[:, None] * dvt + dim[None, :] * dvd, valid, 0.0).to(tl.float32)
++    values = tl.where(valid, values, 0.0)
++    width: tl.constexpr = 3 * H * 64
++    packed_col = block * 128 + feature
++    row_scale = _inverse_scale(tl.max(tl.abs(values), axis=1))
++    tl.store(Row + row[:, None] * width + packed_col[None, :], (values / row_scale[:, None]).to(tl.float8e4nv), valid)
++    row_scale_ptr = RowScale + (tile * (width // 128) + block) * 512 + (feature % 32) * 16 + (feature // 32) * 4
++    row_exponent = (row_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++    for group in tl.static_range(4):
++        tl.store(row_scale_ptr + group, tl.where(row < M, row_exponent, 0))
++    column_scale = _inverse_scale(tl.max(tl.abs(values), axis=0))
++    column_m: tl.constexpr = tl.cdiv(M, 128) * 128
++    tl.store(Column + packed_col[None, :] * column_m + row[:, None], (values / column_scale[None, :]).to(tl.float8e4nv))
++    scale_ptr = ColumnScale.to(tl.pointer_type(tl.uint8)) + ((tile // 4) * width + packed_col) * 4
++    exponent = (column_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++    tl.store(scale_ptr + tile % 4, exponent)
++    if tile == tl.cdiv(M, 128) - 1:
++        for padding in tl.static_range(1, 4):
++            tl.store(scale_ptr + tile % 4 + padding, 0, tile % 4 + padding < 4)
++
++
++@triton.jit
++def _scale_backward_kernel(
++    Partials, QScale, KScale, DQScale, DKScale, Q,
++    H: tl.constexpr, TILES: tl.constexpr, SCALE_MIN: tl.constexpr, SCALE_MAX: tl.constexpr,
++    MIN_INF: tl.constexpr, MAX_INF: tl.constexpr, BLOCK: tl.constexpr,
++):
++    scale_min: tl.constexpr = SCALE_MIN if MIN_INF == 0 else (float("-inf") if MIN_INF < 0 else float("inf"))
++    scale_max: tl.constexpr = SCALE_MAX if MAX_INF == 0 else (float("-inf") if MAX_INF < 0 else float("inf"))
++    head = tl.program_id(0)
++    tile = tl.arange(0, BLOCK)
++    partial = tl.load(Partials + head * TILES + tile, tile < TILES, 0.0)
++    grad = tl.sum(partial, axis=0).to(Q.dtype.element_ty).to(tl.float32)
++    if head < H:
++        scale = tl.load(QScale + head).to(tl.float32)
++        tl.store(DQScale + head, tl.where((scale >= scale_min) & (scale <= scale_max), grad, 0.0))
++    else:
++        head -= H
++        scale = tl.load(KScale + head).to(tl.float32)
++        tl.store(DKScale + head, tl.where((scale >= scale_min) & (scale <= scale_max), grad, 0.0))
++
++
++@triton_op("gpt_moe::attention_sm120_qkv_epilogue_backward_quantize", mutates_args=())
++def _backward_quantize(
++    q: Tensor, k: Tensor, q_scale: Tensor, k_scale: Tensor, cos: Tensor, sin: Tensor,
++    q_gain: Tensor, k_gain: Tensor, grad_q: Tensor, grad_k: Tensor, grad_v: Tensor,
++    rms: bool, scale_min: float, scale_max: float,
++) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
++    batch, heads, seq_len, _ = q.shape
++    m, width = batch * seq_len, 3 * heads * 64
++    row = torch.empty((m, width), device=q.device, dtype=torch.float8_e4m3fn)
++    row_scale = torch.empty((triton.cdiv(m, 128) * 128 * (width // 32),), device=q.device, dtype=torch.uint8)
++    column = torch.empty((width, triton.cdiv(m, 128) * 128), device=q.device, dtype=row.dtype)
++    column_scale = torch.empty((triton.cdiv(m, 512), width), device=q.device, dtype=torch.int32)
++    tiles = triton.cdiv(m, 128)
++    partials = torch.empty((2 * heads, tiles), device=q.device, dtype=torch.float32)
++    dq_scale = torch.empty_like(q_scale)
++    dk_scale = torch.empty_like(k_scale)
++    min_inf = (scale_min == float("inf")) - (scale_min == float("-inf"))
++    max_inf = (scale_max == float("inf")) - (scale_max == float("-inf"))
++    wrap_triton(_backward_quantize_kernel)[(tiles, width // 128)](
++        q, k, q_scale, k_scale, cos, sin, q_gain, k_gain, grad_q, grad_k, grad_v,
++        row, row_scale, column, column_scale, partials, m, seq_len, heads,
++        *q.stride(), *k.stride(), *grad_q.stride(), *grad_k.stride(), *grad_v.stride(),
++        *cos.stride()[-2:], *sin.stride()[-2:], rms,
++        0.0 if min_inf else scale_min, 0.0 if max_inf else scale_max, min_inf, max_inf,
++        num_warps=8, enable_fp_fusion=False,
++    )
++    wrap_triton(_scale_backward_kernel)[(2 * heads,)](
++        partials, q_scale, k_scale, dq_scale, dk_scale, q,
++        heads, tiles, 0.0 if min_inf else scale_min, 0.0 if max_inf else scale_max,
++        min_inf, max_inf, triton.next_power_of_2(tiles), num_warps=4,
++    )
++    return row, row_scale, column, column_scale, dq_scale, dk_scale
++
++
++class _QKVProjection(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, q_scale, k_scale, cos, sin, eps, rms, scale_min, scale_max, heads,
++                weight, weight_scale, transposed, transposed_scale, *weights):
++        inputs = x.reshape(-1, x.shape[-1])
++        row, row_scale, column, column_scale = _quantize_activations([inputs], True)
++        out, q_out, k_out, q_gain, k_gain = _forward_projection(
++            row, weight, row_scale, weight_scale, q_scale, k_scale, cos, sin,
++            x.shape[1], heads, eps, rms, scale_min, scale_max,
++        )
++        width = heads * 64
++        q, k, v = [out[:, start:start + width].view(x.shape[0], x.shape[1], heads, 64).transpose(1, 2)
++                   for start in (0, width, 2 * width)]
++        ctx.save_for_backward(column, column_scale, transposed, transposed_scale, q, k,
++                              q_scale, k_scale, cos, sin, q_gain, k_gain)
++        ctx.input_shape = x.shape
++        ctx.input_dtype = x.dtype
++        ctx.weight_dtype = weights[0].dtype
++        ctx.rms = rms
++        ctx.scale_min = scale_min
++        ctx.scale_max = scale_max
++        ctx.set_materialize_grads(False)
++        return q_out, k_out, v
++
++    @staticmethod
++    def backward(ctx, grad_q, grad_k, grad_v):
++        x_column, x_scale, transposed, transposed_scale, q, k, q_scale, k_scale, cos, sin, q_gain, k_gain = ctx.saved_tensors
++        gradients = [grad if grad is not None else torch.zeros(q.shape, device=q.device, dtype=q.dtype)
++                     for grad in (grad_q, grad_k, grad_v)]
++        row, row_scale, column, column_scale, dq_scale, dk_scale = _backward_quantize(
++            q, k, q_scale, k_scale, cos, sin, q_gain, k_gain, *gradients,
++            ctx.rms, ctx.scale_min, ctx.scale_max,
++        )
++        grad_x = _matmul(row, transposed, row_scale, transposed_scale, ctx.input_dtype)
++        offsets = torch.full((1,), row.shape[0], device=q.device, dtype=torch.int32)
++        grad_weight = grouped_fp8_wgrad(column, column_scale, x_column, x_scale, offsets, ctx.weight_dtype)[0]
++        width = q.shape[1] * 64
++        weight_grads = [grad_weight[start:start + width, :ctx.input_shape[-1]] for start in (0, width, 2 * width)]
++        return (grad_x[:, :ctx.input_shape[-1]].reshape(ctx.input_shape), dq_scale, dk_scale,
++                None, None, None, None, None, None, None, None, None, None, None, *weight_grads)
++
++
++def project_qkv_norm_rope(
++    x: Tensor, weights: List[Tensor], q_scale: Tensor, k_scale: Tensor, cos: Tensor, sin: Tensor,
++    eps: float, rms: bool, scale_min: float, scale_max: float, heads: int,
++    prepared_weight: Optional[Tuple[Tensor, Tensor, Tensor, Tensor]] = None,
++) -> Tuple[Tensor, Tensor, Tensor]:
++    if prepared_weight is None:
++        with torch.no_grad():
++            prepared_weight = quantize_weights(weights)
++    return _QKVProjection.apply(x, q_scale, k_scale, cos, sin, eps, rms, scale_min, scale_max, heads,
++                                *prepared_weight, *weights)
+diff --git a/model/linear/attention_sm120.cu b/model/linear/attention_sm120.cu
+--- a/model/linear/attention_sm120.cu
++++ b/model/linear/attention_sm120.cu
+@@ -45,6 +45,7 @@
+ #include "cutlass/gemm/collective/collective_builder.hpp"
+ #include "cutlass/gemm/device/gemm_universal_adapter.h"
+ #include "cutlass/gemm/kernel/gemm_universal.hpp"
++#include "attention_qkv_epilogue.cuh"
+ 
+ static_assert(CUTLASS_MAJOR == 4 && CUTLASS_MINOR == 8 && CUTLASS_PATCH == 1,
+               "this experiment requires CUTLASS 4.8.1");
+@@ -68,6 +69,28 @@
+     >::CollectiveOp;
+     // one producer warpgroup feeds TMA buffers while two warpgroups consume them
+     // reserve epilogue space before selecting the number of shared-memory stages
++    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
++        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
++        Element, Layout, 16, Element, cutlass::layout::ColumnMajor, 16,
++        float, Tile, Cluster,
++        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
++        cutlass::gemm::KernelTmaWarpSpecializedCooperative
++    >::CollectiveOp;
++    using Kernel = cutlass::gemm::kernel::GemmUniversal<
++        Shape<int, int, int, int>, Mainloop, Epilogue
++    >;
++    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
++    static_assert(Mainloop::DispatchPolicy::Stages >= 2, "at least two TMA stages are required");
++    static_assert(Kernel::SharedStorageSize <= 101376, "SM120 shared-memory budget exceeded");
++};
++
++struct QKVProjection {
++    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
++        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
++        Tile, Cluster, Shape<_64, _64>,
++        float, float, void, Layout, 8, cutlass::bfloat16_t, Layout, 8,
++        cutlass::epilogue::collective::EpilogueScheduleAuto, QKVEpilogue
++    >::CollectiveOp;
+     using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+         cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+         Element, Layout, 16, Element, cutlass::layout::ColumnMajor, 16,
+@@ -158,8 +181,96 @@
+     }
+ }
+ 
++void qkv_matmul(const at::Tensor& a, const at::Tensor& b, const at::Tensor& a_scale,
++                const at::Tensor& b_scale, at::Tensor raw, at::Tensor q, at::Tensor k,
++                at::Tensor q_gain, at::Tensor k_gain, const at::Tensor& q_scale,
++                const at::Tensor& k_scale, const at::Tensor& cos, const at::Tensor& sin,
++                int seq_len, int heads, float eps, bool rms, float scale_min, float scale_max) {
++    TORCH_CHECK(a.is_cuda() && b.device() == a.device() && raw.device() == a.device()
++                && a_scale.device() == a.device() && b_scale.device() == a.device()
++                && q.device() == a.device() && k.device() == a.device()
++                && q_gain.device() == a.device() && k_gain.device() == a.device()
++                && q_scale.device() == a.device() && k_scale.device() == a.device()
++                && cos.device() == a.device() && sin.device() == a.device(),
++                "QKV epilogue operands must be on the same GPU");
++    TORCH_CHECK(heads > 0 && heads % 2 == 0 && seq_len > 0 && a.size(0) % seq_len == 0
++                && a.dim() == 2 && b.dim() == 2 && a.size(1) == b.size(1)
++                && b.size(0) == 3 * heads * 64 && a.size(1) % 128 == 0,
++                "QKV epilogue requires even head count, head64 and packed QKV weights");
++    TORCH_CHECK(a.scalar_type() == at::kFloat8_e4m3fn && b.scalar_type() == at::kFloat8_e4m3fn
++                && a_scale.scalar_type() == at::kByte && b_scale.scalar_type() == at::kByte
++                && raw.scalar_type() == at::kBFloat16 && q.scalar_type() == at::kBFloat16
++                && k.scalar_type() == at::kBFloat16 && q_gain.scalar_type() == at::kFloat
++                && k_gain.scalar_type() == at::kFloat && q_scale.scalar_type() == at::kFloat
++                && k_scale.scalar_type() == at::kFloat && cos.scalar_type() == at::kFloat
++                && sin.scalar_type() == at::kFloat,
++                "invalid QKV epilogue operand dtype");
++    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && a_scale.is_contiguous() && b_scale.is_contiguous()
++                && raw.is_contiguous() && q.is_contiguous() && k.is_contiguous()
++                && q_gain.is_contiguous() && k_gain.is_contiguous() && q_scale.is_contiguous()
++                && k_scale.is_contiguous(),
++                "QKV epilogue operands must be contiguous");
++    TORCH_CHECK(raw.dim() == 2 && raw.size(0) == a.size(0) && raw.size(1) == b.size(0)
++                && q.numel() == a.size(0) * heads * 64 && k.sizes() == q.sizes()
++                && q_gain.numel() == a.size(0) * heads && k_gain.numel() == q_gain.numel()
++                && q_scale.numel() == heads && k_scale.numel() == heads
++                && cos.dim() >= 2 && sin.dim() >= 2 && cos.size(-2) >= seq_len && sin.size(-2) >= seq_len
++                && cos.size(-1) == 32 && sin.size(-1) == 32,
++                "invalid QKV epilogue output or rotary shapes");
++    c10::cuda::CUDAGuard guard(a.device());
++    const auto* properties = at::cuda::getDeviceProperties(a.get_device());
++    TORCH_CHECK(properties->major == 12 && properties->minor == 0, "QKV epilogue requires SM120");
++    using Config = QKVProjection;
++    using Kernel = Config::Kernel;
++    using Gemm = Config::Gemm;
++    int m = a.size(0), n = b.size(0), inner = a.size(1);
++    Kernel::StrideA stride_a{};
++    Kernel::StrideB stride_b{};
++    Kernel::StrideC stride_c{};
++    Kernel::StrideD stride_d{};
++    get<0>(stride_a) = inner;
++    get<0>(stride_b) = inner;
++    get<0>(stride_c) = n;
++    get<0>(stride_d) = n;
++    auto shape = make_shape(m, n, inner, 1);
++    using ScaleConfig = Config::Mainloop::Sm1xxBlkScaledConfig;
++    auto layout_a = ScaleConfig::tile_atom_to_shape_SFA(shape);
++    auto layout_b = ScaleConfig::tile_atom_to_shape_SFB(shape);
++    TORCH_CHECK(a_scale.numel() == cosize(layout_a) && b_scale.numel() == cosize(layout_b),
++                "invalid QKV epilogue scale storage size");
++    QKVEpilogue::Arguments epilogue{
++        reinterpret_cast<cutlass::bfloat16_t*>(q.data_ptr()),
++        reinterpret_cast<cutlass::bfloat16_t*>(k.data_ptr()),
++        q_gain.data_ptr<float>(), k_gain.data_ptr<float>(),
++        q_scale.data_ptr<float>(), k_scale.data_ptr<float>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
++        cos.stride(-2), cos.stride(-1), sin.stride(-2), sin.stride(-1),
++        heads, seq_len, eps, scale_min, scale_max, rms,
++    };
++    Gemm::Arguments arguments{
++        cutlass::gemm::GemmUniversalMode::kGemm, shape,
++        {
++            reinterpret_cast<const cutlass::float_e4m3_t*>(a.data_ptr()), stride_a,
++            reinterpret_cast<const cutlass::float_e4m3_t*>(b.data_ptr()), stride_b,
++            reinterpret_cast<const cutlass::float_ue8m0_t*>(a_scale.data_ptr()), layout_a,
++            reinterpret_cast<const cutlass::float_ue8m0_t*>(b_scale.data_ptr()), layout_b,
++        },
++        {epilogue, nullptr, stride_c, reinterpret_cast<cutlass::bfloat16_t*>(raw.data_ptr()), stride_d},
++    };
++    arguments.hw_info.device_id = a.get_device();
++    arguments.hw_info.sm_count = properties->multiProcessorCount;
++    Gemm gemm;
++    auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
++    check_status(gemm.can_implement(arguments), "QKV epilogue can_implement");
++    auto workspace = at::empty(
++        {static_cast<int64_t>(Gemm::get_workspace_size(arguments))}, a.options().dtype(at::kByte));
++    check_status(gemm.initialize(arguments, workspace.data_ptr(), stream), "QKV epilogue initialize");
++    check_status(gemm.run(stream), "QKV epilogue run");
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ }  // namespace
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+     module.def("matmul", &matmul);
+-}
++    module.def("qkv_matmul", &qkv_matmul);
++}
+diff --git a/model/linear/attention_qkv_epilogue.cuh b/model/linear/attention_qkv_epilogue.cuh
+new file mode 100644
+--- /dev/null
++++ b/model/linear/attention_qkv_epilogue.cuh
+@@ -0,0 +1,221 @@
++/*
++ * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ * list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#pragma once
++
++#include "cute/tensor.hpp"
++#include "cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp"
++
++// use the native SM120 SFVec64 reduction topology from CUTLASS 4.8.1
++// raw BF16 QKV stays in D for backward; normalized Q/K is stored from registers
++struct QKVEpilogue {
++    using BF16 = cutlass::bfloat16_t;
++    struct SharedStorage {
++        alignas(16) float partial[64];
++    };
++    struct Arguments {
++        BF16* q = nullptr;
++        BF16* k = nullptr;
++        float* q_gain = nullptr;
++        float* k_gain = nullptr;
++        const float* q_scale = nullptr;
++        const float* k_scale = nullptr;
++        const float* cos = nullptr;
++        const float* sin = nullptr;
++        int64_t cos_t = 0;
++        int64_t cos_d = 0;
++        int64_t sin_t = 0;
++        int64_t sin_d = 0;
++        int heads = 0;
++        int seq_len = 0;
++        float eps = 0;
++        float scale_min = 0;
++        float scale_max = 0;
++        bool rms = false;
++    };
++    using Params = Arguments;
++    const Params* params = nullptr;
++    float* partial = nullptr;
++
++    template <class Shape>
++    static Params to_underlying_arguments(const Shape&, const Arguments& args, void*) {
++        return args;
++    }
++    template <class Shape>
++    static bool can_implement(const Shape& shape, const Arguments& args) {
++        return cute::get<1>(shape) == 3 * args.heads * 64 && args.heads % 2 == 0
++            && args.seq_len > 0 && cute::get<0>(shape) % args.seq_len == 0;
++    }
++    template <class Shape>
++    static size_t get_workspace_size(const Shape&, const Arguments&) {
++        return 0;
++    }
++    template <class Shape>
++    static cutlass::Status initialize_workspace(const Shape&, const Arguments&, void*, cudaStream_t,
++                                               cutlass::CudaHostAdapter* = nullptr) {
++        return cutlass::Status::kSuccess;
++    }
++    CUTLASS_HOST_DEVICE QKVEpilogue() = default;
++    CUTLASS_HOST_DEVICE QKVEpilogue(const Params& args, const SharedStorage& storage)
++        : params(&args), partial(const_cast<float*>(storage.partial)) {}
++    CUTLASS_DEVICE bool is_producer_load_needed() const { return false; }
++    CUTLASS_DEVICE bool is_C_load_needed() const { return false; }
++    template <class... Args>
++    CUTLASS_DEVICE auto get_producer_load_callbacks(
++        const cutlass::epilogue::fusion::detail::ProducerLoadArgs<Args...>&) {
++        return cutlass::epilogue::fusion::detail::EmptyProducerLoadCallbacks{};
++    }
++
++    template <class Coords>
++    struct Consumer : cutlass::epilogue::fusion::detail::EmptyConsumerStoreCallbacks {
++        Coords coords;
++        const Params* params;
++        float* partial;
++        int thread;
++        int m;
++
++        CUTLASS_DEVICE Consumer(Coords&& coords_, const Params* params_, float* partial_, int thread_, int m_)
++            : coords(cute::move(coords_)), params(params_), partial(partial_), thread(thread_), m(m_) {}
++
++        CUTLASS_DEVICE static float bf16(float value) {
++            return float(cutlass::NumericConverter<BF16, float>{}(value));
++        }
++
++        template <class Accumulator, int Fragment>
++        CUTLASS_DEVICE auto visit(const cutlass::Array<Accumulator, Fragment>& acc, int, int, int) {
++            static_assert(Fragment == 4, "QKV epilogue requires native SM120 four-element fragments");
++            cutlass::Array<float, 4> result;
++            CUTLASS_PRAGMA_UNROLL
++            for (int i = 0; i < 4; ++i) result[i] = bf16(acc[i]);
++            return result;
++        }
++
++        template <class Smem, class Sync, class Values>
++        CUTLASS_DEVICE void reduce(Smem&&, const Sync&, int epi_m, int epi_n, bool, Values raw) {
++            using namespace cute;
++            static_assert(decltype(size<0>(raw))::value == 1);
++            static_assert(decltype(size<0>(coords))::value == 4);
++            static_assert(decltype(size<2>(raw))::value == 2,
++                          "the reduction must contain one complete 64-feature head");
++            int global_head = get<1>(coords(0, 0, 0, epi_m, epi_n)) / 64;
++            if (global_head >= 2 * params->heads) return;
++            bool is_q = global_head < params->heads;
++            int head = global_head % params->heads;
++            float learned = is_q ? params->q_scale[head] : params->k_scale[head];
++            learned = learned < params->scale_min ? params->scale_min : learned;
++            learned = learned > params->scale_max ? params->scale_max : learned;
++            learned = bf16(learned);
++            auto output = is_q ? params->q : params->k;
++            auto gains = is_q ? params->q_gain : params->k_gain;
++            int warp = thread / 32;
++            int quad = thread % 32 / 4;
++            int lane = thread % 4;
++            auto sync = []() {
++                cutlass::arch::NamedBarrier::sync(
++                    256, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
++            };
++            Tensor rotated = make_tensor_like(raw);
++            CUTLASS_PRAGMA_UNROLL
++            for (int row = 0; row < size<1>(raw); ++row) {
++                CUTLASS_PRAGMA_UNROLL
++                for (int fragment = 0; fragment < size<2>(raw); ++fragment) {
++                    CUTLASS_PRAGMA_UNROLL
++                    for (int pair = 0; pair < 2; ++pair) {
++                        int i = 2 * pair;
++                        auto position = coords(i, row, fragment, epi_m, epi_n);
++                        int token = get<0>(position) % params->seq_len;
++                        int feature = get<1>(position) % 64;
++                        float cosine = bf16(params->cos[token * params->cos_t + feature / 2 * params->cos_d]);
++                        float sine = bf16(params->sin[token * params->sin_t + feature / 2 * params->sin_d]);
++                        auto source = raw(0, row, fragment);
++                        rotated(0, row, fragment)[i] = bf16(__fsub_rn(
++                            bf16(__fmul_rn(source[i], cosine)), bf16(__fmul_rn(source[i + 1], sine))));
++                        rotated(0, row, fragment)[i + 1] = bf16(__fadd_rn(
++                            bf16(__fmul_rn(source[i], sine)), bf16(__fmul_rn(source[i + 1], cosine))));
++                    }
++                }
++                CUTLASS_PRAGMA_UNROLL
++                for (int pair_row = 0; pair_row < 2; ++pair_row) {
++                    int i = 2 * pair_row;
++                    float sum = 0.f;
++                    CUTLASS_PRAGMA_UNROLL
++                    for (int fragment = 0; fragment < size<2>(raw); ++fragment) {
++                        auto values = rotated(0, row, fragment);
++                        sum = __fadd_rn(sum, __fmul_rn(values[i], values[i]));
++                        sum = __fadd_rn(sum, __fmul_rn(values[i + 1], values[i + 1]));
++                    }
++                    sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, 1));
++                    sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, 2));
++                    if (lane == 0) partial[warp * 8 + quad] = sum;
++                    sync();
++                    int first_warp = warp % 2;
++                    sum = __fadd_rn(partial[first_warp * 8 + quad], partial[(first_warp + 2) * 8 + quad]);
++                    sum = __fadd_rn(sum, partial[(first_warp + 4) * 8 + quad]);
++                    sum = __fadd_rn(sum, partial[(first_warp + 6) * 8 + quad]);
++                    sync();
++                    float statistic = params->rms ? sum * (1.f / 64.f) : sum;
++                    float gain = rsqrtf(__fadd_rn(statistic, params->eps));
++                    float rounded_gain = bf16(gain);
++                    auto position = coords(i, row, 0, epi_m, epi_n);
++                    int global_row = get<0>(position);
++                    int batch = global_row / params->seq_len;
++                    int token = global_row % params->seq_len;
++                    int64_t row_offset = (int64_t(batch) * params->heads + head) * params->seq_len + token;
++                    if (global_row < m) {
++                        if (lane == 0 && warp < 2) gains[row_offset] = gain;
++                        CUTLASS_PRAGMA_UNROLL
++                        for (int fragment = 0; fragment < size<2>(raw); ++fragment) {
++                            int col = get<1>(coords(i, row, fragment, epi_m, epi_n)) % 64;
++                            auto values = rotated(0, row, fragment);
++                            BF16 first = cutlass::NumericConverter<BF16, float>{}(
++                                __fmul_rn(bf16(__fmul_rn(values[i], rounded_gain)), learned));
++                            BF16 second = cutlass::NumericConverter<BF16, float>{}(
++                                __fmul_rn(bf16(__fmul_rn(values[i + 1], rounded_gain)), learned));
++                            output[row_offset * 64 + col] = first;
++                            output[row_offset * 64 + col + 1] = second;
++                        }
++                    }
++                }
++            }
++        }
++    };
++
++    template <bool ReferenceSrc, class... Args>
++    CUTLASS_DEVICE auto get_consumer_store_callbacks(
++        const cutlass::epilogue::fusion::detail::ConsumerStoreArgs<Args...>& args) {
++        using namespace cute;
++        static_assert(decltype(size(args.tiled_copy))::value == 256);
++        auto [m, n, k, l] = args.problem_shape_mnkl;
++        auto identity = make_identity_tensor(make_shape(m, n, l));
++        auto coords = cutlass::epilogue::fusion::detail::sm90_partition_for_epilogue<ReferenceSrc>(
++            identity, args.tile_shape_mnk, args.tile_coord_mnkl, args.epi_tile, args.tiled_copy, args.thread_idx);
++        return Consumer<decltype(coords)>(cute::move(coords), params, partial, args.thread_idx, m);
++    }
++};
+diff --git a/experiments/check_qkv_sm120_epilogue.py b/experiments/check_qkv_sm120_epilogue.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/check_qkv_sm120_epilogue.py
+@@ -0,0 +1,86 @@
++from pathlib import Path
++import sys
++
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from model.attention.qkv_sm120_epilogue import _forward_projection, project_qkv_norm_rope
++from model.linear.attention_fp8 import _matmul, _quantize_activations, project, quantize_weights
++from model.position.rotary import apply_rotation
++
++
++def reference(x, weights, q_scale, k_scale, cos, sin, eps, rms, minimum, maximum, heads, prepared):
++    q, k, v = [value.view(x.shape[0], x.shape[1], heads, 64).transpose(1, 2)
++               for value in project(x, weights, prepared)]
++    q, k = apply_rotation(q, k, cos.to(q.dtype), sin.to(k.dtype))
++    q_statistic = q.pow(2).mean(-1, keepdim=True) if rms else q.pow(2).sum(-1, keepdim=True)
++    k_statistic = k.pow(2).mean(-1, keepdim=True) if rms else k.pow(2).sum(-1, keepdim=True)
++    q = q * torch.rsqrt(q_statistic + eps).to(q.dtype) * q_scale.clamp(minimum, maximum).to(q.dtype)
++    k = k * torch.rsqrt(k_statistic + eps).to(k.dtype) * k_scale.clamp(minimum, maximum).to(k.dtype)
++    return q, k, v
++
++
++def check(actual, expected, label):
++    assert actual.shape == expected.shape and actual.dtype == expected.dtype
++    assert torch.isfinite(actual).all(), label
++    error = (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-12)
++    print(f"{label}: relative L2={error.item():.8f}")
++    assert error < .015, (label, error.item())
++
++
++torch.manual_seed(2026)
++torch.set_float32_matmul_precision("highest")
++assert torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0), "this correctness check requires SM120"
++
++for label, operation in (("eager", project_qkv_norm_rope), ("compiled", torch.compile(project_qkv_norm_rope, fullgraph=True))):
++    for dtype in (torch.float32, torch.bfloat16):
++        for cached in (False, True):
++            for rms in (False, True):
++                for batch, length, heads, width in ((1, 17, 2, 128), (2, 129, 4, 129)):
++                    torch.compiler.reset()
++                    x = torch.randn(batch, length, width * 2, device="cuda", dtype=dtype)[:, :, ::2].requires_grad_()
++                    weights = [torch.nn.Parameter(torch.randn(heads * 64, width, device="cuda") * .03) for _ in range(3)]
++                    q_scale = torch.nn.Parameter(torch.tensor([-.75, -.5, 1.5, 1.75][:heads], device="cuda").view(1, heads, 1, 1))
++                    k_scale = torch.nn.Parameter(torch.tensor([1.75, 1.5, -.5, -.75][:heads], device="cuda").view(1, heads, 1, 1))
++                    angle = torch.randn(1, 1, length * 2, 32, device="cuda")
++                    cos, sin = angle.cos()[..., ::2, :], angle.sin()[..., ::2, :]
++                    prepared = quantize_weights(weights) if cached else None
++                    args = (x, weights, q_scale, k_scale, cos, sin, 1e-6, rms, -.5, 1.5, heads, prepared)
++                    with torch.no_grad():
++                        packed = prepared if prepared is not None else quantize_weights(weights)
++                        row, row_scale, _, _ = _quantize_activations([x.detach().reshape(-1, width)], False)
++                        raw, processed_q, processed_k, q_gain, k_gain = _forward_projection(
++                            row, packed[0], row_scale, packed[1], q_scale, k_scale, cos, sin,
++                            length, heads, 1e-6, rms, -.5, 1.5,
++                        )
++                        raw_reference = _matmul(row, packed[0], row_scale, packed[1], torch.bfloat16)
++                        torch.testing.assert_close(raw, raw_reference, rtol=0, atol=0)
++                        raw_q, raw_k = [raw[:, start:start + heads * 64].view(batch, length, heads, 64).transpose(1, 2)
++                                        for start in (0, heads * 64)]
++                        rotated_q, rotated_k = apply_rotation(raw_q, raw_k, cos.bfloat16(), sin.bfloat16())
++                        for value, scale, gain, processed in ((rotated_q, q_scale, q_gain, processed_q),
++                                                              (rotated_k, k_scale, k_gain, processed_k)):
++                            square = value.float().pow(2)
++                            statistic = square.mean(-1) if rms else square.sum(-1)
++                            expected_gain = torch.rsqrt(statistic + 1e-6)
++                            torch.testing.assert_close(gain, expected_gain, rtol=1e-6, atol=1e-6)
++                            check(processed, value * expected_gain.bfloat16()[..., None]
++                                  * scale.clamp(-.5, 1.5).bfloat16(), f"{label} epilogue direct output")
++                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
++                        actual = operation(*args)
++                        expected = reference(*args)
++                    gradients = [torch.randn_like(value) * .01 for value in actual]
++                    parameters = [x, *weights, q_scale, k_scale]
++                    for output, target in zip(actual, expected):
++                        check(output, target, f"{label} cached={cached} rms={rms} output")
++                    for selected in ((0, 1, 2), (0,)):
++                        actual_grads = torch.autograd.grad([actual[i] for i in selected], parameters,
++                                                           [gradients[i] for i in selected], allow_unused=True, retain_graph=True)
++                        expected_grads = torch.autograd.grad([expected[i] for i in selected], parameters,
++                                                             [gradients[i] for i in selected], allow_unused=True, retain_graph=True)
++                        for name, source, gradient, target in zip(("input", "q weight", "k weight", "v weight", "q scale", "k scale"), parameters, actual_grads, expected_grads):
++                            gradient = torch.zeros_like(source) if gradient is None else gradient
++                            target = torch.zeros_like(source) if target is None else target
++                            check(gradient, target, f"{label} cached={cached} rms={rms} {name}")
++
++print("PASS: SM120 QKV GEMM epilogue raw output, processed Q/K and gains, FP8 backward operands, all parameter gradients, cache reuse and eager/fullgraph compilation")

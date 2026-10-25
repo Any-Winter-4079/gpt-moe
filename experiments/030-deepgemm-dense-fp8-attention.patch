@@ -1,0 +1,338 @@
+diff --git a/model/linear/attention_fp8.py b/model/linear/attention_fp8.py
+--- a/model/linear/attention_fp8.py
++++ b/model/linear/attention_fp8.py
+@@ -1,12 +1,12 @@
+ from __future__ import annotations
+ 
+-from typing import Any, List, Optional, Tuple
++from typing import List, Optional, Tuple
+ 
+ import torch
+ import triton
+ import triton.language as tl
+ from torch import Tensor
+-from torch.library import triton_op, wrap_triton
++from torch.library import custom_op, triton_op, wrap_triton
+ 
+ from .deepgemm import grouped_fp8_wgrad
+ from .grouped_fp8 import _inverse_scale
+@@ -14,7 +14,7 @@
+ 
+ @triton.jit
+ def _quantize_weights_kernel(
+-    W0, W1, W2, Quantized, Scale,
++    W0, W1, W2, Quantized, Scale, Transposed, TransposedScale,
+     N0: tl.constexpr, N1: tl.constexpr, N2: tl.constexpr, K: tl.constexpr,
+     s0n: tl.constexpr, s0k: tl.constexpr, s1n: tl.constexpr, s1k: tl.constexpr,
+     s2n: tl.constexpr, s2k: tl.constexpr,
+@@ -37,24 +37,42 @@
+     scale = _inverse_scale(tl.max(tl.max(tl.abs(values), axis=1), axis=0))
+     quantized = (values / scale).to(tl.float8e4nv)
+     packed_row = block * 128 + tl.arange(0, 128)
+-    tl.store(Quantized + packed_row[:, None] * (tl.cdiv(K, 128) * 128) + col[None, :], quantized)
+-    tl.store(Scale + block * tl.cdiv(K, 128) + tl.program_id(1), scale)
++    n: tl.constexpr = (tl.cdiv(N0, 128) + tl.cdiv(N1, 128) + tl.cdiv(N2, 128)) * 128
++    k: tl.constexpr = tl.cdiv(K, 128) * 128
++    tl.store(Quantized + packed_row[:, None] * k + col[None, :], quantized)
++    tl.store(Transposed + col[None, :] * n + packed_row[:, None], quantized)
++    exponent = (scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++    k_block = tl.program_id(1)
++    scale_ptr = Scale.to(tl.pointer_type(tl.uint8)) + ((k_block // 4) * n + packed_row) * 4
++    transposed_ptr = TransposedScale.to(tl.pointer_type(tl.uint8)) + ((block // 4) * k + col) * 4
++    tl.store(scale_ptr + k_block % 4, exponent)
++    tl.store(transposed_ptr + block % 4, exponent)
++    for padding in tl.static_range(1, 4):
++        if k_block == k // 128 - 1:
++            tl.store(scale_ptr + k_block % 4 + padding, 0, k_block % 4 + padding < 4)
++        if block == n // 128 - 1:
++            tl.store(transposed_ptr + block % 4 + padding, 0, block % 4 + padding < 4)
+ 
+ 
+ @triton_op("gpt_moe::attention_quantize_weights", mutates_args=())
+-def quantize_weights(weights: List[Tensor]) -> Tuple[Tensor, Tensor]:
++def quantize_weights(weights: List[Tensor]) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     widths = [weight.shape[0] for weight in weights]
+     # keep 128-element scale blocks within each original projection
+     n = sum(triton.cdiv(width, 128) * 128 for width in widths)
+     k = weights[0].shape[1]
+-    quantized = torch.empty((n, triton.cdiv(k, 128) * 128), device=weights[0].device, dtype=torch.float8_e4m3fn)
+-    scale = torch.empty((n // 128, triton.cdiv(k, 128)), device=weights[0].device, dtype=torch.float32)
++    padded_k = triton.cdiv(k, 128) * 128
++    quantized = torch.empty((n, padded_k), device=weights[0].device, dtype=torch.float8_e4m3fn)
++    transposed = torch.empty((padded_k, n), device=weights[0].device, dtype=quantized.dtype)
++    # native dense GEMMs read MN-major scales with four UE8M0 bytes per int32
++    scale = torch.empty((triton.cdiv(k, 512), n), device=weights[0].device, dtype=torch.int32).t()
++    transposed_scale = torch.empty((triton.cdiv(n, 512), padded_k), device=weights[0].device, dtype=torch.int32).t()
+     w0, w1, w2 = weights if len(weights) == 3 else (weights[0], weights[0], weights[0])
+     n0, n1, n2 = widths if len(weights) == 3 else (widths[0], 0, 0)
+     wrap_triton(_quantize_weights_kernel)[(n // 128, triton.cdiv(k, 128))](
+-        w0, w1, w2, quantized, scale, n0, n1, n2, k, *w0.stride(), *w1.stride(), *w2.stride(), num_warps=8,
++        w0, w1, w2, quantized, scale, transposed, transposed_scale,
++        n0, n1, n2, k, *w0.stride(), *w1.stride(), *w2.stride(), num_warps=8,
+     )
+-    return quantized, scale
++    return quantized, scale, transposed, transposed_scale
+ 
+ 
+ @triton.jit
+@@ -84,7 +102,13 @@
+     packed_col = block * 128 + tl.arange(0, 128)
+     row_scale = _inverse_scale(tl.max(tl.abs(values), axis=1))
+     tl.store(Row + row[:, None] * K + packed_col[None, :], (values / row_scale[:, None]).to(tl.float8e4nv), row[:, None] < M)
+-    tl.store(RowScale + row * (K // 128) + block, row_scale, row < M)
++    scale_m: tl.constexpr = tl.cdiv(M, 4) * 4
++    row_scale_ptr = RowScale.to(tl.pointer_type(tl.uint8)) + ((block // 4) * scale_m + row) * 4
++    row_exponent = (row_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++    tl.store(row_scale_ptr + block % 4, tl.where(row < M, row_exponent, 0), row < scale_m)
++    if block == K // 128 - 1:
++        for padding in tl.static_range(1, 4):
++            tl.store(row_scale_ptr + block % 4 + padding, 0, (row < scale_m) & (block % 4 + padding < 4))
+     if SAVE_COLUMN:
+         column_scale = _inverse_scale(tl.max(tl.abs(values), axis=0))
+         column_m: tl.constexpr = tl.cdiv(M, 128) * 128
+@@ -97,12 +121,13 @@
+                 tl.store(scale_ptr + tile % 4 + padding, 0, tile % 4 + padding < 4)
+ 
+ 
++@triton_op("gpt_moe::attention_dg_quantize_activations", mutates_args=())
+ def _quantize_activations(inputs: List[Tensor], save_column: bool) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     m = inputs[0].shape[0]
+     widths = [value.shape[1] for value in inputs]
+     k = sum(triton.cdiv(width, 128) * 128 for width in widths)
+     row = torch.empty((m, k), device=inputs[0].device, dtype=torch.float8_e4m3fn)
+-    row_scale = torch.empty((m, k // 128), device=inputs[0].device, dtype=torch.float32)
++    row_scale = torch.empty((triton.cdiv(k, 512), triton.cdiv(m, 4) * 4), device=row.device, dtype=torch.int32)[:, :m].t()
+     column = torch.empty((k, triton.cdiv(m, 128) * 128) if save_column else (0,), device=row.device, dtype=row.dtype)
+     column_scale = torch.empty((triton.cdiv(m, 512), k) if save_column else (0,), device=row.device, dtype=torch.int32)
+     x0, x1, x2 = inputs if len(inputs) == 3 else (inputs[0], inputs[0], inputs[0])
+@@ -114,159 +139,73 @@
+     return row, row_scale, column, column_scale
+ 
+ 
+-@triton.autotune(
+-    configs=[
+-        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_stages=3, num_warps=warps)
+-        for bm, bn in ((64, 64), (64, 128), (128, 64), (128, 128))
+-        for warps in (4, 8)
+-    ],
+-    key=["M", "N", "K", "N0", "N1", "N2", "a_stride_m", "a_stride_k", "b_stride_k", "b_stride_n"],
+-)
+-@triton.jit
+-def _matmul_kernel(
+-    A, B, AScale, BScale, C0, C1, C2,
+-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+-    N0: tl.constexpr, N1: tl.constexpr, N2: tl.constexpr,
+-    a_stride_m: tl.constexpr, a_stride_k: tl.constexpr, b_stride_k: tl.constexpr, b_stride_n: tl.constexpr,
+-    as_stride_m: tl.constexpr, as_stride_k: tl.constexpr, bs_stride_k: tl.constexpr, bs_stride_n: tl.constexpr,
+-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+-):
+-    pid = tl.program_id(0)
+-    tiles_m, tiles_n = tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N)
+-    group = pid // (8 * tiles_n)
+-    first_m = group * 8
+-    group_m = tl.minimum(tiles_m - first_m, 8)
+-    local = pid % (8 * tiles_n)
+-    tile_m, tile_n = first_m + local % group_m, local // group_m
+-    row = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    col = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    inner = tl.arange(0, 128)
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+-    for block in range(tl.cdiv(K, 128)):
+-        k = block * 128 + inner
+-        a = tl.load(A + row[:, None] * a_stride_m + k[None, :] * a_stride_k,
+-                    (row[:, None] < M) & (k[None, :] < K), 0.0)
+-        b = tl.load(B + k[:, None] * b_stride_k + col[None, :] * b_stride_n,
+-                    (k[:, None] < K) & (col[None, :] < N), 0.0)
+-        a_scale = tl.load(AScale + row * as_stride_m + block * as_stride_k, row < M, 0)
+-        b_scale = tl.load(BScale + block * bs_stride_k + (col // 128) * bs_stride_n, col < N, 0)
+-        a_exponent = (a_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+-        b_exponent = (b_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+-        acc = tl.dot_scaled(a, tl.broadcast_to(a_exponent[:, None], (BLOCK_M, 4)), "e4m3",
+-                            b, tl.broadcast_to(b_exponent[:, None], (BLOCK_N, 4)), "e4m3", acc)
+-    # store Q/K/V separately without a concatenated bf16 intermediate
+-    if N1 == 0:
+-        tl.store(C0 + row[:, None] * N0 + col[None, :], acc, (row[:, None] < M) & (col[None, :] < N0))
+-    elif tile_n * BLOCK_N < tl.cdiv(N0, 128) * 128:
+-        tl.store(C0 + row[:, None] * N0 + col[None, :], acc, (row[:, None] < M) & (col[None, :] < N0))
+-    elif tile_n * BLOCK_N < (tl.cdiv(N0, 128) + tl.cdiv(N1, 128)) * 128:
+-        col -= tl.cdiv(N0, 128) * 128
+-        tl.store(C1 + row[:, None] * N1 + col[None, :], acc, (row[:, None] < M) & (col[None, :] < N1))
+-    else:
+-        col -= (tl.cdiv(N0, 128) + tl.cdiv(N1, 128)) * 128
+-        tl.store(C2 + row[:, None] * N2 + col[None, :], acc, (row[:, None] < M) & (col[None, :] < N2))
+-
+-
+-def _matmul(a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, widths: List[int], dtype: torch.dtype) -> List[Tensor]:
++@custom_op("gpt_moe::attention_deepgemm_mm", mutates_args=())
++def _matmul(a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, dtype: torch.dtype) -> Tensor:
++    import deep_gemm
++
+     if torch.cuda.get_device_capability(a.device) != (12, 0):
+-        raise ValueError("native scaled FP8 attention projections require SM120")
+-    m, k = a.shape
+-    n = b.shape[1]
+-    outputs = [torch.empty((m, width), device=a.device, dtype=dtype) for width in widths]
+-    c0, c1, c2 = outputs if len(outputs) == 3 else (outputs[0], outputs[0], outputs[0])
+-    n0, n1, n2 = widths if len(widths) == 3 else (widths[0], 0, 0)
+-    wrap_triton(_matmul_kernel)[lambda meta: (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),)](
+-        a, b, a_scale, b_scale, c0, c1, c2, m, n, k, n0, n1, n2,
+-        *a.stride(), *b.stride(), *a_scale.stride(), *b_scale.stride(),
+-    )
+-    return outputs
+-
+-
+-@triton_op("gpt_moe::attention_qkv_forward", mutates_args=())
+-def _qkv_forward(
+-    x: Tensor, weights: List[Tensor], weight: Tensor, weight_scale: Tensor, save_backward: bool,
+-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+-    row, row_scale, column, column_scale = _quantize_activations([x], save_backward)
+-    q, k, v = _matmul(row, weight.t(), row_scale, weight_scale.t(), [value.shape[0] for value in weights], torch.bfloat16)
+-    return q, k, v, column, column_scale
+-
+-
+-@triton_op("gpt_moe::attention_linear_forward", mutates_args=())
+-def _linear_forward(
+-    x: Tensor, weights: List[Tensor], weight: Tensor, weight_scale: Tensor, save_backward: bool,
+-) -> Tuple[Tensor, Tensor, Tensor]:
+-    row, row_scale, column, column_scale = _quantize_activations([x], save_backward)
+-    out = _matmul(row, weight.t(), row_scale, weight_scale.t(), [weights[0].shape[0]], torch.bfloat16)[0]
+-    return out, column, column_scale
+-
+-
+-@triton_op("gpt_moe::attention_backward", mutates_args=())
+-def _backward_gemms(
+-    grad_q: Tensor, grad_k: Tensor, grad_v: Tensor, x_column: Tensor, x_scale: Tensor,
+-    weight: Tensor, weight_scale: Tensor, input_dtype: torch.dtype, weight_dtype: torch.dtype, qkv: bool,
+-) -> Tuple[Tensor, Tensor]:
+-    gradients = [grad_q, grad_k, grad_v] if qkv else [grad_q]
+-    row, row_scale, column, column_scale = _quantize_activations(gradients, True)
+-    grad_x = _matmul(row, weight, row_scale, weight_scale, [x_column.shape[0]], input_dtype)[0]
+-    offsets = torch.full((1,), grad_q.shape[0], device=grad_q.device, dtype=torch.int32)
+-    grad_weight = grouped_fp8_wgrad(column, column_scale, x_column, x_scale, offsets, weight_dtype)
+-    return grad_x, grad_weight[0]
+-
+-
+-def _save_context(ctx: Any, inputs: Tuple, output: Tuple, outputs: int) -> None:
+-    x, weights, weight, weight_scale, _ = inputs
+-    ctx.input_dtype = x.dtype
+-    ctx.weight_dtype = weights[0].dtype
+-    ctx.widths = [value.shape[0] for value in weights]
+-    ctx.tokens = x.shape[0]
+-    ctx.input_width = x.shape[1]
+-    ctx.set_materialize_grads(False)
+-    ctx.mark_non_differentiable(*output[outputs:])
+-    ctx.save_for_backward(*output[outputs:], weight, weight_scale)
+-
+-
+-def _setup_qkv_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
+-    _save_context(ctx, inputs, output, 3)
+-
+-
+-def _setup_linear_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
+-    _save_context(ctx, inputs, output, 1)
+-
+-
+-def _qkv_backward(ctx: Any, grad_q: Optional[Tensor], grad_k: Optional[Tensor], grad_v: Optional[Tensor], *unused: Tensor) -> Tuple:
+-    x_column, x_scale, weight, weight_scale = ctx.saved_tensors
+-    grads = [
+-        grad if grad is not None else torch.zeros((ctx.tokens, width), device=weight.device, dtype=torch.bfloat16)
+-        for grad, width in zip((grad_q, grad_k, grad_v), ctx.widths)
+-    ]
+-    grad_x, grad_weight = _backward_gemms(*grads, x_column, x_scale, weight, weight_scale, ctx.input_dtype, ctx.weight_dtype, True)
+-    weight_grads, start = [], 0
+-    for width in ctx.widths:
+-        weight_grads.append(grad_weight[start:start + width, :ctx.input_width])
+-        start += triton.cdiv(width, 128) * 128
+-    return grad_x[:, :ctx.input_width], weight_grads, None, None, None
+-
+-
+-def _linear_backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
+-    x_column, x_scale, weight, weight_scale = ctx.saved_tensors
+-    grad_x, grad_weight = _backward_gemms(grad, grad, grad, x_column, x_scale, weight, weight_scale, ctx.input_dtype, ctx.weight_dtype, False)
+-    return grad_x[:, :ctx.input_width], [grad_weight[:ctx.widths[0], :ctx.input_width]], None, None, None
+-
+-
+-_qkv_forward.register_autograd(_qkv_backward, setup_context=_setup_qkv_context)
+-_linear_forward.register_autograd(_linear_backward, setup_context=_setup_linear_context)
++        raise ValueError("DeepGEMM FP8 attention projections require SM120")
++    out = torch.empty((a.shape[0], b.shape[0]), device=a.device, dtype=dtype)
++    deep_gemm.fp8_gemm_nt((a, a_scale), (b, b_scale), out, recipe=(1, 1, 128), disable_ue8m0_cast=True)
++    return out
++
++
++@_matmul.register_fake
++def _matmul_fake(a, b, a_scale, b_scale, dtype):
++    return torch.empty((a.shape[0], b.shape[0]), device=a.device, dtype=dtype)
++
++
++class _Projection(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, weight, weight_scale, transposed, transposed_scale, *weights):
++        row, row_scale, column, column_scale = _quantize_activations([x], True)
++        out = _matmul(row, weight, row_scale, weight_scale, torch.bfloat16)
++        ctx.save_for_backward(column, column_scale, transposed, transposed_scale)
++        ctx.tokens = x.shape[0]
++        ctx.input_width = x.shape[1]
++        ctx.input_dtype = x.dtype
++        ctx.weight_dtype = weights[0].dtype
++        ctx.widths = [value.shape[0] for value in weights]
++        ctx.set_materialize_grads(False)
++        # return views here so backward receives Q/K/V gradients without a bf16 concatenation
++        outputs, start = [], 0
++        for width in ctx.widths:
++            outputs.append(out[:, start:start + width])
++            start += triton.cdiv(width, 128) * 128
++        return tuple(outputs)
++
++    @staticmethod
++    def backward(ctx, *gradients):
++        x_column, x_scale, transposed, transposed_scale = ctx.saved_tensors
++        gradients = [
++            grad if grad is not None else torch.zeros((ctx.tokens, width), device=transposed.device, dtype=torch.bfloat16)
++            for grad, width in zip(gradients, ctx.widths)
++        ]
++        row, row_scale, column, column_scale = _quantize_activations(gradients, True)
++        grad_x = _matmul(row, transposed, row_scale, transposed_scale, ctx.input_dtype)
++        offsets = torch.full((1,), gradients[0].shape[0], device=transposed.device, dtype=torch.int32)
++        grad_weight = grouped_fp8_wgrad(column, column_scale, x_column, x_scale, offsets, ctx.weight_dtype)[0]
++        weight_grads, start = [], 0
++        for width in ctx.widths:
++            weight_grads.append(grad_weight[start:start + width, :ctx.input_width])
++            start += triton.cdiv(width, 128) * 128
++        return (grad_x[:, :ctx.input_width], None, None, None, None, *weight_grads)
+ 
+ 
+ def project(
+-    x: Tensor, weights: List[Tensor], prepared_weight: Optional[Tuple[Tensor, Tensor]] = None,
++    x: Tensor, weights: List[Tensor], prepared_weight: Optional[Tuple[Tensor, Tensor, Tensor, Tensor]] = None,
+ ) -> List[Tensor]:
+     if prepared_weight is None:
+         with torch.no_grad():
+             prepared_weight = quantize_weights(weights)
+-    save_backward = torch.is_grad_enabled() and (x.requires_grad or any(weight.requires_grad for weight in weights))
+     inputs = x.reshape(-1, x.shape[-1])
+-    if len(weights) == 3:
+-        outputs = _qkv_forward(inputs, weights, *prepared_weight, save_backward)[:3]
++    if torch.is_grad_enabled() and (x.requires_grad or any(weight.requires_grad for weight in weights)):
++        outputs = _Projection.apply(inputs, *prepared_weight, *weights)
+     else:
+-        outputs = _linear_forward(inputs, weights, *prepared_weight, save_backward)[:1]
++        row, row_scale, _, _ = _quantize_activations([inputs], False)
++        out = _matmul(row, prepared_weight[0], row_scale, prepared_weight[1], torch.bfloat16)
++        outputs, start = [], 0
++        for weight in weights:
++            outputs.append(out[:, start:start + weight.shape[0]])
++            start += triton.cdiv(weight.shape[0], 128) * 128
+     return [value.reshape(*x.shape[:-1], weight.shape[0]) for value, weight in zip(outputs, weights)]
+diff --git a/experiments/check_attention.py b/experiments/check_attention.py
+--- a/experiments/check_attention.py
++++ b/experiments/check_attention.py
+@@ -45,7 +45,7 @@
+                     for batch in (4, 8):
+                         x = torch.randn(batch, width, 33, device="cuda", dtype=dtype).transpose(1, 2).requires_grad_()
+                         outputs = operation(x, weights, prepared)
+-                        assert all(value.is_contiguous() for value in outputs)
++                        assert all(value.stride(-1) == 1 for value in outputs)
+                         grads = [torch.randn_like(value) * .01 for value in outputs]
+                         torch.autograd.backward(outputs, grads)
+                         source = x.detach().reshape(-1, width)

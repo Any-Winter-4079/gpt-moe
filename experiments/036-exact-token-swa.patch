@@ -1,0 +1,54 @@
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -547,26 +547,14 @@
+                 return (num_valid_kv_blocks_per_q_block[:, None, :].contiguous(), 
+                         fully_valid_kv_indices[:, None, :].contiguous())
+ 
++            # classify the nearest and farthest token distances for exact SWA tiles
++            if apply_swa:
++                block_distance = (block_indices[:, None] - block_indices) * block_size
++                blockmask_any = blockmask_any & ((block_distance - block_size + 1).clamp_min(0) <= window_size)
++                blockmask_all = blockmask_all & (block_distance + block_size - 1 <= window_size)
++
+             num_only_partially_valid_kv_blocks, only_partial_kv_indices = map_to_ordered(blockmask_any & ~blockmask_all)
+             num_fully_valid_kv_blocks, fully_valid_kv_indices = map_to_ordered(blockmask_all)
+-
+-            # SWA window clamping (skipped for full attention layers)
+-            if apply_swa:
+-                # block-based window clamping makes the attended token count depend on the query position.
+-                # For block_size = 128 and window_size = 384, with two preceding full blocks available
+-                # and no doc or other attn masks, queries attend to 128 + 128 + (1 to 128) = 257 to 384 tokens.
+-                # Use tensor math: (window_size / block_size).ceil()
+-                window_size_blocks = (window_size.float() / block_size).ceil().to(torch.int32)
+-
+-                # is_causal → the diagonal block is partial.
+-                # Therefore, always exclude one full block per row to make room for the diagonal block (in other words,
+-                # start counting window_size from the diagonal to the left)
+-                clamped_num_fully_valid_kv_blocks = torch.clamp_max(num_fully_valid_kv_blocks, window_size_blocks - 1)
+-                clamped_num_only_partially_valid_kv_blocks = torch.clamp_max(num_only_partially_valid_kv_blocks,
+-                                                                            window_size_blocks - clamped_num_fully_valid_kv_blocks)
+-            else:
+-                clamped_num_fully_valid_kv_blocks = num_fully_valid_kv_blocks
+-                clamped_num_only_partially_valid_kv_blocks = num_only_partially_valid_kv_blocks
+             
+             # https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html
+             return BlockMask.from_kv_blocks(
+@@ -574,7 +562,7 @@
+                 # which KV tiles to visit for each query tile
+                 # -------------------------------------------------------------------------
+                 # kv_num_blocks (Tensor) – Number of kv_blocks in each Q_BLOCK_SIZE row tile
+-                clamped_num_only_partially_valid_kv_blocks,
++                num_only_partially_valid_kv_blocks,
+                 # kv_indices (Tensor) – Indices of key-value blocks in each Q_BLOCK_SIZE row tile
+                 only_partial_kv_indices,
+                 # -------------------------------------------------------------------------
+@@ -583,7 +571,7 @@
+                 # -------------------------------------------------------------------------
+                 # full_kv_num_blocks (Optional[Tensor]) – Number of full kv_blocks 
+                 # in each Q_BLOCK_SIZE row tile
+-                clamped_num_fully_valid_kv_blocks,
++                num_fully_valid_kv_blocks,
+                 # full_kv_indices (Optional[Tensor]) – Indices of full key-value blocks 
+                 # in each Q_BLOCK_SIZE row tile
+                 fully_valid_kv_indices,

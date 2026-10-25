@@ -1,0 +1,144 @@
+diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -717,6 +717,7 @@
+     seqlen_k_per_split: Optional[int] = None,
+     disable_scheduler_metadata: bool = False,
+     gather_bwd_recompute_p: bool = False,
++    window_size_tensor: Optional[torch.Tensor] = None,
+ ) -> Tuple[
+     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
+ ]:
+@@ -843,6 +844,17 @@
+         ), "inputs must be on CUDA device"
+     arch = _get_device_arch() if _arch is None else _arch
+     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
++    if window_size_tensor is not None:
++        assert arch // 10 == 12, "Device window is only implemented for SM120"
++        assert not causal, "Device window bounds encode causality; pass causal=False"
++        assert qv is None and score_mod is None and mask_mod is None and block_sparse_tensors is None
++        assert softcap is None or softcap == 0.0
++        assert aux_tensors is None and aux_scalars is None, "Device window owns the native kernel aux slot"
++        assert window_size_tensor.device == v.device and window_size_tensor.dtype == torch.int32
++        assert window_size_tensor.shape == (2,) and window_size_tensor.is_contiguous()
++        # left/right values are loaded on the device; these host placeholders only select local kernels
++        window_size_left = window_size_right = 0
++        aux_tensors = [window_size_tensor]
+     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
+     alignment = 16 // v.element_size()
+     if arch // 10 not in [8, 12]:
+@@ -1451,6 +1463,7 @@
+ 
+     compile_key = (
+         mla_1cta,
++        window_size_tensor is not None,
+         mla_1cta_kb64,
+         mla_1cta_s_ahead if mla_1cta else None,
+         dtype,
+@@ -1769,6 +1782,7 @@
+                 score_mod=score_mod,
+                 mask_mod=mask_mod,
+                 has_aux_tensors=aux_tensors is not None,
++                device_window=window_size_tensor is not None,
+             )
+         else:
+             raise ValueError(
+@@ -2281,11 +2295,22 @@
+     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+     dlse: Optional[torch.Tensor] = None,
+     learnable_sink: Optional[torch.Tensor] = None,
++    window_size_tensor: Optional[torch.Tensor] = None,
+ ) -> Tuple[torch.Tensor, ...]:
+     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+     fake_mode = is_fake_mode()
+     arch = _get_device_arch()
+     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
++    if window_size_tensor is not None:
++        assert arch // 10 == 12, "Device window is only implemented for SM120"
++        assert not causal, "Device window bounds encode causality; pass causal=False"
++        assert score_mod is None and score_mod_bwd is None and mask_mod is None and block_sparse_tensors is None
++        assert softcap == 0.0 and learnable_sink is None
++        assert aux_tensors is None and aux_scalars is None, "Device window owns the native kernel aux slot"
++        assert window_size_tensor.device == q.device and window_size_tensor.dtype == torch.int32
++        assert window_size_tensor.shape == (2,) and window_size_tensor.is_contiguous()
++        window_size_left = window_size_right = 0
++        aux_tensors = [window_size_tensor]
+     if block_sparse_tensors is not None:
+         assert (
+             cu_seqlens_q is None
+@@ -2786,6 +2811,7 @@
+     if arch // 10 in [8, 9, 12]:
+         compile_key = (
+             arch,
++            window_size_tensor is not None,
+             dtype,
+             head_dim,
+             head_dim_v,
+@@ -2923,6 +2949,7 @@
+                 V_in_regs=V_in_regs,
+                 score_mod=score_mod,
+                 score_mod_bwd=score_mod_bwd,
++                device_window=window_size_tensor is not None,
+             )
+         elif arch // 10 == 9:
+             fa_bwd_obj = FlashAttentionBackwardSm90(
+diff --git a/flash_attn/cute/flash_fwd.py b/flash_attn/cute/flash_fwd.py
+--- a/flash_attn/cute/flash_fwd.py
++++ b/flash_attn/cute/flash_fwd.py
+@@ -57,6 +57,7 @@
+         mask_mod: Optional[cutlass.Constexpr] = None,
+         has_aux_tensors: bool = False,
+         q_subtile_factor: int = 1,
++        device_window: bool = False,
+     ):
+         """Initializes the configuration for a flash attention kernel.
+ 
+@@ -90,6 +91,7 @@
+         self.qhead_per_kvhead = qhead_per_kvhead
+         self.is_causal = is_causal
+         self.is_local = is_local
++        self.device_window = device_window
+         self.pack_gqa = pack_gqa
+         self.tile_m = tile_m
+         self.tile_n = tile_n
+@@ -787,6 +789,10 @@
+         # Thread index, block index
+         tidx, _, _ = cute.arch.thread_idx()
+ 
++        if const_expr(self.device_window):
++            window_size_left = aux_data.tensors[0][0]
++            window_size_right = aux_data.tensors[0][1]
++
+         tile_scheduler = TileScheduler.create(tile_sched_params)
+         work_tile = tile_scheduler.initial_work_tile_info()
+ 
+diff --git a/flash_attn/cute/flash_bwd.py b/flash_attn/cute/flash_bwd.py
+--- a/flash_attn/cute/flash_bwd.py
++++ b/flash_attn/cute/flash_bwd.py
+@@ -52,6 +52,7 @@
+         V_in_regs: bool = False,
+         score_mod: cutlass.Constexpr | None = None,
+         score_mod_bwd: cutlass.Constexpr | None = None,
++        device_window: bool = False,
+     ):
+         """Initializes the configuration for a flash attention v2 kernel.
+ 
+@@ -86,6 +87,7 @@
+         self.pack_gqa = pack_gqa
+         self.is_causal = is_causal
+         self.is_local = is_local
++        self.device_window = device_window
+         self.num_stages_Q = num_stages_Q
+         self.num_stages_dO = num_stages_dO
+         self.SdP_swapAB = SdP_swapAB
+@@ -533,6 +535,10 @@
+         # Thread index, block index
+         tidx, _, _ = cute.arch.thread_idx()
+ 
++        if cutlass.const_expr(self.device_window):
++            window_size_left = aux_data.tensors[0][0]
++            window_size_right = aux_data.tensors[0][1]
++
+         tile_scheduler = TileScheduler.create(tile_sched_params)
+         work_tile = tile_scheduler.initial_work_tile_info()
+ 

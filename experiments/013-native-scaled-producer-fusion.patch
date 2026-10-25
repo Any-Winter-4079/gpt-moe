@@ -1,0 +1,68 @@
+diff --git a/model/linear/grouped_fp8.py b/model/linear/grouped_fp8.py
+index 636c243..0880a5e 100644
+--- a/model/linear/grouped_fp8.py
++++ b/model/linear/grouped_fp8.py
+@@ -111,8 +111,9 @@ def _quantize_weights_kernel(
+ 
+ @triton.autotune(
+     configs=[
+-        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_stages=3, num_warps=4)
++        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_stages=3, num_warps=warps)
+         for bm, bn in [(64, 64), (64, 128), (128, 64)]
++        for warps in (4, 8)
+     ],
+     key=["M", "N", "K", "NUM_EXPERTS", "GROUP_K", "RELU2_GRAD", "a_stride_m", "a_stride_k", "b_stride_k", "b_stride_n", "relu_stride_m", "relu_stride_n"],
+ )
+@@ -176,9 +177,12 @@ def _grouped_fp8_mm_kernel(
+                     BScale + bs_base + block * bs_stride_k + scale_col * bs_stride_n,
+                     mask=col < N, other=0.0,
+                 )
+-                # rescale each 128-term partial sum before accumulating in fp32
+-                partial = tl.dot(a, b, max_num_imprecise_acc=0)
+-                acc += partial * a_scale[:, None] * b_scale[None, :]
++                # retain 128-element scales while using four native 32-element scale groups
++                a_exponent = (a_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++                b_exponent = (b_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++                a_exponents = tl.broadcast_to(a_exponent[:, None], (BLOCK_M, 4))
++                b_exponents = tl.broadcast_to(b_exponent[:, None], (BLOCK_N, 4))
++                acc = tl.dot_scaled(a, a_exponents, "e4m3", b, b_exponents, "e4m3", acc)
+             if RELU2_GRAD:
+                 preactivation = tl.load(
+                     Relu2Input + (start + row[:, None]) * relu_stride_m + col[None, :] * relu_stride_n,
+@@ -224,6 +228,8 @@ def _grouped_fp8_mm(
+     a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, offsets: Tensor, dtype: torch.dtype,
+     relu2_input: Optional[Tensor] = None,
+ ) -> Tensor:
++    if torch.cuda.get_device_capability(a.device) != (12, 0):
++        raise ValueError("native scaled FP8 grouped projections require SM120")
+     group_k = b.ndim == 2
+     m, k = a.shape
+     n = b.shape[-1]
+diff --git a/model/linear/grouped_fp8_mlp.py b/model/linear/grouped_fp8_mlp.py
+index 0d026e4..572b746 100644
+--- a/model/linear/grouped_fp8_mlp.py
++++ b/model/linear/grouped_fp8_mlp.py
+@@ -50,8 +50,12 @@ def _up_relu2_quantize_kernel(
+                 weight_scale = tl.load(
+                     WeightScale + (expert * tl.cdiv(N, 128) + feature_tile) * tl.cdiv(K, 128) + block,
+                 )
+-                partial = tl.dot(a, weight, max_num_imprecise_acc=0)
+-                acc += partial * a_scale[:, None] * weight_scale
++                # each existing 128-element scale spans four native 32-element groups
++                a_exponent = (a_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++                weight_exponent = (weight_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++                a_exponents = tl.broadcast_to(a_exponent[:, None], (128, 4))
++                weight_exponents = tl.broadcast_to(weight_exponent, (128, 4))
++                acc = tl.dot_scaled(a, a_exponents, "e4m3", weight, weight_exponents, "e4m3", acc)
+             preactivation = acc.to(tl.bfloat16)
+             tl.store(Preactivation + token[:, None] * N + col[None, :], preactivation, mask=mask)
+ 
+@@ -180,6 +184,8 @@ _down_forward.register_autograd(_down_backward, setup_context=_setup_down_contex
+ def grouped_mlp_fp8_relu2(
+     x: Tensor, up_weight: Tensor, down_weight: Tensor, offsets: Tensor, wgrad_backend: str = "triton",
+ ) -> Tensor:
++    if torch.cuda.get_device_capability(x.device) != (12, 0):
++        raise ValueError("native block-scaled grouped FP8 MLP requires SM120")
+     if wgrad_backend not in ("triton", "deepgemm"):
+         raise ValueError(f"unsupported grouped FP8 weight-gradient backend: {wgrad_backend}")
+     save_backward = torch.is_grad_enabled() and (x.requires_grad or up_weight.requires_grad or down_weight.requires_grad)

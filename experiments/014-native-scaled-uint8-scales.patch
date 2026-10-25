@@ -1,0 +1,70 @@
+diff --git a/model/linear/grouped_fp8.py b/model/linear/grouped_fp8.py
+index b8c6835..138f445 100644
+--- a/model/linear/grouped_fp8.py
++++ b/model/linear/grouped_fp8.py
+@@ -45,7 +45,7 @@ def _quantize_activations_kernel(
+             tl.store(Row + (start + row[:, None]) * K + col[None, :], quantized, mask=mask)
+             tl.store(
+                 RowScale + (start + row) * tl.cdiv(K, 128) + tl.program_id(1),
+-                row_scale, mask=start + row < end,
++                (row_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8), mask=start + row < end,
+             )
+             if SAVE_COLUMN:
+                 # transpose quantization uses 128 tokens from the same expert per scale
+@@ -72,7 +72,8 @@ def _quantize_activations_kernel(
+                         Column + col[None, :] * M + start + row[:, None], quantized_column, mask=mask,
+                     )
+                     scale_row = start // 128 + expert + tile - first_tile
+-                    tl.store(ColumnScale + scale_row * K + col, column_scale, mask=col < K)
++                    exponent = (column_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++                    tl.store(ColumnScale + scale_row * K + col, exponent, mask=col < K)
+         if WRITE_OFFSETS:
+             if (tile == 0) & (tl.program_id(1) == 0):
+                 tl.store(PaddedOffsets + expert, first_tile * 128 + end - start)
+@@ -100,7 +101,7 @@ def _quantize_weights_kernel(
+     tl.store(Quantized + expert * N * K + row[:, None] * K + col[None, :], quantized, mask=mask)
+     tl.store(
+         Scale + (expert * tl.cdiv(N, 128) + tl.program_id(1)) * tl.cdiv(K, 128) + tl.program_id(2),
+-        scale,
++        (scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8),
+     )
+ 
+ 
+@@ -171,10 +172,8 @@ def _grouped_fp8_mm_kernel(
+                     mask=col < N, other=0.0,
+                 )
+                 # retain 128-element scales while using four native 32-element scale groups
+-                a_exponent = (a_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+-                b_exponent = (b_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+-                a_exponents = tl.broadcast_to(a_exponent[:, None], (BLOCK_M, 4))
+-                b_exponents = tl.broadcast_to(b_exponent[:, None], (BLOCK_N, 4))
++                a_exponents = tl.broadcast_to(a_scale[:, None], (BLOCK_M, 4))
++                b_exponents = tl.broadcast_to(b_scale[:, None], (BLOCK_N, 4))
+                 acc = tl.dot_scaled(a, a_exponents, "e4m3", b, b_exponents, "e4m3", acc)
+             tl.store(
+                 C + c_base + row[:, None] * N + col[None, :], acc,
+@@ -191,13 +190,13 @@ def _quantize_activations(
+     m, k = x.shape
+     scale_rows = triton.cdiv(m, 128) + offsets.numel()
+     row = torch.empty((m, k), device=x.device, dtype=torch.float8_e4m3fn)
+-    row_scale = torch.empty((m, triton.cdiv(k, 128)), device=x.device, dtype=torch.float32)
++    row_scale = torch.empty((m, triton.cdiv(k, 128)), device=x.device, dtype=torch.uint8)
+     column_m = scale_rows * 128 if deepgemm else m
+     column = torch.empty((k, column_m) if save_column else (0,), device=x.device, dtype=torch.float8_e4m3fn)
+     column_scale_rows = triton.cdiv(m, 512) + offsets.numel() if deepgemm else scale_rows
+     column_scale = torch.empty(
+         (column_scale_rows, k) if save_column else (0,), device=x.device,
+-        dtype=torch.int32 if deepgemm else torch.float32,
++        dtype=torch.int32 if deepgemm else torch.uint8,
+     )
+     padded_offsets = torch.empty(offsets.shape if write_offsets else (0,), device=x.device, dtype=torch.int32)
+     wrap_triton(_quantize_activations_kernel)[(scale_rows, triton.cdiv(k, 128))](
+@@ -232,7 +231,7 @@ def _forward(
+     row, row_scale, column, column_scale, _ = _quantize_activations(x, offsets, save_backward, deepgemm)
+     experts, n, k = weight.shape
+     weight_fp8 = torch.empty(weight.shape, device=weight.device, dtype=torch.float8_e4m3fn)
+-    weight_scale = torch.empty((experts, triton.cdiv(n, 128), triton.cdiv(k, 128)), device=weight.device, dtype=torch.float32)
++    weight_scale = torch.empty((experts, triton.cdiv(n, 128), triton.cdiv(k, 128)), device=weight.device, dtype=torch.uint8)
+     wrap_triton(_quantize_weights_kernel)[(experts, triton.cdiv(n, 128), triton.cdiv(k, 128))](
+         weight, weight_fp8, weight_scale, n, k, *weight.stride(), num_warps=8,
+     )

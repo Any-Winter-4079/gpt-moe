@@ -1,0 +1,93 @@
+diff --git a/model/linear/linear.py b/model/linear/linear.py
+--- a/model/linear/linear.py
++++ b/model/linear/linear.py
+@@ -6,6 +6,8 @@
+ from torch.nn import functional as F
+ import transformer_engine.pytorch as te
+ from transformer_engine.common.recipe import Float8BlockScaling, Format
++
++from .grouped_fp8 import grouped_linear_fp8_weights
+ 
+ 
+ class Linear(te.Linear):
+@@ -34,6 +36,12 @@
+ 
+     def forward(self, x: Tensor) -> Tensor:
+         if self.precision == "fp8":
++            if self.role in ("q_proj", "k_proj", "v_proj", "out_proj"):
++                inputs = x.reshape(-1, x.shape[-1])
++                offsets = torch.full((1,), inputs.shape[0], device=x.device, dtype=torch.int32)
++                out = grouped_linear_fp8_weights(inputs, [self.weight], offsets, "deepgemm")
++                out = out.reshape(*x.shape[:-1], self.weight.shape[0])
++                return out if self.bias is None else out + self.bias.to(out.dtype)
+             with te.autocast(enabled=True, recipe=self.fp8_recipe):
+                 return super().forward(x)
+         return F.linear(x, self.weight, self.bias)
+diff --git a/config/training.py b/config/training.py
+--- a/config/training.py
++++ b/config/training.py
+@@ -209,10 +209,10 @@
+     # default inherits the surrounding precision context; fp8 explicitly enables block scaling
+     linear_precision: Dict[str, Dict[str, str]] = field(default_factory=lambda: {
+         "training": {
+-            "q_proj": "default",
+-            "k_proj": "default",
+-            "v_proj": "default",
+-            "out_proj": "default",
++            "q_proj": "fp8",
++            "k_proj": "fp8",
++            "v_proj": "fp8",
++            "out_proj": "fp8",
+             "up_proj": "fp8",
+             "down_proj": "fp8",
+             "router": "default",
+diff --git a/experiments/check_grouped.py b/experiments/check_grouped.py
+--- a/experiments/check_grouped.py
++++ b/experiments/check_grouped.py
+@@ -9,6 +9,7 @@
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ from model.linear.grouped import grouped_linear
+ from model.linear import grouped_fp8
++from model.linear.linear import Linear
+ 
+ grouped_mlp_fp8_relu2 = None
+ if Path(grouped_fp8.__file__).with_name("grouped_fp8_mlp.py").is_file():
+@@ -260,4 +261,37 @@
+                 actual_mlp = run_mlp(operation(fused_mlp), x, weight, down_weight, offsets, mlp_grad, wgrad_backend)
+                 check(actual_mlp, expected_mlp, f"producer fused MLP {wgrad_backend} {suffix}", .001)
+ 
+-print("PASS: grouped BF16/FP8 outputs and gradients, available fusion paths, empty/ragged experts, noncontiguous inputs, eager and fullgraph compilation")
++for role, width, output_width in (("q_proj", 128, 256), ("k_proj", 128, 64), ("v_proj", 128, 64), ("out_proj", 256, 128)):
++    layer = Linear(width, output_width, role=role, bias=True).cuda()
++    layer.precision = "fp8"
++    torch.compiler.reset()
++    for label, operation in (("eager", lambda fn: fn), ("compiled", lambda fn: torch.compile(fn, fullgraph=True))):
++        projection = operation(layer)
++        for dtype in (torch.float32, torch.bfloat16):
++            layer.zero_grad(set_to_none=True)
++            expected_weight_grad = torch.zeros_like(layer.weight)
++            expected_bias_grad = torch.zeros_like(layer.bias)
++            for batch in (4, 8):
++                counts = [batch * 129]
++                x = torch.randn(batch, width, 129, device="cuda", dtype=dtype).transpose(1, 2).requires_grad_()
++                grad = torch.randn(batch, 129, output_width, device="cuda", dtype=torch.bfloat16) * .01
++                assert not x.is_contiguous()
++                with torch.autocast("cuda", dtype=torch.bfloat16):
++                    output = projection(x)
++                output.backward(grad)
++                assert output.dtype == torch.bfloat16 and x.grad.dtype == dtype
++                assert layer.weight.grad.dtype == layer.weight.dtype and layer.bias.grad.dtype == layer.bias.dtype
++                reference = fp8_reference(x.detach().reshape(-1, width), layer.weight.detach()[None], grad.reshape(-1, output_width), counts)
++                expected_output = reference[0] + layer.bias.detach().to(torch.bfloat16)
++                expected_weight_grad += reference[2][0].to(layer.weight.dtype)
++                expected_bias_grad += grad.sum((0, 1)).to(layer.bias.dtype)
++                actual = output.detach().reshape(-1, output_width), x.grad.reshape(-1, width), layer.weight.grad.detach()[None]
++                expected = expected_output, reference[1].to(dtype), expected_weight_grad[None]
++                check(actual, expected, f"attention {role} {label} {dtype} batch={batch}", .001)
++                torch.testing.assert_close(layer.bias.grad, expected_bias_grad, rtol=.01, atol=.001)
++            layer.precision = "default"
++            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
++                torch.testing.assert_close(projection(x), F.linear(x, layer.weight, layer.bias), rtol=0, atol=0)
++            layer.precision = "fp8"
++
++print("PASS: grouped BF16/FP8 and attention projection outputs and gradients, available fusion paths, empty/ragged experts, noncontiguous inputs, eager and fullgraph compilation")

@@ -1,0 +1,206 @@
+diff --git a/model/linear/attention_fp8.py b/model/linear/attention_fp8.py
+--- a/model/linear/attention_fp8.py
++++ b/model/linear/attention_fp8.py
+@@ -14,7 +14,7 @@
+ 
+ @triton.jit
+ def _quantize_weights_kernel(
+-    W0, W1, W2, Quantized, Scale, Transposed, TransposedScale,
++    W0, W1, W2, Quantized, Scale, BFloat,
+     N0: tl.constexpr, N1: tl.constexpr, N2: tl.constexpr, K: tl.constexpr,
+     s0n: tl.constexpr, s0k: tl.constexpr, s1n: tl.constexpr, s1k: tl.constexpr,
+     s2n: tl.constexpr, s2k: tl.constexpr,
+@@ -40,39 +40,34 @@
+     n: tl.constexpr = (tl.cdiv(N0, 128) + tl.cdiv(N1, 128) + tl.cdiv(N2, 128)) * 128
+     k: tl.constexpr = tl.cdiv(K, 128) * 128
+     tl.store(Quantized + packed_row[:, None] * k + col[None, :], quantized)
+-    tl.store(Transposed + col[None, :] * n + packed_row[:, None], quantized)
++    tl.store(BFloat + packed_row[:, None] * k + col[None, :], values.to(tl.bfloat16))
+     exponent = (scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+     k_block = tl.program_id(1)
+     scale_ptr = Scale.to(tl.pointer_type(tl.uint8)) + ((k_block // 4) * n + packed_row) * 4
+-    transposed_ptr = TransposedScale.to(tl.pointer_type(tl.uint8)) + ((block // 4) * k + col) * 4
+     tl.store(scale_ptr + k_block % 4, exponent)
+-    tl.store(transposed_ptr + block % 4, exponent)
+     for padding in tl.static_range(1, 4):
+         if k_block == k // 128 - 1:
+             tl.store(scale_ptr + k_block % 4 + padding, 0, k_block % 4 + padding < 4)
+-        if block == n // 128 - 1:
+-            tl.store(transposed_ptr + block % 4 + padding, 0, block % 4 + padding < 4)
+ 
+ 
+ @triton_op("gpt_moe::attention_quantize_weights", mutates_args=())
+-def quantize_weights(weights: List[Tensor]) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
++def quantize_weights(weights: List[Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+     widths = [weight.shape[0] for weight in weights]
+     # keep 128-element scale blocks within each original projection
+     n = sum(triton.cdiv(width, 128) * 128 for width in widths)
+     k = weights[0].shape[1]
+     padded_k = triton.cdiv(k, 128) * 128
+     quantized = torch.empty((n, padded_k), device=weights[0].device, dtype=torch.float8_e4m3fn)
+-    transposed = torch.empty((padded_k, n), device=weights[0].device, dtype=quantized.dtype)
++    bfloat_weight = torch.empty((n, padded_k), device=weights[0].device, dtype=torch.bfloat16)
+     # native dense GEMMs read MN-major scales with four UE8M0 bytes per int32
+     scale = torch.empty((triton.cdiv(k, 512), n), device=weights[0].device, dtype=torch.int32).t()
+-    transposed_scale = torch.empty((triton.cdiv(n, 512), padded_k), device=weights[0].device, dtype=torch.int32).t()
+     w0, w1, w2 = weights if len(weights) == 3 else (weights[0], weights[0], weights[0])
+     n0, n1, n2 = widths if len(weights) == 3 else (widths[0], 0, 0)
+     wrap_triton(_quantize_weights_kernel)[(n // 128, triton.cdiv(k, 128))](
+-        w0, w1, w2, quantized, scale, transposed, transposed_scale,
++        w0, w1, w2, quantized, scale, bfloat_weight,
+         n0, n1, n2, k, *w0.stride(), *w1.stride(), *w2.stride(), num_warps=8,
+     )
+-    return quantized, scale, transposed, transposed_scale
++    return quantized, scale, bfloat_weight
+ 
+ 
+ @triton.jit
+@@ -80,7 +75,7 @@
+     X0, X1, X2, Row, RowScale, Column, ColumnScale,
+     M: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, K2: tl.constexpr,
+     s0m: tl.constexpr, s0k: tl.constexpr, s1m: tl.constexpr, s1k: tl.constexpr,
+-    s2m: tl.constexpr, s2k: tl.constexpr, SAVE_COLUMN: tl.constexpr,
++    s2m: tl.constexpr, s2k: tl.constexpr, SAVE_COLUMN: tl.constexpr, BF16_ROW: tl.constexpr,
+ ):
+     tile = tl.program_id(0)
+     block = tl.program_id(1)
+@@ -100,15 +95,18 @@
+                          (row[:, None] < M) & (col[None, :] < K2), 0).to(tl.float32)
+     K: tl.constexpr = (tl.cdiv(K0, 128) + tl.cdiv(K1, 128) + tl.cdiv(K2, 128)) * 128
+     packed_col = block * 128 + tl.arange(0, 128)
+-    row_scale = _inverse_scale(tl.max(tl.abs(values), axis=1))
+-    tl.store(Row + row[:, None] * K + packed_col[None, :], (values / row_scale[:, None]).to(tl.float8e4nv), row[:, None] < M)
+-    scale_m: tl.constexpr = tl.cdiv(M, 4) * 4
+-    row_scale_ptr = RowScale.to(tl.pointer_type(tl.uint8)) + ((block // 4) * scale_m + row) * 4
+-    row_exponent = (row_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
+-    tl.store(row_scale_ptr + block % 4, tl.where(row < M, row_exponent, 0), row < scale_m)
+-    if block == K // 128 - 1:
+-        for padding in tl.static_range(1, 4):
+-            tl.store(row_scale_ptr + block % 4 + padding, 0, (row < scale_m) & (block % 4 + padding < 4))
++    if BF16_ROW:
++        tl.store(Row + row[:, None] * K + packed_col[None, :], values.to(tl.bfloat16), row[:, None] < M)
++    else:
++        row_scale = _inverse_scale(tl.max(tl.abs(values), axis=1))
++        tl.store(Row + row[:, None] * K + packed_col[None, :], (values / row_scale[:, None]).to(tl.float8e4nv), row[:, None] < M)
++        scale_m: tl.constexpr = tl.cdiv(M, 4) * 4
++        row_scale_ptr = RowScale.to(tl.pointer_type(tl.uint8)) + ((block // 4) * scale_m + row) * 4
++        row_exponent = (row_scale.to(tl.uint32, bitcast=True) >> 23).to(tl.uint8)
++        tl.store(row_scale_ptr + block % 4, tl.where(row < M, row_exponent, 0), row < scale_m)
++        if block == K // 128 - 1:
++            for padding in tl.static_range(1, 4):
++                tl.store(row_scale_ptr + block % 4 + padding, 0, (row < scale_m) & (block % 4 + padding < 4))
+     if SAVE_COLUMN:
+         column_scale = _inverse_scale(tl.max(tl.abs(values), axis=0))
+         column_m: tl.constexpr = tl.cdiv(M, 128) * 128
+@@ -122,19 +120,22 @@
+ 
+ 
+ @triton_op("gpt_moe::attention_dg_quantize_activations", mutates_args=())
+-def _quantize_activations(inputs: List[Tensor], save_column: bool) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
++def _quantize_activations(inputs: List[Tensor], save_column: bool, bf16_row: bool) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     m = inputs[0].shape[0]
+     widths = [value.shape[1] for value in inputs]
+     k = sum(triton.cdiv(width, 128) * 128 for width in widths)
+-    row = torch.empty((m, k), device=inputs[0].device, dtype=torch.float8_e4m3fn)
+-    row_scale = torch.empty((triton.cdiv(k, 512), triton.cdiv(m, 4) * 4), device=row.device, dtype=torch.int32)[:, :m].t()
+-    column = torch.empty((k, triton.cdiv(m, 128) * 128) if save_column else (0,), device=row.device, dtype=row.dtype)
++    row = torch.empty((m, k), device=inputs[0].device, dtype=torch.bfloat16 if bf16_row else torch.float8_e4m3fn)
++    if bf16_row:
++        row_scale = torch.empty((0,), device=row.device, dtype=torch.int32)
++    else:
++        row_scale = torch.empty((triton.cdiv(k, 512), triton.cdiv(m, 4) * 4), device=row.device, dtype=torch.int32)[:, :m].t()
++    column = torch.empty((k, triton.cdiv(m, 128) * 128) if save_column else (0,), device=row.device, dtype=torch.float8_e4m3fn)
+     column_scale = torch.empty((triton.cdiv(m, 512), k) if save_column else (0,), device=row.device, dtype=torch.int32)
+     x0, x1, x2 = inputs if len(inputs) == 3 else (inputs[0], inputs[0], inputs[0])
+     k0, k1, k2 = widths if len(inputs) == 3 else (widths[0], 0, 0)
+     wrap_triton(_quantize_activations_kernel)[(triton.cdiv(m, 128), k // 128)](
+         x0, x1, x2, row, row_scale, column, column_scale, m, k0, k1, k2,
+-        *x0.stride(), *x1.stride(), *x2.stride(), save_column, num_warps=8,
++        *x0.stride(), *x1.stride(), *x2.stride(), save_column, bf16_row, num_warps=8,
+     )
+     return row, row_scale, column, column_scale
+ 
+@@ -157,10 +158,10 @@
+ 
+ class _Projection(torch.autograd.Function):
+     @staticmethod
+-    def forward(ctx, x, weight, weight_scale, transposed, transposed_scale, *weights):
+-        row, row_scale, column, column_scale = _quantize_activations([x], True)
++    def forward(ctx, x, weight, weight_scale, bfloat_weight, *weights):
++        row, row_scale, column, column_scale = _quantize_activations([x], True, False)
+         out = _matmul(row, weight, row_scale, weight_scale, torch.bfloat16)
+-        ctx.save_for_backward(column, column_scale, transposed, transposed_scale)
++        ctx.save_for_backward(column, column_scale, bfloat_weight)
+         ctx.tokens = x.shape[0]
+         ctx.input_width = x.shape[1]
+         ctx.input_dtype = x.dtype
+@@ -176,24 +177,24 @@
+ 
+     @staticmethod
+     def backward(ctx, *gradients):
+-        x_column, x_scale, transposed, transposed_scale = ctx.saved_tensors
++        x_column, x_scale, bfloat_weight = ctx.saved_tensors
+         gradients = [
+-            grad if grad is not None else torch.zeros((ctx.tokens, width), device=transposed.device, dtype=torch.bfloat16)
++            grad if grad is not None else torch.zeros((ctx.tokens, width), device=bfloat_weight.device, dtype=torch.bfloat16)
+             for grad, width in zip(gradients, ctx.widths)
+         ]
+-        row, row_scale, column, column_scale = _quantize_activations(gradients, True)
+-        grad_x = _matmul(row, transposed, row_scale, transposed_scale, ctx.input_dtype)
+-        offsets = torch.full((1,), gradients[0].shape[0], device=transposed.device, dtype=torch.int32)
++        row, _, column, column_scale = _quantize_activations(gradients, True, True)
++        grad_x = torch.mm(row, bfloat_weight).to(ctx.input_dtype)
++        offsets = torch.full((1,), gradients[0].shape[0], device=bfloat_weight.device, dtype=torch.int32)
+         grad_weight = grouped_fp8_wgrad(column, column_scale, x_column, x_scale, offsets, ctx.weight_dtype)[0]
+         weight_grads, start = [], 0
+         for width in ctx.widths:
+             weight_grads.append(grad_weight[start:start + width, :ctx.input_width])
+             start += triton.cdiv(width, 128) * 128
+-        return (grad_x[:, :ctx.input_width], None, None, None, None, *weight_grads)
++        return (grad_x[:, :ctx.input_width], None, None, None, *weight_grads)
+ 
+ 
+ def project(
+-    x: Tensor, weights: List[Tensor], prepared_weight: Optional[Tuple[Tensor, Tensor, Tensor, Tensor]] = None,
++    x: Tensor, weights: List[Tensor], prepared_weight: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
+ ) -> List[Tensor]:
+     if prepared_weight is None:
+         with torch.no_grad():
+@@ -202,7 +203,7 @@
+     if torch.is_grad_enabled() and (x.requires_grad or any(weight.requires_grad for weight in weights)):
+         outputs = _Projection.apply(inputs, *prepared_weight, *weights)
+     else:
+-        row, row_scale, _, _ = _quantize_activations([inputs], False)
++        row, row_scale, _, _ = _quantize_activations([inputs], False, False)
+         out = _matmul(row, prepared_weight[0], row_scale, prepared_weight[1], torch.bfloat16)
+         outputs, start = [], 0
+         for weight in weights:
+diff --git a/experiments/check_attention.py b/experiments/check_attention.py
+--- a/experiments/check_attention.py
++++ b/experiments/check_attention.py
+@@ -49,15 +49,17 @@
+                         grads = [torch.randn_like(value) * .01 for value in outputs]
+                         torch.autograd.backward(outputs, grads)
+                         source = x.detach().reshape(-1, width)
+-                        expected_x = torch.zeros_like(source, dtype=torch.float32)
++                        bfloat_gradients, bfloat_weights = [], []
+                         for index, (weight, output, grad) in enumerate(zip(weights, outputs, grads)):
+                             gradient = grad.reshape(-1, weight.shape[0])
+                             quantized_weight = quantized_reference(weight, 128)
+                             expected_out = (quantized_reference(source, 1) @ quantized_weight.t()).bfloat16()
+-                            expected_x += quantized_reference(gradient, 1) @ quantized_weight
++                            bfloat_gradients.append(F.pad(gradient.bfloat16(), (0, (-weight.shape[0]) % 128)))
++                            bfloat_weights.append(F.pad(weight.detach().bfloat16(), (0, (-width) % 128, 0, (-weight.shape[0]) % 128)))
+                             expected_weights[index] += quantized_reference(gradient.t(), 1) @ quantized_reference(source.t(), 1).t()
+                             check(output.reshape_as(expected_out), expected_out, f"{label} cached={cached} update={update} output {index}")
+                             check(weight.grad, expected_weights[index], f"{label} cached={cached} update={update} weight {index}")
++                        expected_x = (torch.cat(bfloat_gradients, 1) @ torch.cat(bfloat_weights))[:, :width]
+                         check(x.grad, expected_x.to(dtype).reshape_as(x), f"{label} cached={cached} update={update} input")
+                     with torch.no_grad():
+                         for weight in weights:
+@@ -69,4 +71,4 @@
+             assert torch.isfinite(x.grad).all()
+             assert not weights[1].grad.count_nonzero() and not weights[2].grad.count_nonzero()
+ 
+-print("PASS: dense/fused QKV FP8 outputs, input and accumulated weight gradients, cache refresh, padded GQA widths, changing batches, noncontiguous inputs and eager/fullgraph compilation")
++print("PASS: dense/fused QKV FP8 outputs/weight gradients and BF16 input gradients, cache refresh, padded GQA widths, changing batches, noncontiguous inputs and eager/fullgraph compilation")

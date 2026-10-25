@@ -1,0 +1,350 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -45,6 +45,7 @@
+     n_kv_heads: int = 16
+     attn_dim: int = 1024
+     use_flex_attention: bool = True # True for FlexAttention or False for SDPA
++    use_flash_attention_4: bool = True # native SM120 kernel instead of FlexAttention / SDPA
+     # NOTE: for performance reasons, SWA, attention logit soft capping and doc masking require FlexAttention
+     use_doc_masking: bool = False
+     use_attn_logit_softcapping: bool = False # True for tanh soft-capping of attention logits (Gemma2/Grok-1 style), applied via score_mod before softmax
+diff --git a/model/attention/self_attention.py b/model/attention/self_attention.py
+--- a/model/attention/self_attention.py
++++ b/model/attention/self_attention.py
+@@ -66,6 +66,16 @@
+             self.attn_dim = gpt_config.attn_dim
+             self.n_kv_heads = gpt_config.n_kv_heads
+         self.head_size = self.attn_dim // self.n_heads
++        self.use_flash_attention_4 = gpt_config.use_flash_attention_4
++        if self.use_flash_attention_4:
++            if not 8 <= self.head_size <= 160 or self.head_size % 8:
++                raise ValueError("native FlashAttention 4 on SM120 requires head_size divisible by 8 and between 8 and 160; larger widths exceed backward shared memory")
++            from .flash_attention_4 import flash_attention_4
++
++            self.flash_attention_4 = flash_attention_4
++            self.flash_attention_local = not is_full_attention
++            # keep this host scalar out of module buffers so .to(cuda) does not move it
++            self.flash_attention_window = torch.tensor(training_config.swa_initial_window_size, dtype=torch.int32, device="cpu")
+ 
+         assert 1 <= self.n_kv_heads <= self.n_heads, "n_kv_heads must be in [1, n_heads]"
+         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads for GQA/MQA"
+@@ -104,6 +114,8 @@
+         self.is_causal = gpt_config.is_causal
+         self.use_flex_attention = gpt_config.use_flex_attention
+         self.use_attn_logit_softcapping = gpt_config.use_attn_logit_softcapping
++        if self.use_flash_attention_4 and self.use_attn_logit_softcapping:
++            raise ValueError("native FlashAttention 4 does not support attention soft-capping on SM120")
+         self.attn_logit_softcap = gpt_config.attn_logit_softcap
+ 
+         self.tanh_backend = gpt_config.tanh_backend
+@@ -130,7 +142,7 @@
+             cos, sin = self.rotary.get_cos_sin(seq_len, q.dtype, q.device)
+             q, k = apply_rotation(q, k, cos, sin)
+ 
+-        if self.n_kv_heads != self.n_heads:
++        if self.n_kv_heads != self.n_heads and not self.use_flash_attention_4:
+             # expand KV to heads if needed
+             k = k.unsqueeze(2).expand(x.size(0), self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(x.size(0), self.n_heads, seq_len, self.head_size)
+             v = v.unsqueeze(2).expand(x.size(0), self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(x.size(0), self.n_heads, seq_len, self.head_size)
+@@ -156,7 +168,7 @@
+             k_scale = torch.clamp(self.k_scale, min=self.qk_scale_min, max=self.qk_scale_max)
+ 
+             # if we expanded K/V from n_kv_heads -> n_heads, do the same for k_scale
+-            if self.n_kv_heads != self.n_heads:
++            if self.n_kv_heads != self.n_heads and not self.use_flash_attention_4:
+                 # replicate per-kv scale across the grouped query heads
+                 k_scale = k_scale.repeat_interleave(self.q_heads_per_kv_head, dim=1)
+ 
+@@ -172,8 +184,15 @@
+             # (gpu_batch_size, n_heads, seq_len, head_size) * (gpu_batch_size, n_heads, seq_len, 1) * (1, n_heads, 1, 1)
+             k = k * k_gain * k_scale
+ 
++        if self.use_flash_attention_4:
++            if flex_attn_block_mask is not None or sdpa_attn_mask is not None:
++                raise ValueError("native FlashAttention 4 does not accept custom attention masks")
++            y = self.flash_attention_4(
++                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
++                self.flash_attention_window, self.is_causal, self.flash_attention_local,
++            ).transpose(1, 2)
+         # FlexAttention
+-        if self.use_flex_attention:
++        elif self.use_flex_attention:
+             y = flex_attention(q, k, v, score_mod=self._score_mod, block_mask=flex_attn_block_mask)
+         # SDPA
+         else:
+diff --git a/model/attention/flash_attention_4.py b/model/attention/flash_attention_4.py
+new file mode 100644
+--- /dev/null
++++ b/model/attention/flash_attention_4.py
+@@ -0,0 +1,76 @@
++from __future__ import annotations
++
++from typing import Tuple
++
++import torch
++from torch import Tensor
++from torch.library import custom_op
++
++
++@custom_op("gpt_moe::flash_attention_4_forward", mutates_args=())
++def _forward(q: Tensor, k: Tensor, v: Tensor, window: Tensor, causal: bool, local: bool) -> Tuple[Tensor, Tensor]:
++    # flash-attn-4 4.0.0b36 / e7a6402a9ff099de5eb628ce207a88a3f0aa5378
++    from flash_attn.cute.interface import _flash_attn_fwd
++
++    if q.dtype not in (torch.bfloat16, torch.float16):
++        raise ValueError("FlashAttention 4 requires bfloat16 or float16 attention activations")
++    if torch.cuda.get_device_capability(q.device) != (12, 0):
++        raise ValueError("this FlashAttention 4 experiment requires SM120")
++    # the host scalar stays outside CUDA buffers and is read only inside this opaque operation
++    width = int(window.item()) if local else None
++    out, lse, _, _, _ = _flash_attn_fwd(
++        q, k, v, causal=causal, window_size_left=width,
++        window_size_right=0 if causal else width, return_lse=True,
++    )
++    return out, lse
++
++
++@_forward.register_fake
++def _fake_forward(q: Tensor, k: Tensor, v: Tensor, window: Tensor, causal: bool, local: bool) -> Tuple[Tensor, Tensor]:
++    out = torch.empty((*q.shape[:-1], v.shape[-1]), dtype=q.dtype, device=q.device)
++    lse = torch.empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32, device=q.device)
++    return out, lse
++
++
++@custom_op("gpt_moe::flash_attention_4_backward", mutates_args=())
++def _backward(
++        q: Tensor, k: Tensor, v: Tensor, out: Tensor, grad: Tensor, lse: Tensor,
++        window: Tensor, causal: bool, local: bool,
++        ) -> Tuple[Tensor, Tensor, Tensor]:
++    from flash_attn.cute.interface import _flash_attn_bwd
++
++    width = int(window.item()) if local else None
++    return _flash_attn_bwd(
++        q, k, v, out, grad, lse, causal=causal,
++        window_size_left=width, window_size_right=0 if causal else width,
++    )
++
++
++@_backward.register_fake
++def _fake_backward(
++        q: Tensor, k: Tensor, v: Tensor, out: Tensor, grad: Tensor, lse: Tensor,
++        window: Tensor, causal: bool, local: bool,
++        ) -> Tuple[Tensor, Tensor, Tensor]:
++    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
++
++
++def _setup_context(ctx, inputs, output):
++    q, k, v, window, causal, local = inputs
++    out, lse = output
++    ctx.save_for_backward(q, k, v, out, lse, window)
++    ctx.causal = causal
++    ctx.local = local
++    ctx.mark_non_differentiable(lse)
++
++
++def _autograd_backward(ctx, grad, grad_lse):
++    q, k, v, out, lse, window = ctx.saved_tensors
++    dq, dk, dv = _backward(q, k, v, out, grad, lse, window, ctx.causal, ctx.local)
++    return dq, dk, dv, None, None, None
++
++
++_forward.register_autograd(_autograd_backward, setup_context=_setup_context)
++
++
++def flash_attention_4(q: Tensor, k: Tensor, v: Tensor, window: Tensor, causal: bool, local: bool) -> Tensor:
++    return _forward(q, k, v, window, causal, local)[0]
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -51,6 +51,7 @@
+         self.is_causal = gpt_config.is_causal
+ 
+         self.use_flex_attention = gpt_config.use_flex_attention
++        self.use_flash_attention_4 = gpt_config.use_flash_attention_4
+         self.flex_block_size = training_config.flex_block_size
+ 
+         self.use_doc_masking = gpt_config.use_doc_masking
+@@ -81,7 +82,12 @@
+         self.num_moe_layers = gpt_config.n_layers if gpt_config.use_moe else 0
+ 
+         swa_min_window_size = min(training_config.swa_schedule_values)
+-        if (self.use_doc_masking or self.use_attn_logit_softcapping or swa_min_window_size < training_config.max_seq_len):
++        if self.use_flash_attention_4:
++            if getattr(gpt_config, "use_mla", False):
++                raise ValueError("native FlashAttention 4 and MLA are separate experiments; do not enable both")
++            if self.use_doc_masking or self.use_attn_logit_softcapping or self.data_uses_padding:
++                raise ValueError("native FlashAttention 4 does not support document masking, padding masks or attention soft-capping")
++        elif (self.use_doc_masking or self.use_attn_logit_softcapping or swa_min_window_size < training_config.max_seq_len):
+             assert self.use_flex_attention, "Document masking / SWA / attention soft-capping require use_flex_attention=True"
+         self.initial_sliding_window_size = training_config.swa_initial_window_size
+         # register as a 0-dim tensor buffer so torch.compile treats it as a dynamic tensor input
+@@ -155,6 +161,12 @@
+         self._linear_modules = tuple(module for module in self.modules() if isinstance(module, Linear))
+         self.precision_phase = None
+         self.set_precision_phase("training")
++
++    def set_sliding_window_size(self, window_size: int) -> None:
++        self.sliding_window_size.fill_(window_size)
++        if self.use_flash_attention_4:
++            for block in self.transformer.h:
++                block.attn.flash_attention_window.fill_(window_size)
+ 
+     def set_precision_phase(self, phase: str) -> None:
+         if phase == self.precision_phase:
+@@ -681,6 +693,8 @@
+         # sampling, hellaswag
+         # even if used in train
+         gpu_batch_size, seq_len = indices.shape[:2]
++        if self.use_flash_attention_4 and attn_mask is not None:
++            raise ValueError("native FlashAttention 4 does not accept padding or custom attention masks")
+         if self.stage_index != 1:
+             te = self.transformer.wte(indices)
+ 
+@@ -701,7 +715,7 @@
+             for_flex=self.use_flex_attention,
+         )
+ 
+-        if self.use_flex_attention:
++        if self.use_flex_attention and not self.use_flash_attention_4:
+             swa_flex_attn_block_mask = self._build_flex_attn_block_mask(
+                 attn_mask=attn_mask,
+                 document_ids=document_ids,
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -200,6 +200,19 @@
+         )
+         print(message)
+         log_buffer.append(message)
++elif gpt_config.use_flash_attention_4:
++    # CUDA graph replay would freeze the host window scalar captured at launch
++    compile_options = torch._inductor.list_mode_options(training_config.torch_compile_mode)
++    compile_options["triton.cudagraphs"] = False
++    gpt_model = torch.compile(
++        gpt_model, options=compile_options,
++        fullgraph=training_config.torch_compile_fullgraph,
++        dynamic=training_config.torch_compile_dynamic,
++    )
++    if master_process:
++        message = "native FlashAttention 4: exact token SWA; runtime host window; CUDA graphs disabled"
++        print(message)
++        log_buffer.append(message)
+ else:
+     gpt_model = torch.compile(
+         gpt_model,
+@@ -362,7 +375,7 @@
+         next_batch_update_tokens = schedule_state["next_batch_update_tokens"]
+         lr_schedule_idx = schedule_state["lr_schedule_idx"]
+         next_lr_update_tokens = schedule_state["next_lr_update_tokens"]
+-    raw_gpt_model.sliding_window_size.fill_(current_window_size)
++    raw_gpt_model.set_sliding_window_size(current_window_size)
+ 
+     for step in range(start_step, max_train_steps):
+         
+@@ -472,7 +485,7 @@
+                     training_config.max_tokens
+                 )
+         # update the buffer in-place to avoid graph breaks
+-        raw_gpt_model.sliding_window_size.fill_(current_window_size)
++        raw_gpt_model.set_sliding_window_size(current_window_size)
+ 
+         # AdamW gets the base learning rate
+         for param_group in optimizers["adamw"].param_groups:
+diff --git a/experiments/check_flash_attention_4.py b/experiments/check_flash_attention_4.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/check_flash_attention_4.py
+@@ -0,0 +1,92 @@
++from pathlib import Path
++from types import SimpleNamespace
++import sys
++
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from model.attention.flash_attention_4 import flash_attention_4
++from model.attention.self_attention import SelfAttention
++from config.model import GPTConfig
++
++
++def reference(q, k, v, window, causal, local):
++    heads_per_kv = q.shape[2] // k.shape[2]
++    k = k.repeat_interleave(heads_per_kv, dim=2)
++    v = v.repeat_interleave(heads_per_kv, dim=2)
++    positions = torch.arange(q.shape[1], device=q.device)
++    distance = positions[:, None] - positions[None, :]
++    mask = torch.ones_like(distance, dtype=torch.bool)
++    if causal:
++        mask = mask & (distance >= 0)
++    if local:
++        # inclusive lookback W allows W+1 tokens counting the current token
++        mask = mask & ((distance <= window) if causal else (distance.abs() <= window))
++    scores = q.transpose(1, 2).float() @ k.transpose(1, 2).float().transpose(-1, -2)
++    scores = (scores / q.shape[-1]**.5).masked_fill(~mask, float("-inf"))
++    return (scores.softmax(-1) @ v.transpose(1, 2).float()).transpose(1, 2).bfloat16()
++
++
++def run(operation, values, grad, window, causal, local):
++    inputs = [value.detach().clone().requires_grad_() for value in values]
++    output = operation(*inputs, window, causal, local)
++    output.backward(grad)
++    return output.detach(), *(value.grad.detach() for value in inputs)
++
++
++def check(actual, expected, label):
++    for name, value, target in zip(("output", "dQ", "dK", "dV"), actual, expected):
++        assert value.shape == target.shape and value.dtype == torch.bfloat16, (label, name)
++        assert torch.isfinite(value).all(), (label, name)
++        difference = (value.float() - target.float()).norm()
++        relative_error = difference / target.float().norm().clamp_min(1e-6)
++        rms_error = difference / value.numel()**.5
++        print(f"{label} {name}: relative L2={relative_error.item():.8f}, absolute RMS={rms_error.item():.8f}")
++        tolerance = .006 if name == "output" else .03
++        assert relative_error < tolerance or rms_error < 1e-5, (label, name, relative_error.item(), rms_error.item())
++
++
++torch.manual_seed(2026)
++torch.set_float32_matmul_precision("highest")
++assert torch.cuda.is_available(), "this correctness check requires CUDA"
++assert torch.cuda.get_device_capability() == (12, 0), "this experiment requires SM120"
++for width, full_layer in ((7, False), (164, False), (168, False), (192, False), (192, True), (256, False)):
++    config = GPTConfig(
++        d_model=128, n_heads=4, n_kv_heads=4, attn_dim=4 * width,
++        full_attention_layers=[0] if full_layer else [], global_attn_dim=4 * width,
++        global_n_kv_heads=4, use_flash_attention_4=True,
++    )
++    try:
++        SelfAttention(config, SimpleNamespace())
++    except ValueError as error:
++        assert "head_size divisible by 8 and between 8 and 160" in str(error)
++    else:
++        raise AssertionError(f"unsupported native FA4 head width accepted: {width}")
++print("native FA4 numerical preflight; exact token SWA q-k <= W; no timing or model training")
++
++cases = 0
++for heads, kv_heads, head_size, seq_len in ((16, 16, 64, 127), (16, 4, 64, 257), (16, 1, 64, 513), (16, 4, 128, 129), (4, 2, 160, 65)):
++    torch.compiler.reset()
++    compiled = torch.compile(flash_attention_4, fullgraph=True, mode="max-autotune-no-cudagraphs", dynamic=False)
++    # q/k arrive from head-major RoPE/normalization; v retains the projection's token-major layout
++    values = [(torch.randn(2, count, seq_len, head_size, device="cuda", dtype=torch.bfloat16) * .2).transpose(1, 2) for count in (heads, kv_heads, kv_heads)]
++    values[2] = values[2].contiguous()
++    grad = torch.randn_like(values[0]) * .01
++    window = torch.tensor(0, dtype=torch.int32, device="cpu")
++    for causal in (True, False):
++        for local in (True, False):
++            graphs = None
++            for width in ((0, 1, 127, 128, 129) if local else (0,)):
++                window.fill_(width)
++                label = f"heads={heads}/{kv_heads} dim={head_size} tokens={seq_len} causal={causal} local={local} W={width}"
++                expected = run(reference, values, grad, width, causal, local)
++                check(run(flash_attention_4, values, grad, window, causal, local), expected, f"eager {label}")
++                check(run(compiled, values, grad, window, causal, local), expected, f"compiled {label}")
++                captured = torch._dynamo.utils.counters["stats"]["unique_graphs"]
++                if graphs is not None:
++                    assert captured == graphs, f"changing the host SWA window recompiled: {label}"
++                graphs = captured
++                cases += 1
++
++torch.cuda.synchronize()
++print(f"PASS: {cases} cases, eager/fullgraph forward and backward, changing host windows, causal/noncausal/full attention, ragged lengths, MHA/GQA/MQA")

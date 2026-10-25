@@ -1,0 +1,177 @@
+--- a/model/linear/linear.py
++++ b/model/linear/linear.py
+@@ -7,7 +7,9 @@
+ import transformer_engine.pytorch as te
+ from transformer_engine.common.recipe import Float8BlockScaling, Format
+ 
++from .deepgemm_head import linear_fp8
+ 
++
+ class Linear(te.Linear):
+     def __init__(self, in_features: int, out_features: int, *, role: str, bias: bool = True) -> None:
+         super().__init__(
+@@ -34,6 +36,8 @@
+ 
+     def forward(self, x: Tensor) -> Tensor:
+         if self.precision == "fp8":
++            if self.role == "lm_head":
++                return linear_fp8(x, self.weight, self.bias)
+             with te.autocast(enabled=True, recipe=self.fp8_recipe):
+                 return super().forward(x)
+         return F.linear(x, self.weight, self.bias)
+diff --git a/model/linear/deepgemm_head.py b/model/linear/deepgemm_head.py
+new file mode 100644
+index 0000000..f527473
+--- /dev/null
++++ b/model/linear/deepgemm_head.py
+@@ -0,0 +1,82 @@
++from __future__ import annotations
++
++from typing import Any, Tuple
++
++import torch
++import triton
++from torch import Tensor
++from torch.library import custom_op, triton_op, wrap_triton
++
++from .deepgemm import grouped_fp8_wgrad
++from .grouped_fp8 import _quantize_activations, _quantize_weights_kernel
++
++
++@custom_op("gpt_moe::deepgemm_head_mm", mutates_args=())
++def _mm(a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, dtype: torch.dtype) -> Tensor:
++    import deep_gemm
++
++    if torch.cuda.get_device_capability(a.device) != (12, 0):
++        raise ValueError("DeepGEMM FP8 language-model head requires SM120")
++    out = torch.empty((a.shape[0], b.shape[0]), device=a.device, dtype=dtype)
++    deep_gemm.fp8_gemm_nt((a, a_scale), (b, b_scale), out, recipe=(1, 128, 128))
++    return out
++
++
++@_mm.register_fake
++def _fake_mm(a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, dtype: torch.dtype) -> Tensor:
++    return torch.empty((a.shape[0], b.shape[0]), device=a.device, dtype=dtype)
++
++
++@triton_op("gpt_moe::deepgemm_head_forward", mutates_args=())
++def _forward(x: Tensor, weight: Tensor, save_backward: bool, dtype: torch.dtype) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
++    m, k = x.shape
++    n = weight.shape[0]
++    offsets = torch.full((1,), m, device=x.device, dtype=torch.int32)
++    row, row_scale, column, column_scale, _ = _quantize_activations(x, offsets, save_backward, True)
++    weight_fp8 = torch.empty(weight.shape, device=weight.device, dtype=torch.float8_e4m3fn)
++    weight_scale = torch.empty((triton.cdiv(n, 128), triton.cdiv(k, 128)), device=weight.device, dtype=torch.float32)
++    wrap_triton(_quantize_weights_kernel)[(1, triton.cdiv(n, 128), triton.cdiv(k, 128))](
++        weight, weight_fp8, weight_scale, n, k, 0, *weight.stride(), num_warps=8,
++    )
++    out = _mm(row, weight_fp8, row_scale, weight_scale, dtype)
++    return out, column, column_scale, weight_fp8, weight_scale, offsets
++
++
++@triton_op("gpt_moe::deepgemm_head_backward", mutates_args=())
++def _backward_gemms(
++    grad: Tensor, x_column: Tensor, x_scale: Tensor, weight: Tensor, weight_scale: Tensor,
++    offsets: Tensor, compute_dtype: torch.dtype, input_dtype: torch.dtype, weight_dtype: torch.dtype,
++) -> Tuple[Tensor, Tensor]:
++    row, row_scale, column, column_scale, padded_offsets = _quantize_activations(grad, offsets, True, True, True)
++    # a 128x128 weight block has the same scale after transposition
++    grad_x = _mm(row, weight.t().contiguous(), row_scale, weight_scale.t().contiguous(), compute_dtype)
++    grad_weight = grouped_fp8_wgrad(column, column_scale, x_column, x_scale, padded_offsets, compute_dtype)
++    return grad_x.to(input_dtype), grad_weight.squeeze(0).to(weight_dtype)
++
++
++def _setup_context(ctx: Any, inputs: Tuple, output: Tuple) -> None:
++    x, weight, _, ctx.compute_dtype = inputs
++    ctx.input_dtype = x.dtype
++    ctx.weight_dtype = weight.dtype
++    ctx.set_materialize_grads(False)
++    ctx.mark_non_differentiable(*output[1:])
++    ctx.save_for_backward(*output[1:])
++
++
++def _backward(ctx: Any, grad: Tensor, *unused: Tensor) -> Tuple:
++    x_column, x_scale, weight, weight_scale, offsets = ctx.saved_tensors
++    grad_x, grad_weight = _backward_gemms(
++        grad, x_column, x_scale, weight, weight_scale, offsets, ctx.compute_dtype, ctx.input_dtype, ctx.weight_dtype,
++    )
++    return grad_x, grad_weight, None, None
++
++
++_forward.register_autograd(_backward, setup_context=_setup_context)
++
++
++def linear_fp8(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
++    dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
++    save_backward = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
++    out = _forward(x.reshape(-1, x.shape[-1]), weight, save_backward, dtype)[0]
++    out = out.reshape(*x.shape[:-1], weight.shape[0])
++    return out if bias is None else out + bias.to(dtype)
+diff --git a/experiments/check_deepgemm_head.py b/experiments/check_deepgemm_head.py
+new file mode 100644
+index 0000000..435d12d
+--- /dev/null
++++ b/experiments/check_deepgemm_head.py
+@@ -0,0 +1,62 @@
++from pathlib import Path
++import sys
++
++import torch
++from torch.nn import functional as F
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from model.linear.linear import Linear
++
++
++def quantized_reference(x, block_rows):
++    m, k = x.shape
++    padded = F.pad(x.detach().float(), (0, (-k) % 128, 0, (-m) % block_rows))
++    values = padded.reshape(-1, block_rows, padded.shape[1] // 128, 128)
++    amax = values.abs().amax((1, 3), keepdim=True)
++    scale = torch.where(amax == 0, 1.0, torch.exp2(torch.ceil(torch.log2(amax / 448.0))).clamp_min(2.0**-126))
++    return ((values / scale).to(torch.float8_e4m3fn).float() * scale).reshape(padded.shape)[:m, :k]
++
++
++def check(actual, expected, name, tolerance):
++    relative_error = (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-12)
++    print(f"{name}: relative L2={relative_error.item():.8f}, dtype={actual.dtype}")
++    assert relative_error < tolerance, name
++
++
++torch.manual_seed(2026)
++torch.set_float32_matmul_precision("highest")
++head = Linear(256, 512, role="lm_head", bias=False).cuda()
++head.precision = "fp8"
++embedding = torch.nn.Embedding(512, 256, device="cuda")
++embedding.weight = head.weight
++weight = head.weight
++tokens = torch.tensor([1, 7, 7, 42], device="cuda")
++compiled = torch.compile(head, fullgraph=True)
++
++for label, layer in (("eager", head), ("compiled", compiled)):
++    head.zero_grad(set_to_none=True)
++    x = torch.randn(2, 129, 256, device="cuda", requires_grad=True)
++    with torch.autocast("cuda", dtype=torch.bfloat16):
++        out = layer(x)
++    assert out.shape == (2, 129, 512) and out.dtype == torch.bfloat16
++    grad = torch.randn_like(out) * .01
++    loss = (out.float() * grad.float()).sum() + embedding(tokens).sum()
++    loss.backward()
++
++    x_matrix = x.detach().reshape(-1, 256)
++    grad_matrix = grad.reshape(-1, 512)
++    quantized_weight = quantized_reference(weight, 128)
++    expected_out = (quantized_reference(x_matrix, 1) @ quantized_weight.t()).bfloat16()
++    expected_x_grad = (quantized_reference(grad_matrix, 1) @ quantized_weight).bfloat16().float()
++    expected_weight_grad = (quantized_reference(grad_matrix.t(), 1) @ quantized_reference(x_matrix.t(), 1).t()).bfloat16().float()
++    expected_weight_grad.index_add_(0, tokens, torch.ones(4, 256, device="cuda"))
++    check(out.reshape(-1, 512), expected_out, f"{label} output", .01)
++    check(x.grad.reshape(-1, 256), expected_x_grad, f"{label} input gradient", .001)
++    check(weight.grad, expected_weight_grad, f"{label} tied weight gradient", .001)
++    assert x.grad.dtype == weight.grad.dtype == torch.float32
++    assert head.weight is embedding.weight is weight
++
++head.precision = "default"
++with torch.autocast("cuda", dtype=torch.bfloat16):
++    torch.testing.assert_close(head(x), F.linear(x, weight), rtol=0, atol=0)
++print("PASS: eager/compiled head, BF16 output, FP32 gradients, tied embeddings and default precision")

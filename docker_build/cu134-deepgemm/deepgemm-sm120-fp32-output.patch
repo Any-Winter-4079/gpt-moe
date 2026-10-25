@@ -1,0 +1,14 @@
+diff --git a/csrc/apis/gemm.hpp b/csrc/apis/gemm.hpp
+index e7ddd58..52b9e16 100644
+--- a/csrc/apis/gemm.hpp
++++ b/csrc/apis/gemm.hpp
+@@ -251,7 +251,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor,
+     const auto [m_, n_] = get_shape<2>(d);
+     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
+-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
++    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or
++                   (arch_major == 12 and d.scalar_type() == torch::kFloat));
+     DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt);
+ 
+     // Layout checks

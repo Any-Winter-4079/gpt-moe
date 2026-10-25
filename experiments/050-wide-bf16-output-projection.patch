@@ -1,0 +1,17 @@
+diff --git a/model/linear/attention_sm120.cu b/model/linear/attention_sm120.cu
+--- a/model/linear/attention_sm120.cu
++++ b/model/linear/attention_sm120.cu
+@@ -54,11 +54,12 @@
+ using namespace cute;
+ using Element = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+ using Layout = cutlass::layout::RowMajor;
+-using Tile = Shape<_128, _64, _128>;
+ using Cluster = Shape<_1, _1, _1>;
+ 
+ template <class Output>
+ struct Projection {
++    using Tile = conditional_t<is_same_v<Output, cutlass::bfloat16_t>,
++                               Shape<_128, _128, _128>, Shape<_128, _64, _128>>;
+     static constexpr int Alignment = 128 / cutlass::sizeof_bits<Output>::value;
+     using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+         cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,

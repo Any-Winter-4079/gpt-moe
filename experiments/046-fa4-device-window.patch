@@ -1,0 +1,192 @@
+diff --git a/model/attention/self_attention.py b/model/attention/self_attention.py
+--- a/model/attention/self_attention.py
++++ b/model/attention/self_attention.py
+@@ -74,8 +74,12 @@
+ 
+             self.flash_attention_4 = flash_attention_4
+             self.flash_attention_local = not is_full_attention
+-            # keep this host scalar out of module buffers so .to(cuda) does not move it
+-            self.flash_attention_window = torch.tensor(training_config.swa_initial_window_size, dtype=torch.int32, device="cpu")
++            window_size = training_config.swa_initial_window_size
++            self.register_buffer(
++                "flash_attention_window",
++                torch.tensor((window_size, 0 if gpt_config.is_causal else window_size), dtype=torch.int32),
++                persistent=False,
++            )
+ 
+         assert 1 <= self.n_kv_heads <= self.n_heads, "n_kv_heads must be in [1, n_heads]"
+         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads for GQA/MQA"
+diff --git a/model/attention/flash_attention_4.py b/model/attention/flash_attention_4.py
+--- a/model/attention/flash_attention_4.py
++++ b/model/attention/flash_attention_4.py
+@@ -1,26 +1,29 @@
+ from __future__ import annotations
+ 
++import inspect
+ from typing import Tuple
+ 
+ import torch
+ from torch import Tensor
+ from torch.library import custom_op
++from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
++
++
++if any("window_size_tensor" not in inspect.signature(operation).parameters for operation in (_flash_attn_fwd, _flash_attn_bwd)):
++    raise ImportError("this experiment requires the optional FA4 SM120 device-window source patch; build the performance image with FA4_DEVICE_WINDOW=1")
+ 
+ 
+ @custom_op("gpt_moe::flash_attention_4_forward", mutates_args=())
+ def _forward(q: Tensor, k: Tensor, v: Tensor, window: Tensor, causal: bool, local: bool) -> Tuple[Tensor, Tensor]:
+     # flash-attn-4 4.0.0b36 / e7a6402a9ff099de5eb628ce207a88a3f0aa5378
+-    from flash_attn.cute.interface import _flash_attn_fwd
+-
+     if q.dtype not in (torch.bfloat16, torch.float16):
+         raise ValueError("FlashAttention 4 requires bfloat16 or float16 attention activations")
+     if torch.cuda.get_device_capability(q.device) != (12, 0):
+         raise ValueError("this FlashAttention 4 experiment requires SM120")
+-    # the host scalar stays outside CUDA buffers and is read only inside this opaque operation
+-    width = int(window.item()) if local else None
++    # the optional source patch loads the stable CUDA window buffer inside both attention kernels
+     out, lse, _, _, _ = _flash_attn_fwd(
+-        q, k, v, causal=causal, window_size_left=width,
+-        window_size_right=0 if causal else width, return_lse=True,
++        q, k, v, causal=causal if not local else False,
++        window_size_tensor=window if local else None, return_lse=True,
+     )
+     return out, lse
+ 
+@@ -37,12 +40,9 @@
+         q: Tensor, k: Tensor, v: Tensor, out: Tensor, grad: Tensor, lse: Tensor,
+         window: Tensor, causal: bool, local: bool,
+         ) -> Tuple[Tensor, Tensor, Tensor]:
+-    from flash_attn.cute.interface import _flash_attn_bwd
+-
+-    width = int(window.item()) if local else None
+     return _flash_attn_bwd(
+-        q, k, v, out, grad, lse, causal=causal,
+-        window_size_left=width, window_size_right=0 if causal else width,
++        q, k, v, out, grad, lse, causal=causal if not local else False,
++        window_size_tensor=window if local else None,
+     )
+ 
+ 
+diff --git a/model/gpt.py b/model/gpt.py
+--- a/model/gpt.py
++++ b/model/gpt.py
+@@ -90,6 +90,7 @@
+         elif (self.use_doc_masking or self.use_attn_logit_softcapping or swa_min_window_size < training_config.max_seq_len):
+             assert self.use_flex_attention, "Document masking / SWA / attention soft-capping require use_flex_attention=True"
+         self.initial_sliding_window_size = training_config.swa_initial_window_size
++        self._flash_attention_window_size = self.initial_sliding_window_size
+         # register as a 0-dim tensor buffer so torch.compile treats it as a dynamic tensor input
+         self.register_buffer(
+             "sliding_window_size",
+@@ -164,9 +165,12 @@
+ 
+     def set_sliding_window_size(self, window_size: int) -> None:
+         self.sliding_window_size.fill_(window_size)
+-        if self.use_flash_attention_4:
++        if self.use_flash_attention_4 and window_size != self._flash_attention_window_size:
+             for block in self.transformer.h:
+-                block.attn.flash_attention_window.fill_(window_size)
++                block.attn.flash_attention_window[0].fill_(window_size)
++                if not self.is_causal:
++                    block.attn.flash_attention_window[1].fill_(window_size)
++            self._flash_attention_window_size = window_size
+ 
+     def set_precision_phase(self, phase: str) -> None:
+         if phase == self.precision_phase:
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -198,19 +198,6 @@
+             f"activation offloading: first {training_config.activation_offload_layers} blocks per GPU; "
+             "prefetch one block ahead; compiled blocks with eager transfer scheduling; CUDA graphs disabled"
+         )
+-        print(message)
+-        log_buffer.append(message)
+-elif gpt_config.use_flash_attention_4:
+-    # CUDA graph replay would freeze the host window scalar captured at launch
+-    compile_options = torch._inductor.list_mode_options(training_config.torch_compile_mode)
+-    compile_options["triton.cudagraphs"] = False
+-    gpt_model = torch.compile(
+-        gpt_model, options=compile_options,
+-        fullgraph=training_config.torch_compile_fullgraph,
+-        dynamic=training_config.torch_compile_dynamic,
+-    )
+-    if master_process:
+-        message = "native FlashAttention 4: exact token SWA; runtime host window; CUDA graphs disabled"
+         print(message)
+         log_buffer.append(message)
+ else:
+diff --git a/experiments/check_flash_attention_4.py b/experiments/check_flash_attention_4.py
+--- a/experiments/check_flash_attention_4.py
++++ b/experiments/check_flash_attention_4.py
+@@ -62,7 +62,7 @@
+         assert "head_size divisible by 8 and between 8 and 160" in str(error)
+     else:
+         raise AssertionError(f"unsupported native FA4 head width accepted: {width}")
+-print("native FA4 numerical preflight; exact token SWA q-k <= W; no timing or model training")
++print("native FA4 numerical preflight; exact token SWA q-k <= W; device-resident windows")
+ 
+ cases = 0
+ for heads, kv_heads, head_size, seq_len in ((16, 16, 64, 127), (16, 4, 64, 257), (16, 1, 64, 513), (16, 4, 128, 129), (4, 2, 160, 65)):
+@@ -72,21 +72,54 @@
+     values = [(torch.randn(2, count, seq_len, head_size, device="cuda", dtype=torch.bfloat16) * .2).transpose(1, 2) for count in (heads, kv_heads, kv_heads)]
+     values[2] = values[2].contiguous()
+     grad = torch.randn_like(values[0]) * .01
+-    window = torch.tensor(0, dtype=torch.int32, device="cpu")
++    window = torch.zeros(2, dtype=torch.int32, device="cuda")
+     for causal in (True, False):
+         for local in (True, False):
+             graphs = None
+             for width in ((0, 1, 127, 128, 129) if local else (0,)):
+-                window.fill_(width)
++                window[0].fill_(width)
++                window[1].fill_(0 if causal else width)
+                 label = f"heads={heads}/{kv_heads} dim={head_size} tokens={seq_len} causal={causal} local={local} W={width}"
+                 expected = run(reference, values, grad, width, causal, local)
+                 check(run(flash_attention_4, values, grad, window, causal, local), expected, f"eager {label}")
+                 check(run(compiled, values, grad, window, causal, local), expected, f"compiled {label}")
+                 captured = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+                 if graphs is not None:
+-                    assert captured == graphs, f"changing the host SWA window recompiled: {label}"
++                    assert captured == graphs, f"changing the device SWA window recompiled: {label}"
+                 graphs = captured
+                 cases += 1
+ 
++for causal, local in ((True, True), (False, True), (True, False)):
++    values = [torch.randn(2, 4, 257, 64, device="cuda", dtype=torch.bfloat16).transpose(1, 2).requires_grad_()]
++    values.extend(torch.randn(2, 2, 257, 64, device="cuda", dtype=torch.bfloat16).transpose(1, 2).requires_grad_() for _ in range(2))
++    grad = torch.randn_like(values[0]) * .01
++    window = torch.tensor((1, 0 if causal else 1), dtype=torch.int32, device="cuda")
++    storage = window.data_ptr()
++    capture_stream = torch.cuda.Stream()
++    capture_stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(capture_stream):
++        # compile FA4 kernels and populate all first-use caches before CUDA graph capture
++        for _ in range(3):
++            for value in values:
++                value.grad = None
++            output = flash_attention_4(*values, window, causal, local)
++            output.backward(grad)
++    capture_stream.synchronize()
++    for value in values:
++        value.grad = None
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph, stream=capture_stream):
++        output = flash_attention_4(*values, window, causal, local)
++        output.backward(grad)
++    torch.cuda.current_stream().wait_stream(capture_stream)
++    for width in (0, 1, 127, 128, 129, 384):
++        window[0].fill_(width)
++        window[1].fill_(0 if causal else width)
++        assert window.data_ptr() == storage
++        graph.replay()
++        expected = run(reference, values, grad, width, causal, local)
++        actual = (output.detach(), *(value.grad.detach() for value in values))
++        check(actual, expected, f"CUDA graph replay causal={causal} local={local} W={width}")
++
+ torch.cuda.synchronize()
+-print(f"PASS: {cases} cases, eager/fullgraph forward and backward, changing host windows, causal/noncausal/full attention, ragged lengths, MHA/GQA/MQA")
++print(f"PASS: {cases} eager/fullgraph cases plus 18 CUDA graph replays, changing device windows, causal/noncausal/full attention, ragged lengths, MHA/GQA/MQA")

@@ -1,0 +1,58 @@
+diff --git a/model/linear/deepgemm.py b/model/linear/deepgemm.py
+--- a/model/linear/deepgemm.py
++++ b/model/linear/deepgemm.py
+@@ -3,6 +3,32 @@
+ import torch
+ from torch import Tensor
+ from torch.library import custom_op
++
++
++@custom_op("gpt_moe::deepgemm_dense_fp8_wgrad", mutates_args=())
++def dense_fp8_wgrad(
++    grad: Tensor, grad_scale: Tensor, x: Tensor, x_scale: Tensor, dtype: torch.dtype,
++) -> Tensor:
++    import deep_gemm
++
++    if torch.cuda.get_device_capability(grad.device) != (12, 0):
++        raise ValueError("DeepGEMM dense FP8 weight gradients require SM120")
++    if dtype not in (torch.float32, torch.bfloat16):
++        raise ValueError("DeepGEMM dense FP8 weight gradients require float32 or bfloat16 weights")
++    out = torch.empty((grad.shape[0], x.shape[0]), device=grad.device, dtype=dtype)
++    # the column quantizers already emit the packed native scales; transpose views select MN-major layout
++    deep_gemm.fp8_gemm_nt(
++        (grad, grad_scale.t()), (x, x_scale.t()), out,
++        recipe=(1, 1, 128), disable_ue8m0_cast=True,
++    )
++    return out
++
++
++@dense_fp8_wgrad.register_fake
++def _fake_dense_fp8_wgrad(
++    grad: Tensor, grad_scale: Tensor, x: Tensor, x_scale: Tensor, dtype: torch.dtype,
++) -> Tensor:
++    return torch.empty((grad.shape[0], x.shape[0]), device=grad.device, dtype=dtype)
+ 
+ 
+ @custom_op("gpt_moe::deepgemm_fp8_wgrad", mutates_args=())
+diff --git a/model/linear/attention_fp8.py b/model/linear/attention_fp8.py
+--- a/model/linear/attention_fp8.py
++++ b/model/linear/attention_fp8.py
+@@ -8,7 +8,7 @@
+ from torch import Tensor
+ from torch.library import custom_op, triton_op, wrap_triton
+ 
+-from .deepgemm import grouped_fp8_wgrad
++from .deepgemm import dense_fp8_wgrad
+ from .grouped_fp8 import _inverse_scale
+ 
+ 
+@@ -183,8 +183,7 @@
+         ]
+         row, row_scale, column, column_scale = _quantize_activations(gradients, True)
+         grad_x = _matmul(row, transposed, row_scale, transposed_scale, ctx.input_dtype)
+-        offsets = torch.full((1,), gradients[0].shape[0], device=transposed.device, dtype=torch.int32)
+-        grad_weight = grouped_fp8_wgrad(column, column_scale, x_column, x_scale, offsets, ctx.weight_dtype)[0]
++        grad_weight = dense_fp8_wgrad(column, column_scale, x_column, x_scale, ctx.weight_dtype)
+         weight_grads, start = [], 0
+         for width in ctx.widths:
+             weight_grads.append(grad_weight[start:start + width, :ctx.input_width])

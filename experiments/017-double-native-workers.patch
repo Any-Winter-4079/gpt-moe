@@ -1,0 +1,13 @@
+diff --git a/model/linear/grouped_fp8.py b/model/linear/grouped_fp8.py
+index 138f445..a99d6ad 100644
+--- a/model/linear/grouped_fp8.py
++++ b/model/linear/grouped_fp8.py
+@@ -214,7 +214,7 @@ def _grouped_fp8_mm(a: Tensor, b: Tensor, a_scale: Tensor, b_scale: Tensor, offs
+     n = b.shape[-1]
+     num_experts = offsets.numel()
+     out = torch.empty((num_experts, m, n) if group_k else (m, n), device=a.device, dtype=dtype)
+-    num_programs = torch.cuda.get_device_properties(a.device).multi_processor_count
++    num_programs = torch.cuda.get_device_properties(a.device).multi_processor_count * 2
+     wrap_triton(_grouped_fp8_mm_kernel)[(num_programs,)](
+         a, b, a_scale, b_scale, out, offsets, m, n, k,
+         *a.stride(), 0 if group_k else b.stride(0), *b.stride()[-2:],
