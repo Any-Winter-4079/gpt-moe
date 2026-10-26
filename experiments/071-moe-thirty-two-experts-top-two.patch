@@ -1,0 +1,12 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -76,7 +76,7 @@
+ 
+     # mixture of experts
+     use_moe: bool = True
+-    num_experts: int = 8
++    num_experts: int = 32
+     moe_top_k: int = 2
+     # for top-k > 1, use full-softmax gates instead of renormalizing the selected experts; top-1 always uses full softmax
+     moe_full_softmax_gating: bool = False

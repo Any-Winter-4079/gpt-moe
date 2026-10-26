@@ -1,0 +1,21 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -10,7 +10,7 @@
+     n_layers: int = 8
+     hidden_size: int = 1024
+     use_bias: bool = False
+-    mlp_hidden_dim: int = 2048
++    mlp_hidden_dim: int = 4096
+     use_tied_embeddings: bool = True
+     norm_type: str = "rms" # "rms" or any other name for "layer"
+     is_causal: bool = True # True for decoders or False for encoders
+@@ -77,7 +77,7 @@
+     # mixture of experts
+     use_moe: bool = True
+     num_experts: int = 8
+-    moe_top_k: int = 2
++    moe_top_k: int = 1
+     # for top-k > 1, use full-softmax gates instead of renormalizing the selected experts; top-1 always uses full softmax
+     moe_full_softmax_gating: bool = False
+ 

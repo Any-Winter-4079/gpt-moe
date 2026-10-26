@@ -16,13 +16,15 @@ EXPERIMENTS = {
     "attention-te": ["049"],
     "attention-qkv-only": ["033"],
     "attention-out-only": ["034"],
-    "polar-final-update": ["055"],
     "polar-gram-trace": ["056"],
     "lm-head-custom": ["061"],
     "qk-token-major-layout": ["063"],
-    "polar-momentum-pack": ["064"],
-    "52+54+58+59+60+62": [],
-    "55+64": ["065"],
+    "moe-l2-tiles": ["066"],
+    "paired-qk-forward": ["067"],
+    "moe-8-top1": ["068"],
+    "moe-16-top2": ["069"],
+    "moe-8-top1-wide": ["070"],
+    "moe-32-top2": ["071"],
 }
 
 

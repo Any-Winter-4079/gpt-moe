@@ -1,0 +1,27 @@
+diff --git a/model/linear/fp8/custom/grouped.py b/model/linear/fp8/custom/grouped.py
+--- a/model/linear/fp8/custom/grouped.py
++++ b/model/linear/fp8/custom/grouped.py
+@@ -174,12 +174,20 @@
+             bs_base = expert * bs_stride_e
+             c_base = start * N
+ 
++        tiles_m = tl.cdiv(rows, BLOCK_M)
+         tiles_n = tl.cdiv(N, BLOCK_N)
+-        last_tile = first_tile + tl.cdiv(rows, BLOCK_M) * tiles_n
++        last_tile = first_tile + tiles_m * tiles_n
+         while tile < last_tile:
+             local_tile = tile - first_tile
+-            row = (local_tile // tiles_n) * BLOCK_M + tl.arange(0, BLOCK_M)
+-            col = (local_tile % tiles_n) * BLOCK_N + tl.arange(0, BLOCK_N)
++            # visit eight row tiles per column before moving to the next group
++            group = local_tile // (8 * tiles_n)
++            first_row = group * 8
++            group_rows = tl.minimum(tiles_m - first_row, 8)
++            within_group = local_tile % (8 * tiles_n)
++            row_tile = first_row + within_group % group_rows
++            col_tile = within_group // group_rows
++            row = row_tile * BLOCK_M + tl.arange(0, BLOCK_M)
++            col = col_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+             inner = tl.arange(0, 128)
+             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+             for block in range(tl.cdiv(reduction, 128)):

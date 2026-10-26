@@ -1,0 +1,78 @@
+diff --git a/model/attention/qkv_norm_rope_fp8.py b/model/attention/qkv_norm_rope_fp8.py
+--- a/model/attention/qkv_norm_rope_fp8.py
++++ b/model/attention/qkv_norm_rope_fp8.py
+@@ -36,38 +36,39 @@
+     scale_min: tl.constexpr = SCALE_MIN if MIN_INF == 0 else (float("-inf") if MIN_INF < 0 else float("inf"))
+     scale_max: tl.constexpr = SCALE_MAX if MAX_INF == 0 else (float("-inf") if MAX_INF < 0 else float("inf"))
+     batch_head = tl.program_id(0)
+-    batch = batch_head // (2 * H)
+-    head = batch_head % (2 * H)
++    batch = batch_head // H
++    head = batch_head % H
+     token = tl.program_id(1) * 16 + tl.arange(0, 16)
+     feature = tl.arange(0, 64)
+     valid = token[:, None] < T
+-    if head < H:
+-        source = Q + batch * qb + head * qh + token[:, None] * qt
+-        x = tl.load(source + feature[None, :] * qd, valid, 0.0).to(tl.float32)
+-        scale = tl.load(QScale + head).to(tl.float32)
+-        out = QOut + ((batch * H + head) * T + token[:, None]) * 64 + feature[None, :]
+-        gain_out = QGain + (batch * H + head) * T + token
+-    else:
+-        head -= H
+-        source = K + batch * kb + head * kh + token[:, None] * kt
+-        x = tl.load(source + feature[None, :] * kd, valid, 0.0).to(tl.float32)
+-        scale = tl.load(KScale + head).to(tl.float32)
+-        out = KOut + ((batch * H + head) * T + token[:, None]) * 64 + feature[None, :]
+-        gain_out = KGain + (batch * H + head) * T + token
+     dtype: tl.constexpr = Q.dtype.element_ty
+-    paired = tl.gather(x, tl.broadcast_to(feature[None, :] ^ 1, (16, 64)), axis=1)
+     cos = tl.load(Cos + token[:, None] * ct + (feature[None, :] // 2) * cd, valid, 0.0).to(dtype).to(tl.float32)
+     sin = tl.load(Sin + token[:, None] * st + (feature[None, :] // 2) * sd, valid, 0.0).to(dtype).to(tl.float32)
+-    rotated = _rotate(x, paired, cos, sin, feature[None, :], dtype, False)
+-    # preserve CUDA BF16 autocast's FP32 norm statistic and rsqrt
+-    statistic = tl.sum(rotated * rotated, axis=1)
+-    if RMS:
+-        statistic /= 64
+-    gain = tl.rsqrt(statistic + EPS)
+-    scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, scale_min), scale_max)).to(dtype).to(tl.float32)
+-    normalized = (rotated * gain[:, None].to(dtype).to(tl.float32)).to(dtype).to(tl.float32)
+-    tl.store(out, normalized * scale, valid)
+-    tl.store(gain_out, gain, token < T)
++    # share rotary table loads between the matching query and key head
++    for projection in tl.static_range(0, 2):
++        if projection == 0:
++            source = Q + batch * qb + head * qh + token[:, None] * qt
++            x = tl.load(source + feature[None, :] * qd, valid, 0.0).to(tl.float32)
++            scale = tl.load(QScale + head).to(tl.float32)
++            out = QOut + ((batch * H + head) * T + token[:, None]) * 64 + feature[None, :]
++            gain_out = QGain + (batch * H + head) * T + token
++        else:
++            source = K + batch * kb + head * kh + token[:, None] * kt
++            x = tl.load(source + feature[None, :] * kd, valid, 0.0).to(tl.float32)
++            scale = tl.load(KScale + head).to(tl.float32)
++            out = KOut + ((batch * H + head) * T + token[:, None]) * 64 + feature[None, :]
++            gain_out = KGain + (batch * H + head) * T + token
++        paired = tl.gather(x, tl.broadcast_to(feature[None, :] ^ 1, (16, 64)), axis=1)
++        rotated = _rotate(x, paired, cos, sin, feature[None, :], dtype, False)
++        # preserve CUDA BF16 autocast's FP32 norm statistic and rsqrt
++        statistic = tl.sum(rotated * rotated, axis=1)
++        if RMS:
++            statistic /= 64
++        gain = tl.rsqrt(statistic + EPS)
++        scale = tl.where(scale != scale, scale, tl.minimum(tl.maximum(scale, scale_min), scale_max)).to(dtype).to(tl.float32)
++        normalized = (rotated * gain[:, None].to(dtype).to(tl.float32)).to(dtype).to(tl.float32)
++        tl.store(out, normalized * scale, valid)
++        tl.store(gain_out, gain, token < T)
+ 
+ 
+ @triton_op("gpt_moe::attention_qkv_norm_rope_forward", mutates_args=())
+@@ -83,7 +84,7 @@
+     # keep infinities out of Inductor's generated Python metadata
+     min_inf = (scale_min == float("inf")) - (scale_min == float("-inf"))
+     max_inf = (scale_max == float("inf")) - (scale_max == float("-inf"))
+-    wrap_triton(_forward_kernel)[(batch * 2 * heads, triton.cdiv(seq_len, 16))](
++    wrap_triton(_forward_kernel)[(batch * heads, triton.cdiv(seq_len, 16))](
+         q, k, q_scale, k_scale, cos, sin, q_out, k_out, q_gain, k_gain,
+         seq_len, heads, *q.stride(), *k.stride(), *cos.stride()[-2:], *sin.stride()[-2:],
+         eps, rms, 0.0 if min_inf else scale_min, 0.0 if max_inf else scale_max,

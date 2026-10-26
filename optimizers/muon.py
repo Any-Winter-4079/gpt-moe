@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .polar_express import zeropower_via_polar_express
+from .polar_express import aX_plus_BX_update, zeropower_via_polar_express
+from .polar_prepare import prepare_polar
 
 
 # In Muon, the goal is:
@@ -149,6 +150,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group['momentum']
             zeropower_backend = zeropower_backends[group['backend']]
             buckets = {}
+            prepare_buckets = {}
             for p in group['params']:
                 g = p.grad
                 if g is None:
@@ -157,6 +159,15 @@ class Muon(torch.optim.Optimizer):
                 if 'momentum_buffer' not in state:
                     state['momentum_buffer'] = torch.zeros_like(g)
                 buf = state['momentum_buffer']
+                if group['backend'] == 'polarexpress' and g.is_cuda and g.dtype == torch.float32:
+                    if g.size(0) == 3 * g.size(1):
+                        prepared = zip(p.data.split(g.size(1)), g.split(g.size(1)), buf.split(g.size(1)))
+                    else:
+                        prepared = [(p.data, g, buf)]
+                    for weight, gradient, buffer in prepared:
+                        key = (gradient.shape, gradient.device, gradient.dtype)
+                        prepare_buckets.setdefault(key, []).append((weight, gradient, buffer))
+                    continue
                 buf.mul_(momentum).add_(g)
                 if group['nesterov']:
                     g.add_(buf, alpha=momentum)
@@ -180,8 +191,35 @@ class Muon(torch.optim.Optimizer):
                 for start in range(0, len(bucket), 8):
                     batch = bucket[start:start + 8]
                     updates = torch.stack([g for _, g in batch])
-                    updates = zeropower_backend(updates, steps=group['backend_steps'])
                     scale = max(updates.shape[-2:]) ** 0.5
-                    for (weight, _), update in zip(batch, updates):
-                        weight.add_(update, alpha=-lr * scale)
+                    if updates.is_cuda and all(weight.dtype == torch.float32 for weight, _ in batch):
+                        B, X = zeropower_backend(updates, steps=group['backend_steps'], return_last=True)
+                        # keep the changing learning rate outside the compiled projection graph
+                        aX_plus_BX_update(
+                            B, X, tuple(weight for weight, _ in batch), -lr * scale,
+                            updates.size(-2) > updates.size(-1),
+                        )
+                    else:
+                        updates = zeropower_backend(updates, steps=group['backend_steps'])
+                        for (weight, _), update in zip(batch, updates):
+                            weight.add_(update, alpha=-lr * scale)
+
+            for bucket in prepare_buckets.values():
+                for start in range(0, len(bucket), 8):
+                    batch = bucket[start:start + 8]
+                    updates = prepare_polar(
+                        tuple(g for _, g, _ in batch), tuple(buf for _, _, buf in batch),
+                        momentum, group['nesterov'],
+                    )
+                    scale = max(updates.shape[-2:]) ** 0.5
+                    if all(weight.dtype == torch.float32 for weight, _, _ in batch):
+                        B, X = zeropower_backend(updates, steps=group['backend_steps'], return_last=True)
+                        aX_plus_BX_update(
+                            B, X, tuple(weight for weight, _, _ in batch), -lr * scale,
+                            updates.size(-2) > updates.size(-1),
+                        )
+                    else:
+                        updates = zeropower_backend(updates, steps=group['backend_steps'])
+                        for (weight, _, _), update in zip(batch, updates):
+                            weight.add_(update, alpha=-lr * scale)
 # -- End of (modified) source: https://github.com/tyler-romero/nanogpt-speedrun/blob/main/src/train_gpt2.py --
