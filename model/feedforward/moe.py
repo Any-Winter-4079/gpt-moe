@@ -11,6 +11,7 @@ from ..linear.default.grouped import grouped_linear
 from ..linear.fp8.custom.grouped import _quantize_expert_weights, grouped_linear_fp8_weights
 from ..linear.linear import Linear
 from .mlp import MLP
+from .routing import counted_expert_routing
 
 if TYPE_CHECKING:
     from config.model import GPTConfig
@@ -91,12 +92,7 @@ class MoE(nn.Module):
         return output.reshape(input_shape), balance_loss
 
     def forward_grouped(self, hidden_states: Tensor, top_k_indices: Tensor, top_k_weights: Tensor) -> Tensor:
-        expert_indices, order = top_k_indices.reshape(-1).sort()
-        counts = torch.zeros(self.num_experts, device=hidden_states.device, dtype=torch.int32).scatter_add_(
-            0, expert_indices, torch.ones_like(expert_indices, dtype=torch.int32),
-        )
-        offsets = counts.cumsum(0, dtype=torch.int32)
-        inverse_order = torch.empty_like(order).scatter_(0, order, torch.arange(order.numel(), device=order.device))
+        expert_indices, order, inverse_order, offsets = counted_expert_routing(top_k_indices, self.num_experts)
         reuse_weights = self.training and torch.is_grad_enabled()
         if self.experts[0].up_proj.precision == "fp8":
             packed = grouped_linear_fp8_weights(

@@ -51,6 +51,27 @@ class Block(nn.Module):
         else:
             self.mlp = MLP(gpt_config, training_config)
 
+    def _attention(
+            self, x: Tensor, flex_attn_block_mask: Optional[BlockMask], sdpa_attn_mask: Optional[Tensor],
+            ) -> Tensor:
+        fused_norm = (
+            self.training and torch.is_grad_enabled() and x.is_cuda and x.is_contiguous()
+            and x.dtype == torch.float32 and x.shape[-1] <= 4096
+            and isinstance(self.ln_1, nn.RMSNorm) and self.ln_1.weight.dtype == torch.float32
+            and torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.bfloat16
+            and self.attn.use_qk_norm and self.attn.rotary is not None
+            and self.attn.n_kv_heads == self.attn.n_heads and self.attn.head_size == 64 and self.attn.n_heads % 2 == 0
+            and all(projection.precision == "fp8" and projection.backend == "custom" and projection.bias is None
+                    for projection in (self.attn.q_proj, self.attn.k_proj, self.attn.v_proj))
+        )
+        if fused_norm:
+            eps = self.ln_1.eps if self.ln_1.eps is not None else torch.finfo(x.dtype).eps
+            return self.attn(
+                x, flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask,
+                pre_norm_weight=self.ln_1.weight, pre_norm_eps=eps,
+            )
+        return self.attn(self.ln_1(x), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+
     def forward(
             self,
             x: Tensor,
@@ -68,13 +89,13 @@ class Block(nn.Module):
             # Attention
             if self.use_weighted_residual_path and not self.use_weighted_main_path:
                 # x = alpha_1 * x + Attn(norm(x))
-                x = self.attn_residual_scale * x + self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+                x = self.attn_residual_scale * x + self._attention(x_ln1, flex_attn_block_mask, sdpa_attn_mask)
             elif not self.use_weighted_residual_path and self.use_weighted_main_path:
                 # x = x + beta_1 * Attn(norm(x))
-                x = x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+                x = x + self.attn_main_scale * self._attention(x_ln1, flex_attn_block_mask, sdpa_attn_mask)
             else:
                 # x = alpha_1 * x + beta_1 * Attn(norm(x))
-                x = self.attn_residual_scale * x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+                x = self.attn_residual_scale * x + self.attn_main_scale * self._attention(x_ln1, flex_attn_block_mask, sdpa_attn_mask)
 
             # match activation dtype to the receiving module's weight dtype when autocast is disabled
             x_ln2 = x
@@ -101,7 +122,7 @@ class Block(nn.Module):
             x_ln1 = x
             if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln1.dtype != self.ln_1.weight.dtype:
                 x_ln1 = x_ln1.to(dtype=self.ln_1.weight.dtype)
-            x = x + self.residual_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+            x = x + self.residual_scale * self._attention(x_ln1, flex_attn_block_mask, sdpa_attn_mask)
             # match activation dtype to the receiving module's weight dtype when autocast is disabled
             x_ln2 = x
             if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:

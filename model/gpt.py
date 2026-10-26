@@ -11,6 +11,7 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask, and_
 from torch.utils.checkpoint import checkpoint
 
 from .block import Block
+from .cross_entropy import cross_entropy
 from .linear.linear import Linear
 
 if TYPE_CHECKING:
@@ -811,15 +812,21 @@ class GPT(nn.Module):
             # [gpu_batch_size, seq_len, vocab_size]
             logits = self.lm_head(x)
             if targets is not None:
-                logits_for_loss = logits.float() if self.keep_fp32_loss and logits.dtype != torch.float32 else logits
-                if self.data_uses_padding:
-                    loss_mask = (targets != self.pad_token_id)
-                    loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
-                    n_non_masked_tokens = loss_mask.sum()
-                    sum_non_masked_loss_tokens = (loss * loss_mask.view(-1)).sum()
-                    loss = sum_non_masked_loss_tokens / n_non_masked_tokens
+                if self.training and self.keep_fp32_loss and logits.dtype == torch.bfloat16:
+                    loss = cross_entropy(
+                        logits.view(-1, logits.size(-1)), targets.view(-1),
+                        self.pad_token_id if self.data_uses_padding else None,
+                    )
                 else:
-                    loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
+                    logits_for_loss = logits.float() if self.keep_fp32_loss and logits.dtype != torch.float32 else logits
+                    if self.data_uses_padding:
+                        loss_mask = (targets != self.pad_token_id)
+                        loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
+                        n_non_masked_tokens = loss_mask.sum()
+                        sum_non_masked_loss_tokens = (loss * loss_mask.view(-1)).sum()
+                        loss = sum_non_masked_loss_tokens / n_non_masked_tokens
+                    else:
+                        loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
             else:
                 loss = None
 

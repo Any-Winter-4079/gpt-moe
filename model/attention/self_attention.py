@@ -11,6 +11,7 @@ from torch.nn.attention.flex_attention import flex_attention, BlockMask
 from ..position.rotary import Rotary, apply_rotation
 from ..linear.linear import Linear
 from ..linear.fp8.custom.dense import project, quantize_weights
+from ..linear.fp8.custom.output_projection import project_output
 from .logit_softcapping import generate_tanh_softcap
 from .qkv_norm_rope_fp8 import project_qkv_norm_rope
 from .qk_norm_rope import qk_norm_rope
@@ -136,6 +137,8 @@ class SelfAttention(nn.Module):
             x: Tensor,
             flex_attn_block_mask: Optional[BlockMask] = None,
             sdpa_attn_mask: Optional[Tensor] = None,
+            pre_norm_weight: Optional[Tensor] = None,
+            pre_norm_eps: Optional[float] = None,
             ) -> Tensor:
         _, seq_len, _ = x.size()
 
@@ -151,13 +154,15 @@ class SelfAttention(nn.Module):
             and all(projection.precision == "fp8" and projection.backend == "custom" and projection.bias is None
                     for projection in (self.q_proj, self.k_proj, self.v_proj))
         )
+        if pre_norm_weight is not None and not fused_qkv:
+            x = F.rms_norm(x, (x.shape[-1],), pre_norm_weight, pre_norm_eps)
         if fused_qkv:
             cos = self.rotary.cos_cached[..., :seq_len, :]
             sin = self.rotary.sin_cached[..., :seq_len, :]
             q, k, v = project_qkv_norm_rope(
                 x, [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], self.q_scale, self.k_scale,
                 cos, sin, self.qk_eps, self.qk_norm_type == "rms", self.qk_scale_min, self.qk_scale_max,
-                self.n_heads, self.prepared_qkv_weight,
+                self.n_heads, self.prepared_qkv_weight, pre_norm_weight, pre_norm_eps,
             )
         elif all(projection.precision == "fp8" and projection.backend == "custom"
                  for projection in (self.q_proj, self.k_proj, self.v_proj)):
@@ -248,6 +253,14 @@ class SelfAttention(nn.Module):
         else:
             is_causal = self.is_causal and (sdpa_attn_mask is None)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=sdpa_attn_mask, is_causal=is_causal)
+
+        if (reuse_weights and self.use_bf16_autocast and y.is_cuda and y.dtype == torch.bfloat16
+                and self.out_proj.precision == "fp8" and self.out_proj.backend == "custom"
+                and not y.transpose(1, 2).is_contiguous()):
+            y = project_output(y, self.out_proj.weight, self.prepared_out_weight)
+            if self.out_proj.bias is not None:
+                y = y + self.out_proj.bias.to(y.dtype)
+            return y
 
         y = y.transpose(1, 2).contiguous().view(x.size(0), seq_len, self.attn_dim)
         if not self.use_bf16_autocast and self.cast_activations_to_weight_dtype_if_no_autocast and y.dtype != self.out_proj.weight.dtype:

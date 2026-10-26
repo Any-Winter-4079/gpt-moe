@@ -16,21 +16,13 @@ EXPERIMENTS = {
     "attention-te": ["049"],
     "attention-qkv-only": ["033"],
     "attention-out-only": ["034"],
-    "attention-bf16-dgrad": ["031"],
-    "moe-counted-route": ["052"],
-    "moe-output-combine": ["053"],
-    "qkv-head-tiled-backward": ["054"],
     "polar-final-update": ["055"],
     "polar-gram-trace": ["056"],
-    "residual-rmsnorm": ["057"],
-    "rmsnorm-fp8-preparation": ["058"],
-    "streaming-cross-entropy": ["059"],
-    "integer-fp8-scales": ["060"],
     "lm-head-custom": ["061"],
-    "attention-output-layout": ["062"],
     "qk-token-major-layout": ["063"],
     "polar-momentum-pack": ["064"],
-    "52+54+58+59+60+62": ["052", "054", "058", "059", "060", "062"],
+    "52+54+58+59+60+62": [],
+    "55+64": ["065"],
 }
 
 
