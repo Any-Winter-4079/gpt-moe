@@ -1,0 +1,797 @@
+diff --git a/config/vision.py b/config/vision.py
+new file mode 100644
+index 0000000..cecbd78
+--- /dev/null
++++ b/config/vision.py
+@@ -0,0 +1,79 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++
++@dataclass
++class VisionConfig:
++    image_size: int = 224
++    patch_size: int = 16
++    in_channels: int = 3
++    num_classes: int = 1000
++    hidden_size: int = 192
++    n_layers: int = 12
++    n_heads: int = 3
++    mlp_ratio: float = 4.0
++    qkv_bias: bool = True
++    norm_eps: float = 1e-6
++    dropout: float = 0.0
++    drop_path_rate: float = 0.1
++    attention_backend: str = "sdpa" # "sdpa" or "flex"; global, non-causal attention
++
++    def resolve(self) -> None:
++        if self.image_size <= 0 or self.patch_size <= 0 or self.image_size % self.patch_size:
++            raise ValueError("image_size must be positive and divisible by patch_size")
++        if self.hidden_size <= 0 or self.n_heads <= 0 or self.hidden_size % self.n_heads:
++            raise ValueError("hidden_size must be positive and divisible by n_heads")
++        if min(self.n_layers, self.num_classes, self.in_channels, int(self.hidden_size * self.mlp_ratio)) <= 0:
++            raise ValueError("vision layer, class, channel and MLP sizes must be positive")
++        if not 0 <= self.dropout < 1 or not 0 <= self.drop_path_rate < 1:
++            raise ValueError("dropout and drop_path_rate must be in [0, 1)")
++        if self.attention_backend not in ("sdpa", "flex"):
++            raise ValueError("attention_backend must be 'sdpa' or 'flex'")
++        if self.attention_backend == "flex" and self.dropout:
++            raise ValueError("FlexAttention does not support attention dropout; set dropout=0 or use SDPA")
++
++
++@dataclass
++class VisionTrainingConfig:
++    data_path: str = ""
++    output_dir: str = ""
++    epochs: int = 300
++    batch_size: int = 256
++    global_batch_size: int = 1024
++    workers: int = 8
++    precision: str = "fp16" # "fp32", "fp16" or "bf16"; parameters and AdamW moments stay FP32
++    base_lr: float = 5e-4
++    min_lr: float = 1e-5
++    warmup_lr: float = 1e-6
++    warmup_epochs: int = 5
++    weight_decay: float = 0.05
++    adamw_betas: tuple = (0.9, 0.999)
++    adamw_eps: float = 1e-8
++    ema_decay: float = 0.99996
++    mixup_alpha: float = 0.8
++    cutmix_alpha: float = 1.0
++    mixup_prob: float = 1.0
++    mixup_switch_prob: float = 0.5
++    label_smoothing: float = 0.1
++    auto_augment: str = "rand-m9-mstd0.5-inc1"
++    color_jitter: float = 0.4
++    random_erasing_prob: float = 0.25
++    repeated_augmentation: int = 3
++    seed: int = 0
++    log_interval: int = 50
++    compile_model: bool = False
++
++    def resolve(self, world_size: int) -> None:
++        if self.precision not in ("fp32", "fp16", "bf16"):
++            raise ValueError("precision must be 'fp32', 'fp16' or 'bf16'")
++        if self.batch_size < 2 or self.batch_size % 2:
++            raise ValueError("batch_size must be positive and even for batch Mixup/CutMix")
++        if self.global_batch_size <= 0 or self.global_batch_size % (self.batch_size * world_size):
++            raise ValueError("global_batch_size must be divisible by batch_size * world_size")
++        if self.epochs <= 0 or not 0 <= self.warmup_epochs <= self.epochs:
++            raise ValueError("epochs must be positive and warmup_epochs must be in [0, epochs]")
++        if self.workers < 0 or self.log_interval <= 0 or self.repeated_augmentation < 1:
++            raise ValueError("workers must be nonnegative; log_interval and repeated_augmentation must be positive")
++        self.grad_accum_steps = self.global_batch_size // (self.batch_size * world_size)
++        self.lr = self.base_lr * self.global_batch_size / 512
+diff --git a/data/vision.py b/data/vision.py
+new file mode 100644
+index 0000000..99bf49d
+--- /dev/null
++++ b/data/vision.py
+@@ -0,0 +1,58 @@
++from __future__ import annotations
++
++import random
++from pathlib import Path
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader, Subset
++from torchvision import datasets, transforms
++from torchvision.transforms import InterpolationMode
++from timm.data import create_transform
++from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
++from timm.data.distributed_sampler import RepeatAugSampler
++
++
++def seed_worker(worker_id: int) -> None:
++    seed = torch.initial_seed() % (2 ** 32)
++    np.random.seed(seed)
++    random.seed(seed)
++
++
++def create_loaders(model_config, training_config, rank: int, world_size: int):
++    root = Path(training_config.data_path)
++    train_transform = create_transform(
++        input_size=model_config.image_size, is_training=True, color_jitter=training_config.color_jitter,
++        auto_augment=training_config.auto_augment, interpolation="bicubic",
++        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD,
++        re_prob=training_config.random_erasing_prob, re_mode="pixel", re_count=1,
++    )
++    val_transform = transforms.Compose([
++        transforms.Resize(int(model_config.image_size / (224 / 256)), interpolation=InterpolationMode.BICUBIC),
++        transforms.CenterCrop(model_config.image_size), transforms.ToTensor(),
++        transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
++    ])
++    train_dataset = datasets.ImageFolder(root / "train", transform=train_transform)
++    val_dataset = datasets.ImageFolder(root / "val", transform=val_transform)
++    if train_dataset.class_to_idx != val_dataset.class_to_idx:
++        raise ValueError("train and val ImageFolder class names must match exactly")
++    if len(train_dataset.classes) != model_config.num_classes:
++        raise ValueError(f"expected {model_config.num_classes} ImageNet classes, found {len(train_dataset.classes)}")
++    sampler = RepeatAugSampler(
++        train_dataset, num_replicas=world_size, rank=rank,
++        num_repeats=training_config.repeated_augmentation, selected_round=256,
++    )
++    generator = torch.Generator().manual_seed(training_config.seed + rank)
++    train_loader = DataLoader(
++        train_dataset, sampler=sampler, batch_size=training_config.batch_size, drop_last=True,
++        num_workers=training_config.workers, pin_memory=True, worker_init_fn=seed_worker, generator=generator,
++    )
++    # disjoint validation shards count every image once, without distributed-sampler padding
++    val_loader = DataLoader(
++        Subset(val_dataset, range(rank, len(val_dataset), world_size)), batch_size=training_config.batch_size,
++        num_workers=training_config.workers, pin_memory=True, worker_init_fn=seed_worker,
++        generator=torch.Generator().manual_seed(training_config.seed + rank),
++    )
++    if not len(train_loader) or not len(val_dataset):
++        raise ValueError("ImageNet train and val folders must contain enough images for the configured batch_size")
++    return train_loader, val_loader, sampler, generator
+diff --git a/experiments/vision/README.md b/experiments/vision/README.md
+new file mode 100644
+index 0000000..f6876d2
+--- /dev/null
++++ b/experiments/vision/README.md
+@@ -0,0 +1,138 @@
++# DeiT-Tiny / ImageNet-1k
++
++Patch 072 adds an independent image-classification entrypoint. It aims to reproduce
++the **non-distilled DeiT-Tiny 72.2% ImageNet-1k top-1 result**; that result has not
++been reproduced here. Text training, tokenization, generation and language
++benchmarks are unchanged.
++
++The reference is the [2021 DeiT implementation](https://github.com/facebookresearch/deit/tree/ab5715372db8c6cad5740714b2216d55aeae052e)
++and [published result](https://github.com/facebookresearch/deit/blob/ab5715372db8c6cad5740714b2216d55aeae052e/README.md).
++The architecture has 5,717,416 parameters: 224-pixel input, 16-pixel patches,
++192 hidden dimensions, 12 layers, 3 attention heads, GELU MLP ratio 4, LayerNorm,
++learned absolute positions and a CLS classification head. Attention is global
++and non-causal. `forward_features` returns CLS plus all image tokens; this patch
++does not add a vision-language model or pretrained/distilled weights.
++
++## Dependencies and data
++
++Use the existing CUDA/PyTorch image with a **working torchvision build matching
++that exact PyTorch/CUDA build**, NumPy and Pillow. The language-model image's
++nightly PyTorch must not be replaced by a dependency resolver. Install the pinned
++vision helper library without changing the image's Torch stack:
++
++```bash
++python -m pip install --no-deps -r experiments/vision/requirements.txt
++```
++
++This uses modern timm for augmentation, repeated-augmentation sampling, Mixup,
++EMA and the scheduler. It does not import timm's model implementation. The old
++reference used timm 0.3.2, which depends on APIs removed from modern PyTorch.
++The installed timm/torchvision/Pillow/PyTorch versions are recorded in each run.
++
++Obtain ImageNet-1k separately under its dataset terms. There are no automatic
++dataset or checkpoint downloads. Supply extracted images in ImageFolder layout:
++
++```text
++/data/imagenet/
++    train/n01440764/*.JPEG
++    train/n01443537/*.JPEG
++    ...
++    val/n01440764/*.JPEG
++    val/n01443537/*.JPEG
++    ...
++```
++
++Both splits must have the same 1,000 class directories. The official validation
++archive needs organizing into these class directories using its ground-truth
++labels. The full reference dataset has 1,281,167 training and 50,000 validation
++images; the actual counts are logged. Using a subset is a functional check,
++not a reproduction of the published accuracy.
++
++## Run
++
++From the repository with patch 072 applied, single-GPU training is:
++
++```bash
++nohup python -u train_vision.py --data-path /data/imagenet \
++    > vision-training.log 2>&1 < /dev/null &
++```
++
++The default microbatch is 256 with four accumulation steps, giving effective
++batch 1,024. Lower `--batch-size` to an even divisor of 1,024 if needed. The
++reference four-GPU batch arrangement uses no accumulation:
++
++```bash
++nohup torchrun --standalone --nproc_per_node=4 train_vision.py \
++    --data-path /data/imagenet --batch-size 256 --global-batch-size 1024 \
++    > vision-training.log 2>&1 < /dev/null &
++```
++
++Run configurations live in `config/vision.py`; main architecture and execution
++settings also have `--help` options. Default precision is FP16 autocast with a
++gradient scaler and FP32 parameters/AdamW states. `--precision bf16` and
++`--precision fp32` are separate numerical experiments. `--attention-backend sdpa`
++is the default; `--attention-backend flex` uses compiled FlexAttention over all
++image tokens, without a causal or text-document mask. Both routes use the same
++projections and model. Flex attention dropout is unsupported and explicitly
++rejected. `--compile` additionally compiles the complete model.
++
++The recipe uses AdamW, base LR 5e-4 scaled by effective batch / 512, weight decay
++0.05 excluding bias/norm/CLS/position parameters, five warmup epochs from 1e-6,
++cosine minimum LR 1e-5, 300 epochs, stochastic depth 0.1, Mixup 0.8, CutMix 1.0,
++label smoothing 0.1, RandAugment `rand-m9-mstd0.5-inc1`, pixel random erasing 0.25,
++repeated augmentation 3 and EMA decay 0.99996. Validation resizes the short side
++to 256 then center-crops 224; disjoint distributed shards count each image once.
++
++The historical reference calls `scheduler.step(epoch)` **after** training each
++zero-indexed epoch. This ordering is preserved, including epochs 0 and 1 starting
++at the warmup initial LR. Although the old scheduler factory returned 310 epochs
++including cooldown, DeiT ignored that return and trained 300; no extra cooldown
++epochs are added. Shortening `epochs` changes the cosine schedule and is not the
++reference recipe.
++
++Accumulation matches the effective update batch size, but one GPU does not
++reproduce the four-GPU augmentation grouping, sampler interleaving or RNG
++trajectory. The final incomplete accumulation group uses its actual microbatch
++count. Modern PyTorch/SDPA, torchvision, Pillow and timm also introduce numerical
++or augmentation differences from the 2021 stack. A 72.2% result is a target to
++measure, not a promised outcome. Report ordinary-model top-1 separately from
++EMA top-1; the implementation never silently selects the better of the two.
++
++## Results, checkpoints and the Hub
++
++The printed `configs_and_logs/vision-TIMESTAMP` directory contains `config.json`,
++`source.txt`, `log.txt`, per-epoch `metrics.jsonl`, `status.json`, `latest.pth` and
++the best ordinary-model `best.pth`. Metrics include raw/EMA top-1 and top-5,
++losses, processed images, train/validation durations and cumulative times.
++Checkpoints retain model, EMA, AdamW, scaler, scheduler and per-rank RNG states.
++Resume is at epoch boundaries with the same world size, batch and recipe:
++
++```bash
++python -u train_vision.py --data-path /data/imagenet \
++    --resume /root/gpt-moe/configs_and_logs/vision-TIMESTAMP/latest.pth
++```
++
++Evaluation of your own local checkpoint is:
++
++```bash
++python -u train_vision.py --data-path /data/imagenet --eval \
++    --resume /root/gpt-moe/configs_and_logs/vision-TIMESTAMP/best.pth
++```
++
++The trainer needs no Hub credentials unless `--upload-hf` is supplied. With
++`HF_USER` and `HF_TOKEN` (or their lowercase counterparts) already exported, add
++`--upload-hf` to create a new `HF_USER/deit-tiny_TIMESTAMP` repository containing
++the run directory, including both checkpoints. Catchable training failures also
++upload available logs; training errors keep their nonzero exit status. A hard
++kill or destroyed instance cannot run this final upload. SIGTERM is handled
++gracefully and attempts this final upload, but does not create a mid-epoch
++checkpoint; `latest.pth` remains the most recent completed epoch. Each checkpoint is
++approximately 90 MB for the reference model; the uploaded folder contains two.
++Upload failures are printed and return a nonzero exit status. Credentials are
++not written to configuration or source logs.
++
++To follow progress:
++
++```bash
++tail -n 50 -f vision-training.log
++```
+diff --git a/experiments/vision/requirements.txt b/experiments/vision/requirements.txt
+new file mode 100644
+index 0000000..402f1e2
+--- /dev/null
++++ b/experiments/vision/requirements.txt
+@@ -0,0 +1 @@
++timm==1.0.24
+diff --git a/model/vision/vit.py b/model/vision/vit.py
+new file mode 100644
+index 0000000..f309490
+--- /dev/null
++++ b/model/vision/vit.py
+@@ -0,0 +1,113 @@
++from __future__ import annotations
++
++import torch
++import torch.nn as nn
++from torch import Tensor
++from torch.nn import functional as F
++
++from config.vision import VisionConfig
++
++
++class DropPath(nn.Module):
++    def __init__(self, probability: float) -> None:
++        super().__init__()
++        self.probability = probability
++
++    def forward(self, x: Tensor) -> Tensor:
++        if not self.training or not self.probability:
++            return x
++        keep = 1 - self.probability
++        mask = torch.floor(keep + torch.rand((x.shape[0],) + (1,) * (x.ndim - 1), device=x.device, dtype=x.dtype))
++        return x.div(keep) * mask
++
++
++class Attention(nn.Module):
++    def __init__(self, config: VisionConfig) -> None:
++        super().__init__()
++        self.n_heads = config.n_heads
++        self.head_size = config.hidden_size // config.n_heads
++        self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=config.qkv_bias)
++        self.proj = nn.Linear(config.hidden_size, config.hidden_size)
++        self.dropout = config.dropout
++        self.proj_drop = nn.Dropout(config.dropout)
++        self.flex = None
++        if config.attention_backend == "flex":
++            from torch.nn.attention.flex_attention import flex_attention
++
++            self.flex = torch.compile(flex_attention, dynamic=False)
++
++    def forward(self, x: Tensor) -> Tensor:
++        batch, tokens, hidden = x.shape
++        q, k, v = self.qkv(x).reshape(batch, tokens, 3, self.n_heads, self.head_size).permute(2, 0, 3, 1, 4).unbind(0)
++        if self.flex is not None:
++            x = self.flex(q, k, v)
++        else:
++            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0)
++        return self.proj_drop(self.proj(x.transpose(1, 2).reshape(batch, tokens, hidden)))
++
++
++class MLP(nn.Module):
++    def __init__(self, config: VisionConfig) -> None:
++        super().__init__()
++        self.fc1 = nn.Linear(config.hidden_size, int(config.hidden_size * config.mlp_ratio))
++        self.act = nn.GELU()
++        self.fc2 = nn.Linear(int(config.hidden_size * config.mlp_ratio), config.hidden_size)
++        self.drop = nn.Dropout(config.dropout)
++
++    def forward(self, x: Tensor) -> Tensor:
++        return self.drop(self.fc2(self.drop(self.act(self.fc1(x)))))
++
++
++class Block(nn.Module):
++    def __init__(self, config: VisionConfig, drop_path: float) -> None:
++        super().__init__()
++        self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.norm_eps)
++        self.attn = Attention(config)
++        self.drop_path = DropPath(drop_path)
++        self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.norm_eps)
++        self.mlp = MLP(config)
++
++    def forward(self, x: Tensor) -> Tensor:
++        x = x + self.drop_path(self.attn(self.norm1(x)))
++        return x + self.drop_path(self.mlp(self.norm2(x)))
++
++
++class VisionTransformer(nn.Module):
++    def __init__(self, config: VisionConfig) -> None:
++        super().__init__()
++        config.resolve()
++        self.config = config
++        self.patch_embed = nn.Conv2d(config.in_channels, config.hidden_size, kernel_size=config.patch_size, stride=config.patch_size)
++        num_patches = (config.image_size // config.patch_size) ** 2
++        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
++        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, config.hidden_size))
++        self.pos_drop = nn.Dropout(config.dropout)
++        drop_paths = torch.linspace(0, config.drop_path_rate, config.n_layers).tolist()
++        self.blocks = nn.ModuleList([Block(config, probability) for probability in drop_paths])
++        self.norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps)
++        self.head = nn.Linear(config.hidden_size, config.num_classes)
++        nn.init.trunc_normal_(self.pos_embed, std=0.02)
++        nn.init.trunc_normal_(self.cls_token, std=0.02)
++        self.apply(self._init_weights)
++
++    def _init_weights(self, module: nn.Module) -> None:
++        if isinstance(module, nn.Linear):
++            nn.init.trunc_normal_(module.weight, std=0.02)
++            if module.bias is not None:
++                nn.init.zeros_(module.bias)
++        elif isinstance(module, nn.LayerNorm):
++            nn.init.zeros_(module.bias)
++            nn.init.ones_(module.weight)
++
++    def forward_features(self, images: Tensor) -> Tensor:
++        if images.shape[-2:] != (self.config.image_size, self.config.image_size):
++            raise ValueError("image height and width must match the configured image_size")
++        x = self.patch_embed(images).flatten(2).transpose(1, 2)
++        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
++        x = self.pos_drop(x + self.pos_embed)
++        for block in self.blocks:
++            x = block(x)
++        return self.norm(x)
++
++    def forward(self, images: Tensor) -> Tensor:
++        return self.head(self.forward_features(images)[:, 0])
+diff --git a/runtime/vision.py b/runtime/vision.py
+new file mode 100644
+index 0000000..ca09ed0
+--- /dev/null
++++ b/runtime/vision.py
+@@ -0,0 +1,126 @@
++from __future__ import annotations
++
++import contextlib
++import random
++import time
++from dataclasses import asdict
++
++import numpy as np
++import torch
++import torch.distributed as dist
++from torch.nn import functional as F
++
++
++def stop(signum, frame):
++    raise SystemExit(128 + signum)
++
++
++def precision_context(config):
++    if config.precision == "fp32":
++        return contextlib.nullcontext()
++    return torch.autocast("cuda", dtype=torch.float16 if config.precision == "fp16" else torch.bfloat16)
++
++
++def create_optimizer(model, config):
++    decay = []
++    no_decay = []
++    for name, parameter in model.named_parameters():
++        if parameter.ndim == 1 or name.endswith(".bias") or name in ("cls_token", "pos_embed"):
++            no_decay.append(parameter)
++        else:
++            decay.append(parameter)
++    return torch.optim.AdamW([
++        {"params": no_decay, "weight_decay": 0.0}, {"params": decay, "weight_decay": config.weight_decay},
++    ], lr=config.lr, betas=config.adamw_betas, eps=config.adamw_eps)
++
++
++def train_one_epoch(model, loader, optimizer, scaler, mixup, ema, device, config, epoch, rank, world_size, log):
++    model.train()
++    optimizer.zero_grad(set_to_none=True)
++    totals = torch.zeros(2, dtype=torch.float64, device=device)
++    torch.cuda.synchronize(device)
++    start = time.perf_counter()
++    for index, (images, targets) in enumerate(loader):
++        images = images.to(device, non_blocking=True)
++        targets = targets.to(device, non_blocking=True)
++        images, targets = mixup(images, targets)
++        group_start = index // config.grad_accum_steps * config.grad_accum_steps
++        group_size = min(config.grad_accum_steps, len(loader) - group_start)
++        update = (index - group_start + 1) == group_size
++        sync = model.no_sync() if world_size > 1 and not update else contextlib.nullcontext()
++        with sync:
++            with precision_context(config):
++                logits = model(images)
++                loss = (-targets * F.log_softmax(logits.float(), dim=-1)).sum(dim=-1).mean()
++            if not torch.isfinite(loss):
++                raise FloatingPointError(f"non-finite vision training loss at epoch {epoch + 1}, batch {index + 1}")
++            scaler.scale(loss / group_size).backward()
++        if update:
++            scaler.step(optimizer)
++            scaler.update()
++            ema.update(model)
++            optimizer.zero_grad(set_to_none=True)
++        totals[0] += loss.detach() * images.shape[0]
++        totals[1] += images.shape[0]
++        if rank == 0 and ((index + 1) % config.log_interval == 0 or index + 1 == len(loader)):
++            log(f"epoch: {epoch + 1} | batch: {index + 1}/{len(loader)} | train loss: {loss.item():.6f} | lr: {optimizer.param_groups[0]['lr']:.8f}")
++    torch.cuda.synchronize(device)
++    elapsed = torch.tensor(time.perf_counter() - start, dtype=torch.float64, device=device)
++    if world_size > 1:
++        dist.all_reduce(totals)
++        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
++    return {"loss": (totals[0] / totals[1]).item(), "images": int(totals[1].item()), "seconds": elapsed.item()}
++
++
++@torch.no_grad()
++def evaluate(model, loader, device, config, world_size):
++    model.eval()
++    totals = torch.zeros(4, dtype=torch.float64, device=device)
++    torch.cuda.synchronize(device)
++    start = time.perf_counter()
++    for images, targets in loader:
++        images = images.to(device, non_blocking=True)
++        targets = targets.to(device, non_blocking=True)
++        with precision_context(config):
++            logits = model(images)
++        totals[0] += F.cross_entropy(logits.float(), targets, reduction="sum")
++        predictions = logits.topk(min(5, logits.shape[-1]), dim=-1).indices
++        correct = predictions.eq(targets[:, None])
++        totals[1] += correct[:, :1].sum()
++        totals[2] += correct.any(dim=-1).sum()
++        totals[3] += images.shape[0]
++    torch.cuda.synchronize(device)
++    elapsed = torch.tensor(time.perf_counter() - start, dtype=torch.float64, device=device)
++    if world_size > 1:
++        dist.all_reduce(totals)
++        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
++    return {
++        "loss": (totals[0] / totals[3]).item(), "top1": (100 * totals[1] / totals[3]).item(),
++        "top5": (100 * totals[2] / totals[3]).item(), "images": int(totals[3].item()), "seconds": elapsed.item(),
++    }
++
++
++def capture_rng(generator):
++    return {
++        "python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
++        "cuda": torch.cuda.get_rng_state(), "loader": generator.get_state(),
++    }
++
++
++def restore_rng(state, generator):
++    random.setstate(state["python"])
++    np.random.set_state(state["numpy"])
++    torch.set_rng_state(state["torch"])
++    torch.cuda.set_rng_state(state["cuda"])
++    generator.set_state(state["loader"])
++
++
++def save_checkpoint(path, model, ema, optimizer, scheduler, scaler, epoch, best, model_config, training_config, rng, times):
++    temporary = path.with_suffix(".tmp")
++    torch.save({
++        "model": model.state_dict(), "model_ema": ema.module.state_dict(), "optimizer": optimizer.state_dict(),
++        "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(), "epoch": epoch, "best_top1": best,
++        "model_config": asdict(model_config), "training_config": asdict(training_config),
++        "rng": rng, "times": times,
++    }, temporary)
++    temporary.replace(path)
+diff --git a/train_vision.py b/train_vision.py
+new file mode 100644
+index 0000000..ca840ee
+--- /dev/null
++++ b/train_vision.py
+@@ -0,0 +1,240 @@
++import argparse
++from dataclasses import asdict
++from datetime import datetime, timezone
++from importlib.metadata import version
++import json
++import logging
++import os
++from pathlib import Path
++import random
++import signal
++import sys
++import time
++
++import numpy as np
++import torch
++import torch.distributed as dist
++from torch.nn.parallel import DistributedDataParallel as DDP
++from timm.data import Mixup
++from timm.scheduler import CosineLRScheduler
++from timm.utils import ModelEmaV2
++
++from config.vision import VisionConfig, VisionTrainingConfig
++from data.vision import create_loaders
++from model.vision.vit import VisionTransformer
++from runtime.reporting import log_source_code
++from runtime.vision import capture_rng, create_optimizer, evaluate, restore_rng, save_checkpoint, stop, train_one_epoch
++
++
++def main():
++    model_defaults = VisionConfig()
++    training_defaults = VisionTrainingConfig()
++    parser = argparse.ArgumentParser(description="Train non-distilled DeiT-Tiny on ImageNet-1k from scratch")
++    parser.add_argument("--data-path", default=training_defaults.data_path, required=not training_defaults.data_path, help="ImageFolder root containing train/ and val/")
++    parser.add_argument("--output-dir", default=training_defaults.output_dir, help="new run directory; default: configs_and_logs/vision-TIMESTAMP")
++    parser.add_argument("--batch-size", type=int, default=training_defaults.batch_size, help="images per GPU and microbatch")
++    parser.add_argument("--global-batch-size", type=int, default=training_defaults.global_batch_size, help="effective batch over GPUs and accumulation")
++    parser.add_argument("--epochs", type=int, default=training_defaults.epochs)
++    parser.add_argument("--workers", type=int, default=training_defaults.workers, help="loader workers per GPU")
++    parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default=training_defaults.precision)
++    parser.add_argument("--attention-backend", choices=("sdpa", "flex"), default=model_defaults.attention_backend)
++    parser.add_argument("--image-size", type=int, default=model_defaults.image_size)
++    parser.add_argument("--patch-size", type=int, default=model_defaults.patch_size)
++    parser.add_argument("--hidden-size", type=int, default=model_defaults.hidden_size)
++    parser.add_argument("--layers", type=int, default=model_defaults.n_layers)
++    parser.add_argument("--heads", type=int, default=model_defaults.n_heads)
++    parser.add_argument("--mlp-ratio", type=float, default=model_defaults.mlp_ratio)
++    parser.add_argument("--drop-path", type=float, default=model_defaults.drop_path_rate)
++    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=training_defaults.compile_model, help="compile the vision model; disabled for the reference recipe")
++    parser.add_argument("--resume", default="", help="local latest.pth or best.pth checkpoint")
++    parser.add_argument("--eval", action="store_true", help="evaluate a local --resume checkpoint without training")
++    parser.add_argument("--seed", type=int, default=training_defaults.seed)
++    parser.add_argument("--log-interval", type=int, default=training_defaults.log_interval)
++    parser.add_argument("--upload-hf", action="store_true", help="upload this run, including checkpoints, to a new Hub repository")
++    args = parser.parse_args()
++    if args.eval and not args.resume:
++        parser.error("--eval requires a local --resume checkpoint")
++    hf_user = os.environ.get("hf_user") or os.environ.get("HF_USER")
++    hf_token = os.environ.get("hf_token") or os.environ.get("HF_TOKEN")
++    if args.upload_hf:
++        if not hf_user or not hf_token:
++            parser.error("--upload-hf requires hf_user/HF_USER and hf_token/HF_TOKEN before starting")
++        from huggingface_hub import HfApi
++
++    rank = int(os.environ.get("RANK", "0"))
++    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
++    world_size = int(os.environ.get("WORLD_SIZE", "1"))
++    model_config = VisionConfig(
++        image_size=args.image_size, patch_size=args.patch_size, hidden_size=args.hidden_size,
++        n_layers=args.layers, n_heads=args.heads, mlp_ratio=args.mlp_ratio,
++        drop_path_rate=args.drop_path, attention_backend=args.attention_backend,
++    )
++    config = VisionTrainingConfig(
++        data_path=str(Path(args.data_path).resolve()), output_dir=args.output_dir, epochs=args.epochs,
++        batch_size=args.batch_size, global_batch_size=args.global_batch_size, workers=args.workers,
++        precision=args.precision, compile_model=args.compile, seed=args.seed, log_interval=args.log_interval,
++    )
++    model_config.resolve()
++    config.resolve(world_size)
++    if not torch.cuda.is_available():
++        parser.error("vision training requires a CUDA GPU")
++    torch.cuda.set_device(local_rank)
++    device = torch.device("cuda", local_rank)
++    if config.precision == "bf16" and not torch.cuda.is_bf16_supported():
++        parser.error("BF16 autocast is not supported by this GPU; choose fp16 or fp32")
++    if world_size > 1:
++        dist.init_process_group(backend="nccl", device_id=device)
++    timestamp = [datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f") if rank == 0 else None]
++    if world_size > 1:
++        dist.broadcast_object_list(timestamp, src=0)
++    output = Path(config.output_dir or f"configs_and_logs/vision-{timestamp[0]}").resolve()
++    config.output_dir = str(output)
++    if rank == 0:
++        output.mkdir(parents=True, exist_ok=bool(args.resume))
++    if world_size > 1:
++        dist.barrier()
++    logger = logging.getLogger("vision")
++    logger.setLevel(logging.INFO)
++    logger.propagate = False
++    logger.disabled = rank != 0
++    if rank == 0:
++        logger.addHandler(logging.StreamHandler(sys.stdout))
++        logger.addHandler(logging.FileHandler(output / "log.txt"))
++    log = logger.info
++    signal.signal(signal.SIGTERM, stop)
++
++    status = "failed"
++    started = time.perf_counter()
++    try:
++        metadata = {
++            "task": "image-classification", "reference": "DeiT-Tiny non-distilled / ImageNet-1k / 72.2% raw top-1",
++            "model": asdict(model_config), "training": asdict(config), "world_size": world_size,
++            "grad_accum_steps": config.grad_accum_steps, "learning_rate": config.lr,
++            "python": sys.version, "torch": torch.__version__, "cuda": torch.version.cuda,
++            "torchvision": version("torchvision"), "timm": version("timm"), "pillow": version("Pillow"),
++            "gpu": torch.cuda.get_device_name(device),
++        }
++        if rank == 0:
++            (output / "config.json").write_text(json.dumps(metadata, indent=2) + "\n")
++            source = []
++            log_source_code(source)
++            (output / "source.txt").write_text("\n".join(source) + "\n")
++        log(f"output: {output}")
++        log(f"effective global batch: {config.global_batch_size}; accumulation: {config.grad_accum_steps}; LR: {config.lr}")
++        log("reference: 300 epochs; original after-epoch scheduler ordering; raw and EMA metrics reported separately")
++        log("single-GPU accumulation preserves the update batch size, but differs from four-GPU augmentation and RNG grouping")
++        torch.backends.cudnn.benchmark = True
++        # construct identical initial parameters before giving each rank its own augmentation/drop-path RNG
++        torch.manual_seed(config.seed)
++        model = VisionTransformer(model_config).to(device)
++        ema = ModelEmaV2(model, decay=config.ema_decay)
++        optimizer = create_optimizer(model, config)
++        scheduler = CosineLRScheduler(
++            optimizer, t_initial=config.epochs, lr_min=config.min_lr, warmup_t=config.warmup_epochs,
++            warmup_lr_init=config.warmup_lr, warmup_prefix=False, cycle_mul=1.0,
++            cycle_decay=0.1, cycle_limit=1, k_decay=1.0, t_in_epochs=True,
++        )
++        scaler = torch.amp.GradScaler("cuda", enabled=config.precision == "fp16")
++        random.seed(config.seed + rank)
++        np.random.seed(config.seed + rank)
++        torch.manual_seed(config.seed + rank)
++        train_loader, val_loader, sampler, generator = create_loaders(model_config, config, rank, world_size)
++        log(f"parameters: {sum(parameter.numel() for parameter in model.parameters()):,}")
++        log(f"train images: {len(train_loader.dataset):,}; validation images: {len(val_loader.dataset.dataset):,}")
++        start_epoch = 0
++        best = 0.0
++        times = {"train_seconds": 0.0, "val_seconds": 0.0}
++        if args.resume:
++            checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
++            if checkpoint["model_config"] != asdict(model_config):
++                raise ValueError("checkpoint model configuration differs from the requested vision configuration")
++            model.load_state_dict(checkpoint["model"])
++            ema.module.load_state_dict(checkpoint["model_ema"])
++            if not args.eval:
++                previous = checkpoint["training_config"]
++                for name, value in asdict(config).items():
++                    if name not in ("data_path", "output_dir", "log_interval", "compile_model") and previous[name] != value:
++                        raise ValueError(f"resume requires the checkpoint's {name}")
++                if len(checkpoint["rng"]) != world_size:
++                    raise ValueError("resume requires the same world size as the checkpoint")
++                optimizer.load_state_dict(checkpoint["optimizer"])
++                scheduler.load_state_dict(checkpoint["scheduler"])
++                scaler.load_state_dict(checkpoint["scaler"])
++                start_epoch = checkpoint["epoch"] + 1
++                best = checkpoint["best_top1"]
++                times = checkpoint["times"]
++                restore_rng(checkpoint["rng"][rank], generator)
++            log(f"loaded local checkpoint: {args.resume}; next epoch: {start_epoch + 1}")
++        mixup = Mixup(
++            mixup_alpha=config.mixup_alpha, cutmix_alpha=config.cutmix_alpha, prob=config.mixup_prob,
++            switch_prob=config.mixup_switch_prob, mode="batch", label_smoothing=config.label_smoothing,
++            num_classes=model_config.num_classes,
++        )
++        training_model = torch.compile(model, dynamic=False) if config.compile_model else model
++        if world_size > 1:
++            training_model = DDP(training_model, device_ids=[local_rank], broadcast_buffers=False)
++        if args.eval:
++            metrics = {"eval": evaluate(model, val_loader, device, config, world_size),
++                       "eval_ema": evaluate(ema.module, val_loader, device, config, world_size)}
++            log(json.dumps(metrics))
++            if rank == 0:
++                (output / "evaluation.json").write_text(json.dumps(metrics, indent=2) + "\n")
++        else:
++            for epoch in range(start_epoch, config.epochs):
++                sampler.set_epoch(epoch)
++                train_metrics = train_one_epoch(
++                    training_model, train_loader, optimizer, scaler, mixup, ema,
++                    device, config, epoch, rank, world_size, log,
++                )
++                # DeiT calls step(epoch) after training; preserve this historical warmup/cosine ordering
++                scheduler.step(epoch)
++                val_metrics = evaluate(model, val_loader, device, config, world_size)
++                ema_metrics = evaluate(ema.module, val_loader, device, config, world_size)
++                times["train_seconds"] += train_metrics["seconds"]
++                times["val_seconds"] += val_metrics["seconds"] + ema_metrics["seconds"]
++                metrics = {"epoch": epoch + 1, "train": train_metrics, "val": val_metrics, "val_ema": ema_metrics, **times}
++                log(json.dumps(metrics))
++                improved = val_metrics["top1"] > best
++                best = max(best, val_metrics["top1"])
++                rng = [capture_rng(generator)]
++                if world_size > 1:
++                    rng = [None] * world_size
++                    dist.all_gather_object(rng, capture_rng(generator))
++                if rank == 0:
++                    with (output / "metrics.jsonl").open("a") as metrics_file:
++                        metrics_file.write(json.dumps(metrics) + "\n")
++                    save_checkpoint(output / "latest.pth", model, ema, optimizer, scheduler, scaler,
++                                    epoch, best, model_config, config, rng, times)
++                    if improved:
++                        save_checkpoint(output / "best.pth", model, ema, optimizer, scheduler, scaler,
++                                        epoch, best, model_config, config, rng, times)
++                if world_size > 1:
++                    dist.barrier()
++            log(f"best raw validation top-1: {best:.4f}%; total train time: {times['train_seconds'] / 60:.2f} min")
++        status = "completed"
++    except BaseException:
++        if rank == 0:
++            logger.exception("vision training failed")
++        raise
++    finally:
++        if rank == 0:
++            (output / "status.json").write_text(json.dumps({"status": status, "wall_seconds": time.perf_counter() - started}, indent=2) + "\n")
++            for handler in logger.handlers:
++                handler.close()
++        if world_size > 1 and dist.is_initialized():
++            dist.destroy_process_group()
++        if rank == 0 and args.upload_hf:
++            repo_id = f"{hf_user}/deit-tiny_{timestamp[0]}"
++            try:
++                api = HfApi(token=hf_token)
++                api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=False)
++                api.upload_folder(repo_id=repo_id, repo_type="model", folder_path=str(output))
++                print(f"vision run uploaded: https://huggingface.co/{repo_id}", flush=True)
++            except Exception as error:
++                print(f"vision upload failed: {error}", file=sys.stderr, flush=True)
++                if status == "completed":
++                    raise
++
++
++if __name__ == "__main__":
++    main()

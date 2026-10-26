@@ -1,0 +1,81 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -78,7 +78,9 @@
+     use_moe: bool = True
+     num_experts: int = 8
+     moe_top_k: int = 2
+-    # for top-k > 1, use full-softmax gates instead of renormalizing the selected experts; top-1 always uses full softmax
++    # top-k includes the shared expert; top-k=1 uses one MLP without routing
++    moe_shared_expert: bool = True
++    # for routed top-k > 1, use full-softmax gates instead of renormalizing the selected experts; routed top-1 always uses full softmax
+     moe_full_softmax_gating: bool = False
+ 
+     # lm head logit soft-capping
+diff --git a/model/feedforward/moe.py b/model/feedforward/moe.py
+--- a/model/feedforward/moe.py
++++ b/model/feedforward/moe.py
+@@ -21,13 +21,18 @@
+ class MoE(nn.Module):
+     def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig, num_experts: int, top_k: int = 2) -> None:
+         super().__init__()
+-        self.num_experts = num_experts
++        self.use_shared_expert = gpt_config.moe_shared_expert
++        if self.use_shared_expert and not 1 <= top_k <= num_experts:
++            raise ValueError("shared-expert MoE requires 1 <= moe_top_k <= num_experts")
++        self.num_experts = 1 if self.use_shared_expert and top_k == 1 else num_experts
+         self.top_k = top_k
++        self.num_routed_experts = self.num_experts - int(self.use_shared_expert)
++        self.routed_top_k = top_k - int(self.use_shared_expert)
+         self.full_softmax_gating = gpt_config.moe_full_softmax_gating
+         self.load_balance_weight = training_config.moe_load_balance_weight
+         self.use_bf16_autocast = training_config.use_bf16_autocast
+-        self.router = Linear(gpt_config.hidden_size, num_experts, role="router", bias=False)
+-        self.experts = nn.ModuleList([MLP(gpt_config, training_config) for _ in range(num_experts)])
++        self.router = Linear(gpt_config.hidden_size, self.num_routed_experts, role="router", bias=False) if self.routed_top_k else None
++        self.experts = nn.ModuleList([MLP(gpt_config, training_config) for _ in range(self.num_experts)])
+         self.prepared_up_weight = None
+         self.prepared_down_weight = None
+ 
+@@ -52,12 +57,17 @@
+         # flatten batch size x sequence length
+         hidden_states = x.reshape(-1, x.shape[-1])
+ 
++        if self.router is None:
++            indices = torch.zeros((hidden_states.shape[0], 1), device=x.device, dtype=torch.long)
++            weights = torch.ones((hidden_states.shape[0], 1), device=x.device, dtype=torch.float32)
++            return self.forward_grouped(hidden_states, indices, weights).reshape(input_shape), None
++
+         router_input = hidden_states
+         if not self.use_bf16_autocast and router_input.dtype != self.router.weight.dtype:
+             router_input = router_input.to(dtype=self.router.weight.dtype)
+         # (batch size x sequence length, num_experts)
+         router_logits = self.router(router_input).float()
+-        top_k_logits, top_k_indices = torch.topk(router_logits, self.top_k, dim=-1)
++        top_k_logits, top_k_indices = torch.topk(router_logits, self.routed_top_k, dim=-1)
+         router_probs = None
+         # z_i is expert i's router logit, E_i(x) its output, and y the MoE output.
+         #
+@@ -69,7 +79,7 @@
+         #
+         # with A and B selected, selected-only softmax also has a gradient:
+         # dy/dz_A = q_A * (1 - q_A) * (E_A(x) - E_B(x)).
+-        if self.top_k == 1 or self.full_softmax_gating:
++        if self.routed_top_k == 1 or self.full_softmax_gating:
+             router_probs = F.softmax(router_logits, dim=-1)
+             top_k_weights = router_probs.gather(-1, top_k_indices)
+         else:
+@@ -85,8 +95,12 @@
+                 torch.ones_like(top_k_indices, dtype=mean_probs.dtype).reshape(-1),
+             )
+             expert_fraction = expert_counts / top_k_indices.numel()
+-            balance_loss = self.num_experts * (expert_fraction * mean_probs).sum()
++            balance_loss = self.num_routed_experts * (expert_fraction * mean_probs).sum()
+ 
++        if self.use_shared_expert:
++            # expert zero processes every token with unit weight
++            top_k_indices = torch.cat((torch.zeros_like(top_k_indices[:, :1]), top_k_indices + 1), dim=-1)
++            top_k_weights = torch.cat((torch.ones_like(top_k_weights[:, :1]), top_k_weights), dim=-1)
+         output = self.forward_grouped(hidden_states, top_k_indices, top_k_weights)
+ 
+         return output.reshape(input_shape), balance_loss

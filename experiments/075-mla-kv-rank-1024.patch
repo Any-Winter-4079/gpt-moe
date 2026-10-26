@@ -1,0 +1,12 @@
+diff --git a/config/model.py b/config/model.py
+--- a/config/model.py
++++ b/config/model.py
+@@ -48,7 +48,7 @@
+     # MLA shares a compressed KV latent; dimensions are independent of the MHA head size
+     use_mla: bool = True
+     mla_q_rank: int = 0 # 0 uses a direct query projection
+-    mla_kv_rank: int = 768
++    mla_kv_rank: int = 1024
+     mla_qk_content_dim: int = 48
+     mla_qk_rope_dim: int = 16
+     mla_value_dim: int = 64
