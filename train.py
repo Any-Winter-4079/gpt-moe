@@ -1,5 +1,6 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
 import sys
 import math
 import time

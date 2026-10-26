@@ -30,6 +30,7 @@ EXPERIMENTS = {
     "attention-output-layout": ["062"],
     "qk-token-major-layout": ["063"],
     "polar-momentum-pack": ["064"],
+    "52+54+58+59+60+62": ["052", "054", "058", "059", "060", "062"],
 }
 
 
