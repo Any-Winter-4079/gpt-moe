@@ -23,7 +23,7 @@ EXPERIMENTS = {
     "paired-qk-forward": ["067"],
     "moe-8-top1": ["068"],
     "moe-16-top2": ["069"],
-    "moe-16-top1": ["077"],
+    "moe-16-top1": [],
     "moe-8-top1-wide": ["070"],
     "moe-32-top2": ["071"],
     "moe-32-top1": ["078"],
